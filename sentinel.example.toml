@@ -94,6 +94,11 @@ tripwire_accounts      = 5
 tripwire_secs          = 30
 tripwire_cooldown_secs = 60     # an evaluation is a full corpus read
 
+# How long containing a member binds. Long enough that a wave arriving over many
+# sweeps is one event; short enough that the same accounts raiding next week are
+# a new one.
+claim_ttl_secs = 21600          # 6 hours
+
 # The media lane. Off by default: it decrypts attachments and ships the bytes to
 # a model, and that is a decision an operator makes rather than inherits.
 #
@@ -141,10 +146,11 @@ respect_protected = true        # the owner and moderators are never Sentinel's 
 # [community."fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea"]
 # arm = { warn = true, delete = true, kick = true, ban = false, raid = false, vision = false }
 #
-# [community."fe4abeb3…".ladder]
-# strikes = { note = 1, minor = 3, serious = 6, grave = 12 }
-# decay_half_life_hours = 72
+# Overrides fold FIELD by field, so naming one thing leaves the rest of your
+# settings alone:
 #
-# [[community."fe4abeb3…".ladder.steps]]
-# at = 1
-# response = "warn"
+# [community."fe4abeb3…".limits]
+# halt_if_over_pct = 20         # your other limits are untouched
+#
+# [community."fe4abeb3…".ladder]
+# decay_half_life_hours = 72    # your steps and strike worths are untouched
