@@ -51,11 +51,24 @@ pub fn next_step<E>(
     ladder: &Ladder,
     total: u32,
     answered_at: impl Fn(Response) -> Result<Option<String>, E>,
+    can_deliver: impl Fn(Response) -> bool,
 ) -> Result<Option<Response>, E> {
     let Some(reached) = decide(ladder, total) else { return Ok(None) };
-    for r in Response::ALL {
+    // The OPERATOR's rungs, in order, deduped. Walking every Response meant a
+    // ladder of `[warn, ban]` still delivered a delete and a kick, and a
+    // one-step `[ban]` ladder took four passes to get there.
+    let mut rungs: Vec<Response> = ladder.steps.iter().map(|s| s.response).collect();
+    rungs.sort_by_key(|r| r.rank());
+    rungs.dedup();
+    for r in rungs {
         if r.rank() > reached.rank() {
             break;
+        }
+        // SKIPPED, not stopped at: a community that withholds MANAGE_MESSAGES
+        // would otherwise pin every member below delete_and_warn forever, with
+        // kick and ban structurally unreachable.
+        if !can_deliver(r) {
+            continue;
         }
         let prior = answered_at(r)?;
         if prior.as_deref().map(Response::rank_of).unwrap_or(0) < r.rank() {
@@ -77,23 +90,27 @@ mod tests {
         move |_| Ok(answer.map(String::from))
     }
 
+    fn all_powers(_: Response) -> bool {
+        true
+    }
+
     #[test]
     fn the_ladder_is_climbed_one_rung_at_a_time() {
         let l = ladder();
         // Twelve points reaches Ban, but the first answer is still a warning.
-        assert_eq!(next_step(&l, 12, flat(None)), Ok(Some(Response::Warn)));
-        assert_eq!(next_step(&l, 12, flat(Some("warn"))), Ok(Some(Response::DeleteAndWarn)));
-        assert_eq!(next_step(&l, 12, flat(Some("delete_and_warn"))), Ok(Some(Response::Kick)));
-        assert_eq!(next_step(&l, 12, flat(Some("kick"))), Ok(Some(Response::Ban)));
-        assert_eq!(next_step(&l, 12, flat(Some("ban"))), Ok(None), "nothing above the top");
+        assert_eq!(next_step(&l, 12, flat(None), all_powers), Ok(Some(Response::Warn)));
+        assert_eq!(next_step(&l, 12, flat(Some("warn")), all_powers), Ok(Some(Response::DeleteAndWarn)));
+        assert_eq!(next_step(&l, 12, flat(Some("delete_and_warn")), all_powers), Ok(Some(Response::Kick)));
+        assert_eq!(next_step(&l, 12, flat(Some("kick")), all_powers), Ok(Some(Response::Ban)));
+        assert_eq!(next_step(&l, 12, flat(Some("ban")), all_powers), Ok(None), "nothing above the top");
 
         // And it never climbs past what the total has actually earned.
-        assert_eq!(next_step(&l, 4, flat(Some("warn"))), Ok(Some(Response::DeleteAndWarn)));
-        assert_eq!(next_step(&l, 4, flat(Some("delete_and_warn"))), Ok(None), "four points is not a kick");
-        assert_eq!(next_step(&l, 0, flat(None)), Ok(None), "and a clean member answers to nothing");
+        assert_eq!(next_step(&l, 4, flat(Some("warn")), all_powers), Ok(Some(Response::DeleteAndWarn)));
+        assert_eq!(next_step(&l, 4, flat(Some("delete_and_warn")), all_powers), Ok(None), "four points is not a kick");
+        assert_eq!(next_step(&l, 0, flat(None), all_powers), Ok(None), "and a clean member answers to nothing");
 
         // An unrecognised prior ranks 0, so it never blocks the first rung.
-        assert_eq!(next_step(&l, 12, flat(Some("raid:kick"))), Ok(Some(Response::Warn)));
+        assert_eq!(next_step(&l, 12, flat(Some("raid:kick")), all_powers), Ok(Some(Response::Warn)));
     }
 
     /// The case a single guessed lookup could not express: `[arm]` with warn
@@ -110,7 +127,30 @@ mod tests {
                 _ => None,
             })
         };
-        assert_eq!(next_step(&l, 12, per_rung), Ok(Some(Response::Kick)), "it climbs past what is answered");
+        assert_eq!(next_step(&l, 12, per_rung, all_powers), Ok(Some(Response::Kick)), "it climbs past what is answered");
+    }
+
+    /// A rung this community cannot deliver is SKIPPED, not stopped at.
+    /// Stopping pinned every member below a withheld permission forever.
+    #[test]
+    fn a_rung_the_community_withholds_is_climbed_past() {
+        let l = ladder();
+        let no_hiding = |r: Response| r != Response::DeleteAndWarn;
+        assert_eq!(next_step(&l, 12, flat(Some("warn")), no_hiding), Ok(Some(Response::Kick)));
+        // And a community that grants nothing answers with nothing.
+        assert_eq!(next_step(&l, 12, flat(None), |_| false), Ok(None));
+    }
+
+    /// The ladder is the operator's steps, not every response that exists.
+    #[test]
+    fn it_climbs_the_configured_ladder_only() {
+        let mut l = ladder();
+        l.steps = vec![
+            crate::config::Step { at: 1, response: Response::Warn },
+            crate::config::Step { at: 12, response: Response::Ban },
+        ];
+        assert_eq!(next_step(&l, 12, flat(None), all_powers), Ok(Some(Response::Warn)));
+        assert_eq!(next_step(&l, 12, flat(Some("warn")), all_powers), Ok(Some(Response::Ban)), "no rung they never configured");
     }
 
     /// A failed rung that gave up records `attempted:{name}`, which must rank
@@ -121,7 +161,7 @@ mod tests {
         let gave_up = |r: Response| -> Result<Option<String>, ()> {
             Ok((r == Response::Warn).then(|| "warn".to_string()))
         };
-        assert_eq!(next_step(&l, 12, gave_up), Ok(Some(Response::DeleteAndWarn)));
+        assert_eq!(next_step(&l, 12, gave_up, all_powers), Ok(Some(Response::DeleteAndWarn)));
     }
 
     fn ladder() -> Ladder {

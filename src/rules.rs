@@ -12,7 +12,14 @@ use crate::policy::CommunityPolicy;
 /// re-running the compile replaces it rather than stacking copies.
 pub const POLICY_ID: &str = "sentinel";
 
-/// FNV-1a over the compiled document. Only needs to notice a change.
+/// This community's rulebook, as one short string. Stamped on every strike so
+/// an amnesty is a fact about the row rather than an inference from its shape.
+pub fn fingerprint(cfg: &crate::config::Config, community_id: &str) -> String {
+    let rules = cfg.for_community(community_id).rules;
+    format!("{:016x}", fnv(&format!("{rules:?}")))
+}
+
+/// FNV-1a. Only needs to notice a change.
 fn fnv(s: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in s.as_bytes() {
@@ -84,12 +91,14 @@ pub async fn install(
     match compile(&cfg.for_community(community.id())) {
         Some(policy) => {
             community.policies().set(POLICY_ID, policy).await.map_err(|e| e.to_string())?;
-            // The OPERATOR's rules, not the SDK's serialization of them: hashing
-            // the built document meant any SDK field addition or serde
-            // reordering forgave every community's window on the next upgrade.
-            let fingerprint = format!("{:?}", cfg.for_community(community.id()).rules);
-            if store.note_policy(community.id(), &format!("{:016x}", fnv(&fingerprint)))? {
-                return Ok("rulebook changed — its open window forgiven");
+            // Retire whatever an older rulebook minted. Strikes carry the hash
+            // they were charged under, so this is a fact rather than a guess —
+            // and an upgrade that changes the hashing cannot forgive a
+            // community's history as a side effect, because rows written before
+            // the stamp existed carry '' and are never retired.
+            let retired = store.retire_policy(community.id(), &fingerprint(cfg, community.id()))?;
+            if retired > 0 {
+                return Ok("rulebook changed — strikes it minted forgiven");
             }
             Ok("installed")
         }

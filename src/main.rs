@@ -374,12 +374,11 @@ async fn trip(
     // for a wave in progress.
     community.invalidate();
     match sweep(bot, community, cfg, store, wires, me).await {
-        // It declined — another sweep is already in flight. Give the trip back
-        // rather than spending the cooldown on an evaluation that never ran.
-        // Checking `sweeping` beforehand was a race: both handlers could see
-        // false and the loser still lost its trip.
-        Ok(false) => untrip(wires, community.id()),
-        Ok(true) => {}
+        // Only a genuine race gives the trip back. Checking `sweeping`
+        // beforehand was itself a race: both handlers could see false and the
+        // loser still lost its trip.
+        Ok(Pass::Declined) => untrip(wires, community.id()),
+        Ok(_) => {}
         Err(e) => eprintln!("{}: {e}", short(community.id())),
     }
 }
@@ -445,7 +444,7 @@ async fn screen(
         // The same id the sweep mints, so whichever clock arrives first wins.
         let conviction = conviction_id(&f.rule_id, &msg.message.id);
         fresh |= store
-            .record(community.id(), &author, &conviction, worth, now, &evidence)
+            .record(community.id(), &author, &conviction, worth, now, &evidence, &rules::fingerprint(cfg, community.id()))
             .map_err(vector_sdk::Error::Other)?;
         // The GRAVEST finding speaks for the batch, not whichever arrived first.
         if worst.as_ref().is_none_or(|(g, _)| gravity > *g) {
@@ -712,7 +711,9 @@ async fn watch_media(
         }
         let declared = vector_sdk::vector_core::crypto::mime_from_extension(&att.extension);
         if !cfg.vision.mimes.iter().any(|m| m == declared) {
-            unclassified(bot, &community, cfg, store, watches, me, now, &att.id, "declared a type I do not judge").await;
+            // Voice notes, video and PDFs are ordinary traffic, not evasion.
+            // Announcing them filled the mod channel every minute.
+            println!("[media] {} — a type I do not judge", short(&att.id));
             continue;
         }
         // The bytes have to arrive before anything about them can be trusted.
@@ -793,7 +794,7 @@ async fn watch_media(
                 // the same offense, escalating happens by posting more.
                 let conviction = format!("vision:{content_hash}:{}", label.name);
                 let fresh = store
-                    .record(community.id(), &author, &conviction, worth, now, &evidence)
+                    .record(community.id(), &author, &conviction, worth, now, &evidence, &rules::fingerprint(cfg, community.id()))
                     .map_err(vector_sdk::Error::Other)?;
                 println!("[media] FLAGGED {} from {} — {evidence}", short(&att.id), short(&author));
                 if !fresh {
@@ -990,9 +991,9 @@ async fn sweep(
     store: &Arc<Store>,
     wires: &Watches,
     me: &str,
-) -> vector_sdk::Result<bool> {
+) -> vector_sdk::Result<Pass> {
     if !cfg.watches(community.id()) {
-        return Ok(false);
+        return Ok(Pass::Held);
     }
     // Single-flight. Claimed before the corpus read, released however this
     // returns, so an error path cannot wedge the community closed. Returns
@@ -1002,7 +1003,7 @@ async fn sweep(
         let mut guard = wires.lock().unwrap_or_else(|e| e.into_inner());
         let w = guard.entry(community.id().to_string()).or_default();
         if w.sweeping {
-            return Ok(false);
+            return Ok(Pass::Declined);
         }
         w.sweeping = true;
     }
@@ -1018,7 +1019,7 @@ async fn sweep(
         // is most needed on the pass that explains itself least.
         heartbeat(short(community.id()), &verdicts, 0, None);
         println!("[{}] roster read returned no members — holding this pass", short(community.id()));
-        return Ok(false);
+        return Ok(Pass::Held);
     }
 
     let ctx_raid = cfg.for_community(community.id()).raid;
@@ -1037,6 +1038,7 @@ async fn sweep(
     }
     let id = short(community.id());
     let now = now_ms();
+    let policy_fp = rules::fingerprint(cfg, community.id());
     let ctx = Ctx {
         policy: cfg.for_community(community.id()),
         powers: powers_of(community).await,
@@ -1106,13 +1108,13 @@ async fn sweep(
                 // posted while Sentinel was down was never charged at all.
                 for mid in &f.messages {
                     store
-                        .record(community.id(), &v.npub, &conviction_id(&f.rule_id, mid), worth, now, &evidence)
+                        .record(community.id(), &v.npub, &conviction_id(&f.rule_id, mid), worth, now, &evidence, &policy_fp)
                         .map_err(vector_sdk::Error::Other)?;
                 }
                 continue;
             }
             store
-                .record(community.id(), &v.npub, &f.conviction_id, worth, now, &evidence)
+                .record(community.id(), &v.npub, &f.conviction_id, worth, now, &evidence, &policy_fp)
                 .map_err(vector_sdk::Error::Other)?;
         }
         let strikes = store.strikes(community.id(), &v.npub).map_err(vector_sdk::Error::Other)?;
@@ -1166,7 +1168,19 @@ async fn sweep(
     }
 
     heartbeat(id, &verdicts, convicted, Some(&ctx.powers));
-    Ok(true)
+    Ok(Pass::Ran)
+}
+
+/// What one sweep did. `Held` means it ran and found nothing it could work
+/// with; `Declined` means another sweep already had the community. Only the
+/// second is a reason to give a trip back — treating them alike meant a failing
+/// roster read zeroed the cooldown and cost a full corpus evaluation PER
+/// MESSAGE during exactly the wave the cooldown exists for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    Ran,
+    Held,
+    Declined,
 }
 
 /// A raid answers to itself, not to the ladder — but it answers to the same
@@ -1224,9 +1238,7 @@ async fn contain(
         return Ok(());
     }
 
-    // Report touches nobody, so it claims in the dry space: claiming under
-    // `live:` meant switching the response to kick inside the TTL found every
-    // member already claimed and contained nobody, ever.
+    let verb = response.name();
     let touched = armed && response != RaidResponse::Report;
     // A ceiling that spans TIME, not one pass. `raid::select` halts only when a
     // SINGLE pass is over the bar, so a sustained false positive contained 10%
@@ -1240,10 +1252,10 @@ async fn contain(
     // everyone already handled — which for bans is a key rotation each time.
     // Claims are scoped to armed-ness, so a rehearsal never immunises a cohort
     // against a later real containment.
-    // Keyed on ARMED-ness alone, not on what the verb happened to be. Scoping a
-    // Report run as dry meant switching it to kick inside the TTL found every
-    // member already claimed and contained nobody.
-    let scope = if armed { "armed" } else { "dry" };
+    // Keyed on armed-ness AND the verb, because that is what the claim
+    // prevents. Either alone left a natural rollout broken: report-then-kick
+    // found every suspect already claimed and contained nobody for the TTL.
+    let scope = format!("{}:{}", if armed { "armed" } else { "dry" }, verb);
     let ttl = ctx.policy.raid.claim_ttl_secs.saturating_mul(1000);
     let mut fresh: Vec<String> = Vec::new();
     for npub in &suspects {
@@ -1371,6 +1383,39 @@ fn answer_horizon(policy: &CommunityPolicy, now: u64) -> u64 {
     now.saturating_sub(policy.ladder.decay_half_life_hours.saturating_mul(3_600_000).saturating_mul(32))
 }
 
+/// Which rung to answer with, given everything already on file.
+///
+/// Extracted so it can be driven against a real store with no network: every
+/// regression in six review passes has lived in this glue rather than in the
+/// pure rules underneath it, and glue nothing drives is glue nothing checks.
+///
+/// Each candidate is asked about the `dry` space it would actually be recorded
+/// in, and skipped — not stopped at — when this community grants no power to
+/// deliver it. Stopping pinned every member below a rung the community had
+/// simply withheld.
+#[allow(clippy::too_many_arguments)]
+pub fn select_rung(
+    policy: &CommunityPolicy,
+    powers: Powers,
+    store: &Store,
+    community: &str,
+    npub: &str,
+    total: u32,
+    from_vision: bool,
+    horizon: u64,
+) -> Result<Option<Response>, String> {
+    // Provenance follows the EVIDENCE, not the lane. A total built from a
+    // model's opinion is inference wherever it is enforced from, and the sweep
+    // used to enforce it under the text switches.
+    let from_vision = from_vision || store.has_vision_strikes(community, npub, horizon)?;
+    ladder::next_step(
+        &policy.ladder,
+        total,
+        |r| store.strongest_response(community, npub, !adjudicate::armed_for(policy, r, from_vision), horizon),
+        |r| powers.can_deliver(r),
+    )
+}
+
 /// Carry out (or rehearse) whatever [`adjudicate`] decided.
 ///
 /// The decision is NOT made here. This gathers the facts, asks, and obeys —
@@ -1406,13 +1451,13 @@ async fn enforce(
     // and any `[arm]` block that was not uniform made that guess wrong: the
     // ladder read one `dry` space and the dedup another, so it proposed a rung
     // already answered in the other space and the whole ladder went silent.
-    let chosen = ladder::next_step(&ctx.policy.ladder, total, |r| {
-        let armed = adjudicate::armed_for(&ctx.policy, r, from_vision);
-        store.strongest_response(community.id(), &v.npub, !armed, horizon)
-    })
-    .map_err(vector_sdk::Error::Other)?;
-    // Every rung up to what they earned is already answered.
-    let Some(response) = chosen else { return Ok(Outcome::AlreadyAnswered) };
+    let Some(response) =
+        select_rung(&ctx.policy, ctx.powers, store, community.id(), &v.npub, total, from_vision, horizon)
+            .map_err(vector_sdk::Error::Other)?
+    else {
+        // Every rung up to what they earned is already answered.
+        return Ok(Outcome::AlreadyAnswered);
+    };
     let armed_class = adjudicate::armed_for(&ctx.policy, response, from_vision);
     let prior = store
         .strongest_response(community.id(), &v.npub, !armed_class, horizon)
@@ -1431,8 +1476,12 @@ async fn enforce(
         // Distinct PEOPLE, because the ladder climbs: one offender now spends
         // up to four rows, and a roster halt counting rows tripped on a single
         // member in a small community and took raid containment down with it.
+        // EXCLUDING this member. The ladder climbs, so escalating someone
+        // already inside the bound counted them again — and with a ceiling of
+        // 1 (any roster under 20) the first sentence of the hour halted the
+        // whole bot, the debt loop and raid containment for 58 minutes.
         subjects_this_hour: store
-            .subjects_actioned_last_hour(community.id(), !armed_class, now)
+            .subjects_actioned_last_hour(community.id(), !armed_class, now, &v.npub)
             .map_err(vector_sdk::Error::Other)?,
         roster: ctx.roster,
         is_me: v.npub == ctx.me,
@@ -1523,12 +1572,26 @@ async fn enforce(
             // outranking us, no inbox relay. Advance the floor so the ladder can
             // move PAST it: leaving it unanswered pinned the member below the
             // rung forever, which turned "unreachable" into "untouchable".
-            let tries = store
-                .failures(community.id(), &v.npub, name, now.saturating_sub(3_600_000))
+            let (tries, oldest) = store
+                .failure_span(community.id(), &v.npub, name, now.saturating_sub(GIVE_UP_WINDOW_MS))
                 .map_err(vector_sdk::Error::Other)?;
-            if tries >= MAX_FAILURES_PER_HOUR {
+            // Three tries AND a span: a ten-minute relay wobble used to burn
+            // both DM rungs in twelve minutes and eject someone who had never
+            // received a word.
+            let persistent = tries >= MAX_FAILURES && oldest.is_some_and(|o| now.saturating_sub(o) >= GIVE_UP_AFTER_MS);
+            // And a rung nobody could deliver does not authorise a REMOVAL on
+            // its own. A member Sentinel cannot talk to is a case for the mod
+            // channel, not a silent kick.
+            let unlocks_removal = matches!(response, Response::Warn | Response::DeleteAndWarn)
+                && !store
+                    .has_delivered(community.id(), &v.npub, now.saturating_sub(GIVE_UP_WINDOW_MS))
+                    .map_err(vector_sdk::Error::Other)?;
+            if persistent && !unlocks_removal {
                 println!("[{id}] GAVE UP {name} {who} after {tries} tries — moving past this rung");
                 let _ = store.log_action(community.id(), &v.npub, &format!("attempted:{name}"), !armed, now, &why);
+            } else if persistent {
+                println!("[{id}] UNREACHABLE {who} — {name} keeps failing and nothing has ever reached them");
+                announce(bot, community, ctx, &format!("Cannot reach {who}: {name} keeps failing. A person should look.")).await;
             }
             return Ok(Outcome::Failed);
         }
@@ -1553,7 +1616,12 @@ const MAX_HIDES: usize = 10;
 /// Attempts of one sentence against one member per hour before Sentinel stops
 /// trying. Enough that a relay blip retries, few enough that a permanently
 /// unreachable target is not a per-pass publish forever.
-const MAX_FAILURES_PER_HOUR: usize = 3;
+const MAX_FAILURES: usize = 3;
+
+/// How far back failures are counted, and how long they must span before
+/// Sentinel treats a rung as undeliverable rather than unlucky.
+const GIVE_UP_WINDOW_MS: u64 = 6 * 3_600_000;
+const GIVE_UP_AFTER_MS: u64 = 30 * 60_000;
 
 /// One community, as this pass sees it: its own rulebook, its own powers, its
 /// own roster. Nothing about judging one community may leak into another.
@@ -1652,6 +1720,89 @@ mod tests {
     /// Every gate now lives in `adjudicate`, which is a pure function tested
     /// against itself rather than against a restatement of its rules. What is
     /// left here is the glue those gates depend on.
+    use crate::config::Config;
+    use crate::store::tests::mem;
+
+    const HORIZON: u64 = 0;
+    const NOW: u64 = 10_000;
+
+    fn policy_with(arm: &str) -> CommunityPolicy {
+        toml::from_str::<Config>(&format!("[arm]\n{arm}")).unwrap().for_community("aa")
+    }
+
+    /// Every regression in five review passes lived in this glue rather than in
+    /// the rules underneath it. These drive the real selection against a real
+    /// store, so a rung the code picks and a rung it records cannot drift.
+    #[test]
+    fn the_ladder_climbs_and_stops_where_it_should() {
+        let store = mem();
+        let p = policy_with("warn = true\ndelete = true\nkick = true\nban = true");
+        let all = Powers { hide: true, kick: true, ban: true };
+        let pick = |s: &Store| select_rung(&p, all, s, "c", "npub1a", 12, false, HORIZON).unwrap();
+
+        assert_eq!(pick(&store), Some(Response::Warn), "twelve points still starts at a warning");
+        store.log_action("c", "npub1a", "warn", false, NOW, "").unwrap();
+        assert_eq!(pick(&store), Some(Response::DeleteAndWarn));
+        store.log_action("c", "npub1a", "delete_and_warn", false, NOW, "").unwrap();
+        assert_eq!(pick(&store), Some(Response::Kick));
+        store.log_action("c", "npub1a", "kick", false, NOW, "").unwrap();
+        assert_eq!(pick(&store), Some(Response::Ban));
+        store.log_action("c", "npub1a", "ban", false, NOW, "").unwrap();
+        assert_eq!(pick(&store), None, "and stops at the top rather than repeating it");
+    }
+
+    /// The bug that silenced the whole ladder: with `[arm]` not uniform, a
+    /// single lookup read one `dry` space for rungs recorded in another, so it
+    /// proposed a rung that was always already answered.
+    #[test]
+    fn a_non_uniform_arm_block_still_climbs() {
+        let store = mem();
+        let p = policy_with("warn = false\ndelete = false\nkick = true\nban = true");
+        let all = Powers { hide: true, kick: true, ban: true };
+        let pick = |s: &Store| select_rung(&p, all, s, "c", "npub1a", 12, false, HORIZON).unwrap();
+
+        // warn is unarmed, so its rehearsal lands in the dry space.
+        assert_eq!(pick(&store), Some(Response::Warn));
+        store.log_action("c", "npub1a", "warn", true, NOW, "").unwrap();
+        assert_eq!(pick(&store), Some(Response::DeleteAndWarn));
+        store.log_action("c", "npub1a", "delete_and_warn", true, NOW, "").unwrap();
+        // kick is armed, so it asks the LIVE space, which is empty.
+        assert_eq!(pick(&store), Some(Response::Kick), "an armed rung is not deduped by a rehearsal");
+    }
+
+    /// A rung the community withheld must be climbed past, not stopped at.
+    #[test]
+    fn a_withheld_permission_does_not_pin_the_ladder() {
+        let store = mem();
+        let p = policy_with("warn = true\ndelete = true\nkick = true\nban = true");
+        let no_hiding = Powers { hide: false, kick: true, ban: true };
+        store.log_action("c", "npub1a", "warn", false, NOW, "").unwrap();
+        assert_eq!(
+            select_rung(&p, no_hiding, &store, "c", "npub1a", 12, false, HORIZON).unwrap(),
+            Some(Response::Kick),
+            "delete_and_warn cannot be delivered here, so the ladder goes on"
+        );
+    }
+
+    /// Provenance follows the EVIDENCE. A total built from a model's opinion is
+    /// inference wherever it is answered from — the sweep used to answer it
+    /// under the text switches and really kick on a classifier's say-so.
+    #[test]
+    fn a_vision_strike_answers_to_the_vision_switch_from_any_lane() {
+        let store = mem();
+        let p = policy_with("warn = true\nkick = true\nvision = false");
+        let all = Powers { hide: true, kick: true, ban: true };
+        store.record("c", "npub1a", "vision:hash1:gore", 12, NOW, "gore", "p1").unwrap();
+
+        // Enforced from the SWEEP, which knows nothing about the media lane.
+        let r = select_rung(&p, all, &store, "c", "npub1a", 12, false, HORIZON).unwrap();
+        assert_eq!(r, Some(Response::Warn));
+        assert!(
+            !adjudicate::armed_for(&p, r.unwrap(), true),
+            "and it is unarmed, because the evidence is a model's opinion"
+        );
+    }
+
     fn roster(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
         pairs.iter().map(|(n, s)| (n.to_string(), s.to_string())).collect()
     }

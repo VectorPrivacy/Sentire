@@ -129,7 +129,11 @@ pub fn adjudicate(cfg: &CommunityPolicy, powers: Powers, facts: &Facts, response
     if let Some(ceiling) = roster_ceiling(cfg, facts.roster) {
         // Measured against the hour, not one pass: the live lanes act one
         // message at a time, and a per-pass count is always zero for them.
-        if facts.subjects_this_hour >= ceiling {
+        // The post-action set: this member is excluded from the count, so
+        // escalating someone already inside the bound is allowed while the
+        // bound itself still holds. Counting them again halted the whole bot
+        // on the first sentence of every hour in any small community.
+        if facts.subjects_this_hour + 1 > ceiling {
             return Sentence::Halt { ceiling, roster: facts.roster };
         }
     }
@@ -249,6 +253,25 @@ mod tests {
         assert!(matches!(adjudicate(&cfg, all_powers(), &f, Response::Warn), Sentence::Carry { .. }));
     }
 
+    /// A ceiling of 1 — every roster under 20 at the default 10% — must still
+    /// let the member already inside it climb. Counting them halted the bot on
+    /// the first sentence of every hour and took raid containment with it.
+    #[test]
+    fn a_member_already_inside_the_bound_can_still_be_escalated() {
+        let cfg = policy();
+        for roster in 1..=19usize {
+            assert_eq!(roster_ceiling(&cfg, roster), Some(1), "roster {roster}");
+            let f = Facts { roster, subjects_this_hour: 0, ..facts() };
+            assert!(
+                matches!(adjudicate(&cfg, all_powers(), &f, Response::Kick), Sentence::Carry { .. }),
+                "roster {roster} could not escalate the one member it had acted on"
+            );
+            // But a SECOND person is over the bound.
+            let f = Facts { roster, subjects_this_hour: 1, ..facts() };
+            assert!(matches!(adjudicate(&cfg, all_powers(), &f, Response::Kick), Sentence::Halt { .. }));
+        }
+    }
+
     #[test]
     fn ceilings_hold_and_a_small_community_still_permits_one_action() {
         let cfg = policy();
@@ -273,6 +296,9 @@ mod tests {
         let cfg = policy();
         let f = Facts { roster: 40, subjects_this_hour: 4, acted_this_pass: 0, ..facts() };
         assert_eq!(adjudicate(&cfg, all_powers(), &f, Response::Ban), Sentence::Halt { ceiling: 4, roster: 40 });
+        // Three others plus this one is exactly the bound, so it is allowed.
+        let f = Facts { roster: 40, subjects_this_hour: 3, ..facts() };
+        assert!(matches!(adjudicate(&cfg, all_powers(), &f, Response::Ban), Sentence::Carry { .. }));
     }
 
     /// A model's opinion is inference and must not ride the switch an operator

@@ -77,8 +77,14 @@ a member escalates once, not twice.
    week apart do not.
 4. The running total meets the **ladder**, and Sentinel answers with the next rung up from
    whatever that member last received: warn, delete and warn, kick, ban. It climbs rather
-   than jumping, so every step is actually delivered — a member who accrued enough for a ban
-   while Sentinel was rehearsing still gets warned first.
+   than jumping, so a member who accrued enough for a ban while Sentinel was rehearsing
+   still gets warned first.
+
+   Each rung is asked about the space it would be recorded in, so an `[arm]` block that arms
+   some classes and not others still climbs. A rung this community grants no permission for
+   is skipped rather than blocking the ones above it, and a rung that keeps failing to
+   deliver is given up on — but only after it has failed over time, and never in a way that
+   unlocks a kick or ban against someone nothing has ever reached.
 
 Only *proven* convictions earn strikes, on either clock. Inference is reported and never
 sentenced — except where an operator arms it explicitly (`[arm] raid`, `[arm] vision`), which
@@ -161,9 +167,12 @@ must survive as tombstones because the engine re-reports the same convictions fo
 the evidence sits in its window, and the history must go because a forgiven member who kept it
 stays immune to every response below the one they already received.
 
-Editing `[rules]` is a smaller amnesty of the same shape. The engine keys its window-scoped
-convictions on the rulebook, so a change re-reports them under fresh ids — Sentinel forgives
-that community's open window rather than charging it twice.
+Editing `[rules]` forgives the strikes that rulebook minted. The engine keys its
+window-scoped convictions on the rulebook, so a change re-reports them under fresh ids, and
+charging both copies would roughly double every total. Each strike carries the rulebook it
+was charged under, so this is a fact about the row rather than a guess from its shape — and
+the ladder floor is left alone, because an amnesty on the evidence is not an amnesty on the
+answers already given.
 
 ## Proven vs unproven
 
