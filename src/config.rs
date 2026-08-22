@@ -43,6 +43,7 @@ pub struct Config {
     pub ladder: Ladder,
     pub shields: Shields,
     pub raid: Raid,
+    pub vision: VisionCfg,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -218,6 +219,74 @@ impl Default for Ladder {
     }
 }
 
+/// The media lane. Off by default: it ships bytes to a model, and that is a
+/// decision an operator makes rather than inherits.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct VisionCfg {
+    pub enabled: bool,
+    /// llama.cpp's server speaks the OpenAI-compatible shape, so local and
+    /// remote differ by a URL and a header, not by an implementation.
+    pub base_url: String,
+    pub model: String,
+    /// Env var holding an API key. Empty = a local endpoint with no auth.
+    pub api_key_env: String,
+    /// Required for any host that is not loopback. An attachment is
+    /// end-to-end encrypted right up until Sentinel decrypts it and posts it to
+    /// somebody else's server, so that step is explicit or it does not happen.
+    pub allow_remote: bool,
+    pub timeout_secs: u64,
+    pub max_bytes: u64,
+    /// Classifications per minute, so a wave of images cannot become a bill or
+    /// a stalled sweep.
+    pub max_per_min: u32,
+    pub mimes: Vec<String>,
+    pub labels: Vec<VisionLabel>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct VisionLabel {
+    pub name: String,
+    /// 0.0..=1.0. A label with no threshold would flag everything.
+    pub threshold: f32,
+    pub gravity: Gravity,
+}
+
+impl Default for VisionCfg {
+    fn default() -> Self {
+        VisionCfg {
+            enabled: false,
+            base_url: "http://127.0.0.1:8080/v1".into(),
+            model: "llava".into(),
+            api_key_env: String::new(),
+            allow_remote: false,
+            timeout_secs: 60,
+            max_bytes: 8 * 1024 * 1024,
+            max_per_min: 20,
+            mimes: ["image/png", "image/jpeg", "image/webp", "image/gif"].iter().map(|s| s.to_string()).collect(),
+            labels: vec![],
+        }
+    }
+}
+
+impl VisionCfg {
+    /// Does this endpoint keep the bytes on this machine?
+    pub fn is_local(&self) -> bool {
+        let host = self
+            .base_url
+            .split("//")
+            .nth(1)
+            .unwrap_or(&self.base_url)
+            .split('/')
+            .next()
+            .unwrap_or_default()
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or_else(|| self.base_url.split("//").nth(1).unwrap_or_default().split('/').next().unwrap_or_default());
+        matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
+    }
+}
+
 /// What a detected raid answers to. Deliberately outside the ladder: a raid is
 /// one event, and escalating through warnings while a hundred accounts post the
 /// same line is the wrong shape.
@@ -314,6 +383,22 @@ impl Config {
         if self.raid.max_batch == 0 || self.raid.max_batch > 500 {
             return Err(format!("raid.max_batch = {}: must be 1..=500 (the wire rejects an over-cap banlist whole)", self.raid.max_batch));
         }
+        if self.vision.enabled {
+            if self.vision.labels.is_empty() {
+                return Err("vision.enabled with no vision.labels: the model would be asked to judge nothing".into());
+            }
+            for l in &self.vision.labels {
+                if !(0.0..=1.0).contains(&l.threshold) {
+                    return Err(format!("vision label '{}' has threshold {} — must be 0.0..=1.0", l.name, l.threshold));
+                }
+            }
+            if !self.vision.is_local() && !self.vision.allow_remote {
+                return Err(format!(
+                    "vision.base_url {} is not loopback and vision.allow_remote is false.                      An attachment is end-to-end encrypted until Sentinel decrypts it and posts it                      to that host; say so on purpose or keep the model local.",
+                    self.vision.base_url
+                ));
+            }
+        }
         if self.ladder.decay_half_life_hours == 0 {
             return Err("ladder.decay_half_life_hours = 0: strikes would vanish instantly".into());
         }
@@ -369,6 +454,9 @@ mod tests {
             ("[raid]\nmin_confidence = 100", "min_confidence"),
             ("[raid]\nmax_batch = 0", "max_batch"),
             ("[raid]\nmax_batch = 900", "max_batch"),
+            ("[vision]\nenabled = true", "vision.labels"),
+            ("[vision]\nenabled = true\nbase_url = \"https://api.example.com/v1\"\n[[vision.labels]]\nname = \"gore\"\nthreshold = 0.9\ngravity = \"grave\"", "allow_remote"),
+            ("[vision]\nenabled = true\n[[vision.labels]]\nname = \"gore\"\nthreshold = 4.0\ngravity = \"grave\"", "threshold"),
             ("[[rules.words]]\nid = \"empty\"\npatterns = []\ngravity = \"note\"", "empty"),
         ];
         for (toml_text, expect) in cases {
@@ -376,6 +464,16 @@ mod tests {
             let err = cfg.validate().expect_err(toml_text);
             assert!(err.contains(expect), "{toml_text}\n-> {err}");
         }
+    }
+
+    #[test]
+    fn loopback_is_recognised_and_everything_else_needs_saying_so() {
+        let local = |url: &str| VisionCfg { base_url: url.into(), ..Default::default() }.is_local();
+        assert!(local("http://127.0.0.1:8080/v1"));
+        assert!(local("http://localhost:8080/v1"));
+        assert!(local("http://[::1]:8080/v1"));
+        assert!(!local("https://api.openai.com/v1"));
+        assert!(!local("http://192.168.1.50:8080/v1"), "a LAN box is still somebody else's machine");
     }
 
     #[test]

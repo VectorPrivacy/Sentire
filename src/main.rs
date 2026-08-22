@@ -16,6 +16,7 @@
 mod config;
 mod ladder;
 mod raid;
+mod vision;
 mod rules;
 mod store;
 
@@ -27,6 +28,7 @@ use vector_sdk::{Community, VectorBot};
 
 use config::{Config, Gravity, RaidResponse, Response};
 use store::Store;
+use vision::Vision as _;
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
@@ -45,6 +47,7 @@ async fn main() -> vector_sdk::Result<()> {
     let nsec = std::env::var(&cfg.bot.nsec_env)
         .unwrap_or_else(|_| panic!("set {} to Sentinel's nsec", cfg.bot.nsec_env));
     let store = Arc::new(Store::open("sentinel.db").map_err(vector_sdk::Error::Other)?);
+    let cfg = Arc::new(cfg);
 
     let bot = VectorBot::builder().nsec(nsec).public().build().await?;
     println!("Sentinel online as {}", bot.npub());
@@ -84,13 +87,14 @@ async fn main() -> vector_sdk::Result<()> {
     }
 
     operator_surface(&bot, &cfg, &store);
+    let eyes = media_lane(&cfg)?;
 
     // The sweep runs beside the listener rather than instead of it: slash
     // commands arrive through the inbound stream, so a bot that only loops on
     // verdicts can be watched but never asked anything.
     let poll = Duration::from_secs(cfg.bot.poll_secs.max(90));
     {
-        let (bot, store) = (bot.clone(), store.clone());
+        let (bot, store, cfg) = (bot.clone(), store.clone(), cfg.clone());
         tokio::spawn(async move {
             loop {
                 for c in &communities {
@@ -103,8 +107,159 @@ async fn main() -> vector_sdk::Result<()> {
         });
     }
 
-    bot.on_message(|_bot, _msg| async move {}).await?;
+    // The media lane rides the live stream rather than the sweep: an image is
+    // judged when it lands, not up to two minutes later.
+    {
+        let (cfg, store) = (cfg.clone(), store.clone());
+        bot.on_message(move |bot, msg| {
+            let (cfg, store, eyes) = (cfg.clone(), store.clone(), eyes.clone());
+            async move {
+                if let Err(e) = watch_media(&bot, &msg, &cfg, &store, eyes.as_ref().as_ref()).await {
+                    eprintln!("media: {e}");
+                }
+            }
+        })
+        .await?;
+    }
     Ok(())
+}
+
+/// The classifier, if the operator configured one.
+fn media_lane(cfg: &Config) -> vector_sdk::Result<Arc<Option<vision::openai::OpenAiVision>>> {
+    if !cfg.vision.enabled {
+        return Ok(Arc::new(None));
+    }
+    let eyes = vision::openai::OpenAiVision::new(cfg.vision.clone()).map_err(vector_sdk::Error::Other)?;
+    println!(
+        "media lane: {} at {}{}",
+        cfg.vision.model,
+        cfg.vision.base_url,
+        if cfg.vision.is_local() {
+            String::new()
+        } else {
+            format!("  ⚠ REMOTE — decrypted attachments leave this machine for {}", cfg.vision.base_url)
+        }
+    );
+    Ok(Arc::new(Some(eyes)))
+}
+
+/// Judge one message's attachments.
+///
+/// Everything here is Sentinel's own opinion. A model's verdict never reaches
+/// `proven`, never enters the engine's combinator, and never appears in another
+/// client's report — so it is reported as what it is, and the ladder it feeds is
+/// Sentinel's alone.
+async fn watch_media(
+    bot: &VectorBot,
+    msg: &vector_sdk::IncomingMessage,
+    cfg: &Config,
+    store: &Arc<Store>,
+    eyes: Option<&vision::openai::OpenAiVision>,
+) -> vector_sdk::Result<()> {
+    let (Some(eyes), true) = (eyes, msg.is_group && msg.is_file && !msg.is_mine()) else { return Ok(()) };
+    let (Some(community), Some(author)) = (msg.community(), msg.author()) else { return Ok(()) };
+    let now = now_ms();
+
+    for att in &msg.message.attachments {
+        if att.size > cfg.vision.max_bytes {
+            continue;
+        }
+        let declared = vector_sdk::vector_core::crypto::mime_from_extension(&att.extension);
+        if !cfg.vision.mimes.iter().any(|m| m == declared) {
+            continue;
+        }
+        // `Attachment.id` IS the content hash, and so is a citation's — one key
+        // for the cache, the engine and the resolver alike.
+        let verdict = match store.cached_verdict(&att.id, eyes.model()) {
+            Some(cached) => serde_json::from_str(&cached).unwrap_or(vision::Verdict::Clean),
+            None => {
+                let bytes = match bot.download_attachment_from(att, msg.message.npub.as_deref()).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        println!("[media] could not fetch {}: {e} — queued, not cleared", &att.id[..12]);
+                        continue;
+                    }
+                };
+                // MIME from the bytes, never from a name the uploader chose.
+                let actual = vector_sdk::vector_core::crypto::mime_from_magic_bytes(&bytes);
+                if !cfg.vision.mimes.iter().any(|m| m == actual) {
+                    continue;
+                }
+                let v = eyes.classify(&bytes, actual).await;
+                if let Ok(json) = serde_json::to_string(&v) {
+                    let _ = store.cache_verdict(&att.id, eyes.model(), &json, now);
+                }
+                v
+            }
+        };
+
+        match verdict {
+            vision::Verdict::Clean => {}
+            vision::Verdict::Unknown(why) => {
+                // Never an all-clear. An unreachable model is a reason to ask a
+                // person, not a reason to let everything through.
+                println!("[media] UNKNOWN {} from {} — {why} — for review", &att.id[..12], short(&author));
+                announce(bot, &community, cfg, &format!("Could not classify an attachment from {}: {why}", short(&author))).await;
+            }
+            vision::Verdict::Flagged(labels) => {
+                let hits = vision::over_threshold(&labels, &cfg.vision.labels);
+                if hits.is_empty() {
+                    continue;
+                }
+                let (label, gravity) = hits[0].clone();
+                let worth = cfg.ladder.strikes.worth(gravity);
+                let evidence = format!("{} ({:.0}% per {})", label.name, label.score * 100.0, eyes.model());
+                // One strike per (blob, label): re-posting the same image is
+                // the same offense, escalating happens by posting more.
+                let conviction = format!("vision:{}:{}", att.id, label.name);
+                let fresh = store
+                    .record(community.id(), &author, &conviction, worth, now, &evidence)
+                    .map_err(vector_sdk::Error::Other)?;
+                println!("[media] FLAGGED {} from {} — {evidence}", &att.id[..12], short(&author));
+                if !fresh {
+                    continue;
+                }
+                let strikes = store.strikes(community.id(), &author).map_err(vector_sdk::Error::Other)?;
+                let total = ladder::total(&strikes, now, cfg.ladder.decay_half_life_hours);
+                if let Some(response) = ladder::decide(&cfg.ladder, total) {
+                    let v = synthetic_verdict(&author, &evidence, msg.message.id.clone());
+                    enforce(bot, &community, cfg, store, &v, response, total, now).await?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A model's finding, in the shape the ladder and the enforcer already speak.
+/// Confidence and proven are ZERO on purpose: this is Sentinel's judgement, and
+/// nothing about it is replayable by anyone else.
+fn synthetic_verdict(npub: &str, evidence: &str, message_id: String) -> Verdict {
+    Verdict {
+        npub: npub.to_string(),
+        name: short(npub).to_string(),
+        confidence: 0,
+        proven: 0,
+        band: "alert".into(),
+        shield: "none".into(),
+        reasons: vec![evidence.to_string()],
+        findings: vec![vector_sdk::policy::Finding {
+            conviction_id: String::new(),
+            policy_hash: String::new(),
+            rule_id: "vision".into(),
+            scope: "whole".into(),
+            basis: "heuristic".into(),
+            severity: "severe".into(),
+            rung: 0,
+            hits: 1,
+            weight: 0,
+            detail: vec![evidence.to_string()],
+            messages: vec![message_id],
+            citation_count: 1,
+        }],
+        messages: 0,
+        tenure_secs: 0,
+    }
 }
 
 /// What an operator can ask Sentinel from inside a community.

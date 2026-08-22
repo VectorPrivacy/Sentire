@@ -59,6 +59,26 @@ never contained), a pass that would touch more than `halt_if_over_pct` of the ro
 asks for a person, and bans go out via `ban_many` in batches — each individual ban rotates the
 community's keys, and forty rotations strand everyone.
 
+## The media lane
+
+Optional, off by default. When `[vision] enabled` is set, Sentinel decrypts attachments as
+they arrive, asks a vision model to score them against labels you named, and feeds anything
+over its threshold into the same strike ladder as everything else.
+
+llama.cpp's `llama-server` speaks the OpenAI-compatible shape out of the box, so local is the
+default and remote is the same block with a different `base_url`. That switch is deliberate:
+an attachment is end-to-end encrypted right up until Sentinel decrypts it and posts it to
+somebody else's server, so `allow_remote` has to be set on purpose or startup refuses.
+
+Three rules this lane keeps:
+
+- **A model's verdict is Sentinel's opinion, not the engine's.** It never reaches `proven`,
+  never enters the combinator, and never appears in another client's report.
+- **Unknown is not clean.** A timeout, a refusal or a malformed answer routes to a human. An
+  unreachable model is a reason to ask, never a reason to let everything through.
+- **The bytes are never kept.** Classification happens in memory; only the content hash and
+  the verdict are stored, so forty accounts posting one image cost a single call.
+
 ## Asking it things
 
 Inside a community, from any client that renders slash commands:

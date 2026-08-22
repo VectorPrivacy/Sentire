@@ -21,6 +21,12 @@ CREATE TABLE IF NOT EXISTS strikes (
     evidence      TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (community, subject, conviction_id)
 );
+CREATE TABLE IF NOT EXISTS classifications (
+    content_hash TEXT PRIMARY KEY,
+    verdict      TEXT NOT NULL,
+    model        TEXT NOT NULL,
+    at_ms        INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS actions (
     community TEXT NOT NULL,
     subject   TEXT NOT NULL,
@@ -138,6 +144,35 @@ impl Store {
             .map_err(|e| e.to_string())
     }
 
+    /// What a model said about this blob last time, if anything.
+    ///
+    /// Keyed on the PLAINTEXT hash, so forty accounts posting one image cost a
+    /// single classification. The bytes themselves are never stored: a
+    /// moderation bot that fills a disk with the material it was hired to
+    /// remove is a liability.
+    pub fn cached_verdict(&self, content_hash: &str, model: &str) -> Option<String> {
+        use rusqlite::OptionalExtension;
+        self.lock()
+            .query_row(
+                "SELECT verdict FROM classifications WHERE content_hash = ?1 AND model = ?2",
+                rusqlite::params![content_hash, model],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    pub fn cache_verdict(&self, content_hash: &str, model: &str, verdict: &str, at_ms: u64) -> Result<(), String> {
+        self.lock()
+            .execute(
+                "INSERT OR REPLACE INTO classifications (content_hash, verdict, model, at_ms) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![content_hash, verdict, model, at_ms as i64],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
     /// The one command that undoes: clear a member's strikes.
     pub fn pardon(&self, community: &str, subject: &str) -> Result<usize, String> {
         self.lock()
@@ -170,6 +205,16 @@ mod tests {
         // A rung escalation mints a new conviction id, and THAT lands.
         assert!(s.record("c", "npub1a", "conv1-rung2", 2, 2000, "kept swearing").unwrap());
         assert_eq!(s.strikes("c", "npub1a").unwrap().len(), 2);
+    }
+
+    /// A raid of one image is one classification, not forty.
+    #[test]
+    fn a_blob_is_classified_once_per_model() {
+        let s = mem();
+        assert!(s.cached_verdict("hash1", "llava").is_none());
+        s.cache_verdict("hash1", "llava", "clean", 0).unwrap();
+        assert_eq!(s.cached_verdict("hash1", "llava").as_deref(), Some("clean"));
+        assert!(s.cached_verdict("hash1", "other-model").is_none(), "another model is another opinion");
     }
 
     #[test]
