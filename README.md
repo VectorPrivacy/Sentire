@@ -48,8 +48,12 @@ the one thing a raid cannot hide: many *distinct* accounts speaking or joining a
 `[raid] tripwire_accounts` of them appear inside `tripwire_secs`, it drops the memoised
 verdict and evaluates immediately.
 
-The tripwire decides **when to ask, never who is guilty**. It counts distinct actors and
-nothing else; the engine still reaches every verdict. Keeping those apart is what stops a
+The tripwire counts **strangers**, not accounts. Every sweep hands it the engine's own list of
+vouched-for members, and those cost nothing to ignore — ten regulars mid-conversation are the
+least raid-shaped thing there is, and counting them would fire a full corpus read every minute
+for as long as the room stayed lively.
+
+It decides **when to ask, never who is guilty**. The engine still reaches every verdict. Keeping those apart is what stops a
 second, sloppier detector growing beside the real one. A cooldown bounds it, because an
 evaluation is a full corpus read and a sustained wave would otherwise ask for one per
 message.

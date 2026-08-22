@@ -95,13 +95,14 @@ async fn main() -> vector_sdk::Result<()> {
     // The sweep runs beside the listener rather than instead of it: slash
     // commands arrive through the inbound stream, so a bot that only loops on
     // verdicts can be watched but never asked anything.
+    let wires: Arc<Mutex<HashMap<String, Tripwire>>> = Arc::new(Mutex::new(HashMap::new()));
     let poll = Duration::from_secs(cfg.bot.poll_secs.max(90));
     {
-        let (bot, store, cfg) = (bot.clone(), store.clone(), cfg.clone());
+        let (bot, store, cfg, wires) = (bot.clone(), store.clone(), cfg.clone(), wires.clone());
         tokio::spawn(async move {
             loop {
                 for c in &communities {
-                    if let Err(e) = sweep(&bot, c, &cfg, &store, &me).await {
+                    if let Err(e) = sweep(&bot, c, &cfg, &store, &wires, &me).await {
                         eprintln!("{}: {e}", &c.id()[..12]);
                     }
                 }
@@ -116,7 +117,6 @@ async fn main() -> vector_sdk::Result<()> {
     // half the raid signal and a message handler never sees them.
     {
         let (cfg, store, me) = (cfg.clone(), store.clone(), bot.npub().to_string());
-        let wires: Arc<Mutex<HashMap<String, Tripwire>>> = Arc::new(Mutex::new(HashMap::new()));
         bot.on_event(move |bot, event| {
             let (cfg, store, eyes, wires, me) =
                 (cfg.clone(), store.clone(), eyes.clone(), wires.clone(), me.clone());
@@ -188,7 +188,7 @@ async fn trip(
     // The 90-second memoisation is right for a background pass and far too slow
     // for a wave in progress.
     community.invalidate();
-    if let Err(e) = sweep(bot, community, cfg, store, me).await {
+    if let Err(e) = sweep(bot, community, cfg, store, wires, me).await {
         eprintln!("{}: {e}", &community.id()[..12]);
     }
 }
@@ -540,9 +540,24 @@ async fn sweep(
     community: &Community,
     cfg: &Config,
     store: &Arc<Store>,
+    wires: &Arc<Mutex<HashMap<String, Tripwire>>>,
     me: &str,
 ) -> vector_sdk::Result<()> {
     let verdicts = community.verdicts().await?;
+
+    // Hand the tripwire the engine's own answer to "who belongs here", so its
+    // idea of a regular is never its own guess.
+    {
+        let vouched: Vec<&str> =
+            verdicts.all().filter(|v| v.is_shielded()).map(|v| v.npub.as_str()).collect();
+        let mut guard = wires.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .entry(community.id().to_string())
+            .or_insert_with(|| {
+                Tripwire::new(cfg.raid.tripwire_accounts, cfg.raid.tripwire_secs, cfg.raid.tripwire_cooldown_secs)
+            })
+            .trust(vouched);
+    }
     let id = &community.id()[..12];
     let now = now_ms();
     let roster = verdicts.all().count();

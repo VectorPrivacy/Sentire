@@ -12,7 +12,7 @@
 //! those separate is what stops a second, sloppier detector growing here beside
 //! the real one.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 /// One live arrival: who, and when.
 #[derive(Debug, Clone, Copy)]
@@ -32,6 +32,11 @@ pub struct Tripwire {
     cooldown_ms: u64,
     pings: VecDeque<Ping>,
     last_trip_ms: u64,
+    /// Members the engine has already vouched for, refreshed by every sweep.
+    /// A raid is STRANGERS: ten regulars talking is the least raid-shaped thing
+    /// there is, and counting them fires a full corpus read a minute for as
+    /// long as the room stays lively.
+    known: HashSet<u64>,
 }
 
 fn identity(npub: &str) -> u64 {
@@ -52,11 +57,24 @@ impl Tripwire {
             cooldown_ms: cooldown_secs * 1000,
             pings: VecDeque::new(),
             last_trip_ms: 0,
+            known: HashSet::new(),
         }
     }
 
+    /// Replace the vouched-for set. Called after each evaluation, so the
+    /// tripwire's idea of "regular" is the engine's, never its own guess.
+    pub fn trust(&mut self, npubs: impl IntoIterator<Item = impl AsRef<str>>) {
+        self.known = npubs.into_iter().map(|n| identity(n.as_ref())).collect();
+    }
+
     /// Record an arrival. True means "evaluate now".
+    ///
+    /// A trusted member is not recorded at all: they cost nothing to ignore and
+    /// they are the opposite of the signal being watched for.
     pub fn observe(&mut self, npub: &str, at_ms: u64) -> bool {
+        if self.known.contains(&identity(npub)) {
+            return false;
+        }
         let cutoff = at_ms.saturating_sub(self.window_ms);
         while self.pings.front().is_some_and(|p| p.at_ms < cutoff) {
             self.pings.pop_front();
@@ -125,6 +143,37 @@ mod tests {
         }
         // 100 seconds of raid against a 60s cooldown: the opening trip and one more.
         assert_eq!(trips, 2, "one evaluation per cooldown, not one per message");
+    }
+
+    /// The case this exists for: a busy room full of regulars, plus one
+    /// newcomer settling in. Nothing here is raid-shaped, and firing a full
+    /// corpus read every minute for it is pure waste.
+    #[test]
+    fn a_lively_room_of_regulars_never_wakes_the_engine() {
+        let mut t = Tripwire::new(5, 30, 60);
+        let regulars: Vec<String> = (0..10).map(|i| format!("npub1regular{i}")).collect();
+        t.trust(&regulars);
+
+        for round in 0..5u64 {
+            for (i, who) in regulars.iter().enumerate() {
+                assert!(!t.observe(who, round * 2000 + i as u64 * 100), "regulars talking is not a raid");
+            }
+        }
+        // And one new member casually joining in stays far under the bar.
+        assert!(!t.observe("npub1newcomer", 12_000), "one unknown among ten regulars is not a wave");
+    }
+
+    /// Trust is not immunity from the tripwire's PURPOSE: strangers still count.
+    #[test]
+    fn regulars_do_not_hide_a_wave_happening_beside_them() {
+        let mut t = Tripwire::new(5, 30, 60);
+        t.trust(["npub1regular0", "npub1regular1"]);
+        for i in 0..4 {
+            assert!(!t.observe(&format!("npub1raider{i}"), i * 500));
+            // Regular chatter interleaved changes nothing either way.
+            assert!(!t.observe("npub1regular0", i * 500 + 100));
+        }
+        assert!(t.observe("npub1raider4", 4000), "five strangers is still five strangers");
     }
 
     #[test]
