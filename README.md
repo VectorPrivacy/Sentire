@@ -29,6 +29,23 @@ community from the Vector app; it builds `.public()`, so anyone can. It needs no
 to *watch* — evaluation is local computation over history it has synced — but it needs KICK,
 BAN or MANAGE_MESSAGES to carry a sentence out.
 
+## Two clocks
+
+Sentinel judges on two timescales, because the rules themselves come in two kinds.
+
+**Immediate — the moment a message lands.** Word filters, link blocking, regex and mention
+spam settle from the message alone, so they run on arrival and answer in milliseconds. NSFW
+media is the same: attachments are classified as they arrive. A word filter that answers on
+the next tick is not a word filter.
+
+**Periodic — every `poll_secs` (90s floor).** Rate limits, repetition, raid cohorts and join
+bursts are statements about a *window*. There is nothing for them to measure in one message,
+so they belong to the sweep. They are absent from the live path rather than wrongly clean.
+
+Both paths run the same engine over the same policies, so a verdict reached live is the
+verdict the sweep would reach later over the same text, and both feed one strike ladder —
+a member escalates once, not twice.
+
 ## How it decides
 
 1. The engine convicts, reporting which rule matched, how grave its author called it, and

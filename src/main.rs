@@ -114,6 +114,9 @@ async fn main() -> vector_sdk::Result<()> {
         bot.on_message(move |bot, msg| {
             let (cfg, store, eyes) = (cfg.clone(), store.clone(), eyes.clone());
             async move {
+                if let Err(e) = screen(&bot, &msg, &cfg, &store).await {
+                    eprintln!("screen: {e}");
+                }
                 if let Err(e) = watch_media(&bot, &msg, &cfg, &store, eyes.as_ref().as_ref()).await {
                     eprintln!("media: {e}");
                 }
@@ -122,6 +125,89 @@ async fn main() -> vector_sdk::Result<()> {
         .await?;
     }
     Ok(())
+}
+
+/// Screen one message the instant it lands.
+///
+/// A word filter that answers on the next 90-second tick is not a word filter.
+/// Stateless rules — words, links, mentions — settle from the message alone, so
+/// they run here; rate, repetition and cohorts describe a window and stay with
+/// the sweep, where there is something for them to measure.
+///
+/// The same engine and the same policies, so a verdict reached here is the one
+/// the sweep would reach later over the same text. Strikes key on the same
+/// ladder, so the two paths escalate one member rather than two.
+async fn screen(
+    bot: &VectorBot,
+    msg: &vector_sdk::IncomingMessage,
+    cfg: &Config,
+    store: &Arc<Store>,
+) -> vector_sdk::Result<()> {
+    if !msg.is_group || msg.is_mine() {
+        return Ok(());
+    }
+    let (Some(community), Some(author)) = (msg.community(), msg.author()) else { return Ok(()) };
+    let findings = community.screen(msg).await?;
+    if findings.is_empty() {
+        return Ok(());
+    }
+    let now = now_ms();
+    let mut fresh = false;
+    let mut worst: Option<String> = None;
+    for f in &findings {
+        let gravity = cfg.gravity_of(&f.rule_id).unwrap_or(Gravity::from_severity(&f.severity));
+        let worth = cfg.ladder.strikes.worth(gravity);
+        let evidence = if f.detail.is_empty() {
+            format!("{} [{}]", f.rule_id, f.severity)
+        } else {
+            format!("{} [{}] {}", f.rule_id, f.severity, f.detail.join(", "))
+        };
+        // The screen has no conviction id — the message has no id yet at send
+        // time and this is a different pipeline — so one is minted from what
+        // makes this offense distinct. The sweep's own id for the same text
+        // differs, which is deliberate: an offense caught live and the same
+        // offense re-read from the corpus are one event, and the sweep skips
+        // members whose standing has already been answered.
+        let conviction = format!("screen:{}:{}:{}", f.rule_id, msg.message.id, f.detail.join(","));
+        fresh |= store
+            .record(community.id(), &author, &conviction, worth, now, &evidence)
+            .map_err(vector_sdk::Error::Other)?;
+        worst.get_or_insert(evidence);
+    }
+    let evidence = worst.unwrap_or_default();
+    println!("[screen] {} — {evidence}", short(&author));
+    if !fresh {
+        return Ok(());
+    }
+    let strikes = store.strikes(community.id(), &author).map_err(vector_sdk::Error::Other)?;
+    let total = ladder::total(&strikes, now, cfg.ladder.decay_half_life_hours);
+    if let Some(response) = ladder::decide(&cfg.ladder, total) {
+        let v = live_verdict(&author, &evidence, msg.message.id.clone(), &findings);
+        enforce(bot, &community, cfg, store, &v, response, total, now).await?;
+    }
+    Ok(())
+}
+
+/// A live screen result, in the shape the ladder and the enforcer speak.
+fn live_verdict(npub: &str, evidence: &str, message_id: String, findings: &[vector_sdk::policy::Finding]) -> Verdict {
+    let mut findings = findings.to_vec();
+    // The screen knows the message; the engine's own citation could not, since
+    // at send time it does not exist yet.
+    for f in &mut findings {
+        f.messages = vec![message_id.clone()];
+    }
+    Verdict {
+        npub: npub.to_string(),
+        name: short(npub).to_string(),
+        confidence: 0,
+        proven: 0,
+        band: "alert".into(),
+        shield: "none".into(),
+        reasons: vec![evidence.to_string()],
+        findings,
+        messages: 0,
+        tenure_secs: 0,
+    }
 }
 
 /// The classifier, if the operator configured one.
