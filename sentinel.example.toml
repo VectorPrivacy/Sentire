@@ -1,0 +1,81 @@
+# Sentinel's configuration. Copy to sentinel.toml and edit.
+#
+# Everything defaults to the harmless answer: no custom rules, nothing armed.
+# A missing file is exactly these defaults, so Sentinel starts safe and does
+# nothing until you tell it what you care about.
+
+[bot]
+nsec_env    = "SENTINEL_NSEC"   # the env var holding the key, never the key
+communities = ["*"]             # or explicit community ids
+# mod_channel = "mod-log"       # channel NAME for the audit trail; omit to stay silent
+poll_secs   = 120               # floor of 90: the report is memoised that long
+
+# Nothing is armed until you say so, and each class arms separately. A bot that
+# warns is not thereby a bot that bans.
+[arm]
+warn   = false
+delete = false
+kick   = false
+ban    = false
+raid   = false
+
+[limits]
+max_actions_per_run  = 25
+max_actions_per_hour = 100
+halt_if_over_pct     = 10       # touching more of the roster than this halts the pass
+
+# The rules Sentinel compiles into an engine policy. Vector's built-in raid
+# detection runs regardless; everything here is yours.
+[rules]
+window_hours    = 168
+window_messages = 4000
+
+# [[rules.words]]
+# id       = "slurs"
+# patterns = ["…"]              # bare = whole word; *word* matches inside longer ones
+# gravity  = "grave"
+
+# [[rules.links]]
+# id      = "shorteners"
+# domains = ["bit.ly", "tinyurl.com"]
+# gravity = "serious"
+
+# [rules.rate]
+# enabled  = true
+# per_secs = 60
+# gravity  = "minor"
+
+# [rules.mass_tagging]           # one message naming a crowd; counts DISTINCT people
+# enabled = true
+# gravity = "serious"
+
+# [rules.repetition]             # the same line over and over, inside a burst
+# enabled = true
+# gravity = "minor"
+
+# What an offense costs, and what a running total answers to. Strikes halve
+# every half-life, so forgiveness is built in rather than being a pardon
+# somebody has to remember to issue.
+[ladder]
+strikes = { note = 1, minor = 2, serious = 4, grave = 12 }
+decay_half_life_hours = 168
+
+[[ladder.steps]]
+at = 1
+response = "warn"
+
+[[ladder.steps]]
+at = 4
+response = "delete_and_warn"
+
+[[ladder.steps]]
+at = 8
+response = "kick"
+
+[[ladder.steps]]
+at = 12
+response = "ban"
+
+[shields]
+respect_trusted   = true        # a trusted regular is queued for a human, never actioned
+respect_protected = true        # the owner and moderators are never Sentinel's to judge

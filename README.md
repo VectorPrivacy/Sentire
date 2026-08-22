@@ -12,18 +12,44 @@ what any of that is worth.
 
 ## Status
 
-Early. This build is **report only**: it prints what the engine convicted and contains no
-code that removes anyone. The ladder, enforcement and the media lane are not written yet.
+Early. The text lane works end to end: rules compile from config, convictions become
+strikes, strikes decay, and the ladder decides a response. **Nothing is armed by default**,
+so it rehearses and prints instead of acting. The media lane and raid containment are not
+written yet.
 
 ## Running
 
 ```sh
+cp sentinel.example.toml sentinel.toml
 SENTINEL_NSEC=nsec1… cargo run
 ```
 
-Invite Sentinel to a community from the Vector app; it builds `.public()`, so anyone can.
-It needs no permissions to *watch* — evaluation is a local computation over history it has
-synced. It will need KICK, BAN or MANAGE_MESSAGES to act, once it can.
+A missing config is the defaults: no custom rules, nothing armed. Invite Sentinel to a
+community from the Vector app; it builds `.public()`, so anyone can. It needs no permissions
+to *watch* — evaluation is local computation over history it has synced — but it needs KICK,
+BAN or MANAGE_MESSAGES to carry a sentence out.
+
+## How it decides
+
+1. The engine convicts, reporting which rule matched, how grave its author called it, and
+   which messages it cited.
+2. Sentinel translates gravity into **strikes**, recorded once per conviction. Verdicts
+   re-report every standing conviction on every poll, so the conviction id is what separates
+   an offense from an echo of one.
+3. Strikes **decay by halves**. Two serious offenses in a week reach a kick; the same pair a
+   week apart do not.
+4. The running total meets the **ladder** and a response comes out: warn, delete and warn,
+   kick, ban.
+
+Only *proven* convictions earn strikes. Inference is reported and never sentenced.
+
+## Asking it things
+
+Inside a community, from any client that renders slash commands:
+
+- `/status` — what it is watching, and how much history it can actually see
+- `/why <member>` — their strike record, decayed, and the next step
+- `/pardon <member>` — clear it. Moderators only; the community's own roles decide.
 
 ## Proven vs unproven
 
