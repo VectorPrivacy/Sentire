@@ -215,8 +215,6 @@ impl Powers {
         }
     }
 
-    /// One line for the boot log, so an operator sees what Sentinel can and
-    /// cannot do somewhere before it matters.
     /// Can this community's grant deliver that rung? A warning is a DM and
     /// needs nothing from the community.
     pub fn can_deliver(&self, r: crate::config::Response) -> bool {
@@ -228,6 +226,8 @@ impl Powers {
         }
     }
 
+    /// One line for the boot log, so an operator sees what Sentinel can and
+    /// cannot do somewhere before it matters.
     pub fn describe(&self) -> String {
         let mut have: Vec<&str> = Vec::new();
         for (on, name) in [(self.hide, "hide"), (self.kick, "kick"), (self.ban, "ban")] {

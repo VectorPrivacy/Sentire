@@ -48,6 +48,24 @@ pub fn validate_policy(p: &crate::policy::CommunityPolicy, whose: &str) -> Resul
     if p.ladder.decay_half_life_hours == 0 {
         return at("ladder.decay_half_life_hours = 0: strikes would never be forgiven, and the dedup horizon collapses".into());
     }
+    // Arming a class above an unarmed one makes the first real sentence the
+    // armed rung: the ones below it are answered in the dry space a rehearsal
+    // filled, so a member who has received nothing real is banned outright.
+    let armed = [
+        (p.arm.warn, "warn"),
+        (p.arm.delete, "delete"),
+        (p.arm.kick, "kick"),
+        (p.arm.ban, "ban"),
+    ];
+    if let Some((_, gap)) = armed.iter().enumerate().find_map(|(i, (on, name))| {
+        (!on && armed[i + 1..].iter().any(|(above, _)| *above)).then_some((i, *name))
+    }) {
+        return at(format!(
+            "[arm] {gap} is off while a harsher class is on: the rungs below the armed one would be \
+             answered in the rehearsal's ledger, so the first real sentence lands without warning. \
+             Arm from the bottom up."
+        ));
+    }
     if p.limits.halt_if_over_pct == 0 || p.limits.halt_if_over_pct > 100 {
         return at(format!(
             "limits.halt_if_over_pct = {} — must be 1..=100 (0 would mean 'never act', which is what [arm] is for)",
@@ -584,6 +602,16 @@ mod tests {
         assert_eq!(Response::ALL.len(), 4);
         for r in Response::ALL {
             assert_eq!(Response::rank_of(r.name()), r.rank(), "{r:?} is missing from ALL");
+            // The prefixes the enforcement path actually writes. `attempted:`
+            // is the sole mechanism stopping an undeliverable rung from
+            // pinning every member below it forever.
+            assert_eq!(
+                Response::rank_of(&format!("attempted:{}", r.name())),
+                r.rank(),
+                "a given-up {r:?} must unpin the ladder"
+            );
+            assert_eq!(Response::rank_of(&format!("failed:{}", r.name())), 0, "a failure answers nothing");
+            assert_eq!(Response::rank_of(&format!("raid:{}", r.name())), 0, "a raid row is not a ladder response");
         }
         let mut ranks: Vec<u8> = Response::ALL.iter().map(|r| r.rank()).collect();
         ranks.dedup();
@@ -611,6 +639,8 @@ mod tests {
             ("[raid]\nmax_batch = 900", "max_batch"),
             ("[raid]\ntripwire_accounts = 1", "tripwire_accounts"),
             ("[limits]\nhalt_if_over_pct = 0", "halt_if_over_pct"),
+            ("[arm]\nwarn = false\nkick = true", "Arm from the bottom up"),
+            ("[arm]\nwarn = true\ndelete = false\nban = true", "Arm from the bottom up"),
             ("[limits]\nhalt_if_over_pct = 200", "halt_if_over_pct"),
             ("[limits]\nmax_actions_per_run = 0", "max_actions_"),
             ("[bot]\ncommunities = []", "communities"),

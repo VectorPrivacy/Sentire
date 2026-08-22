@@ -109,11 +109,15 @@ pub async fn install(
         None => {
             // The config is the source of truth, so removing every rule has to
             // remove the policy. Writing nothing left the last one installed
-            // and still convicting.
-            let _ = community.policies().delete(POLICY_ID).await;
-            // And retire what the old rulebook minted, or emptying `[rules]` —
-            // the obvious way to stop a misbehaving bot — leaves the debt loop
+            // and still convicting — and a swallowed failure here left it
+            // installed AND its strikes forgiven, which is the worst of both.
+            community.policies().delete(POLICY_ID).await.map_err(|e| e.to_string())?;
+            // Retire what an old rulebook minted, or emptying `[rules]` — the
+            // obvious way to stop a misbehaving bot — leaves the debt loop
             // climbing the ladder on strikes nothing can convict for any more.
+            //
+            // `""` is not a rulebook, so this is a no-op unless something was
+            // actually stamped: a default config on every boot forgives nobody.
             let retired = store.retire_policy(community.id(), "")?;
             if retired > 0 {
                 return Ok("no custom rules — the old rulebook's strikes forgiven");

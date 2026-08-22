@@ -8,15 +8,33 @@ use crate::config::{Ladder, Response};
 pub struct Strike {
     pub worth: u32,
     pub at_ms: u64,
+    /// Charged on a model's opinion rather than something replayable.
+    pub from_vision: bool,
 }
 
 /// The decayed total: each strike is worth half after the half-life, a quarter
 /// after two, never negative and never rounded up. Forgiveness is built in
 /// rather than being a pardon someone has to remember to issue.
 pub fn total(strikes: &[Strike], now_ms: u64, half_life_hours: u64) -> u32 {
+    weigh(strikes, now_ms, half_life_hours, |_| true)
+}
+
+/// The part of the total that survives replay: no model's opinion in it.
+///
+/// Provenance is a property of each STRIKE, not of the member. A boolean taint
+/// meant one flagged image disarmed every response against them — the worse the
+/// offense, the more immune they became — while a taint that expired sooner
+/// than the strike still counting meant a total only inference could reach was
+/// carried out under the text switches.
+pub fn provable_total(strikes: &[Strike], now_ms: u64, half_life_hours: u64) -> u32 {
+    weigh(strikes, now_ms, half_life_hours, |s| !s.from_vision)
+}
+
+fn weigh(strikes: &[Strike], now_ms: u64, half_life_hours: u64, keep: impl Fn(&Strike) -> bool) -> u32 {
     let half_life_ms = half_life_hours.saturating_mul(3_600_000);
     strikes
         .iter()
+        .filter(|s| keep(s))
         .map(|s| {
             let age = now_ms.saturating_sub(s.at_ms);
             // Integer halvings: cheap, monotone, and exact at the boundaries.
@@ -158,8 +176,11 @@ mod tests {
     #[test]
     fn a_rung_given_up_on_does_not_pin_the_ladder() {
         let l = ladder();
+        // The string the code actually writes. Feeding a bare name made this
+        // a duplicate of the flat(Some("warn")) case above, so deleting the
+        // prefix handling left every test green.
         let gave_up = |r: Response| -> Result<Option<String>, ()> {
-            Ok((r == Response::Warn).then(|| "warn".to_string()))
+            Ok((r == Response::Warn).then(|| "attempted:warn".to_string()))
         };
         assert_eq!(next_step(&l, 12, gave_up, all_powers), Ok(Some(Response::DeleteAndWarn)));
     }
@@ -172,14 +193,14 @@ mod tests {
     fn three_notes_do_not_reach_a_kick() {
         let l = ladder();
         let worth = l.strikes.worth(Gravity::Note);
-        let strikes: Vec<Strike> = (0..3).map(|_| Strike { worth, at_ms: 0 }).collect();
+        let strikes: Vec<Strike> = (0..3).map(|_| Strike { worth, at_ms: 0, from_vision: false }).collect();
         assert_eq!(decide(&l, total(&strikes, 0, l.decay_half_life_hours)), Some(Response::Warn));
     }
 
     #[test]
     fn one_grave_offense_reaches_the_top_without_skipping_the_math() {
         let l = ladder();
-        let strikes = [Strike { worth: l.strikes.worth(Gravity::Grave), at_ms: 0 }];
+        let strikes = [Strike { worth: l.strikes.worth(Gravity::Grave), at_ms: 0, from_vision: false }];
         assert_eq!(decide(&l, total(&strikes, 0, l.decay_half_life_hours)), Some(Response::Ban));
     }
 
@@ -192,7 +213,7 @@ mod tests {
     fn strikes_decay_by_halves_and_reach_zero() {
         let hl = 168u64;
         let hl_ms = hl * 3_600_000;
-        let s = [Strike { worth: 8, at_ms: 0 }];
+        let s = [Strike { worth: 8, at_ms: 0, from_vision: false }];
         assert_eq!(total(&s, 0, hl), 8, "fresh is full");
         assert_eq!(total(&s, hl_ms - 1, hl), 8, "just under a half-life still counts whole");
         assert_eq!(total(&s, hl_ms, hl), 4, "one half-life halves");
@@ -201,15 +222,35 @@ mod tests {
         assert_eq!(total(&s, u64::MAX, hl), 0, "distant past cannot overflow");
     }
 
+    /// Provenance belongs to the strike, not the member.
+    ///
+    /// A boolean taint failed in both directions: one flagged image disarmed
+    /// every response against them, and a taint that expired sooner than the
+    /// strike still counted let a total only inference could reach be carried
+    /// out under the text switches.
+    #[test]
+    fn the_provable_total_excludes_a_models_opinion() {
+        let text = Strike { worth: 8, at_ms: 0, from_vision: false };
+        let seen = Strike { worth: 12, at_ms: 0, from_vision: true };
+        let both = [text, seen];
+        assert_eq!(total(&both, 0, 168), 20, "everything counts toward what they have earned");
+        assert_eq!(provable_total(&both, 0, 168), 8, "but only the replayable half is provable");
+        assert_eq!(provable_total(&[seen], 0, 168), 0, "a member convicted only by a model has proved nothing");
+        // And provenance decays with its own strike rather than on a second clock.
+        let hl_ms = 168 * 3_600_000;
+        assert_eq!(provable_total(&both, 2 * hl_ms, 168), 2);
+        assert_eq!(total(&both, 2 * hl_ms, 168), 5);
+    }
+
     #[test]
     fn escalation_is_cumulative_across_gravities() {
         let l = ladder();
         // Two serious offenses (4 + 4 = 8) reach a kick; the same pair a
         // half-life apart (4 + 2 = 6) stays at delete_and_warn.
         let hl_ms = l.decay_half_life_hours * 3_600_000;
-        let fresh = [Strike { worth: 4, at_ms: hl_ms }, Strike { worth: 4, at_ms: hl_ms }];
+        let fresh = [Strike { worth: 4, at_ms: hl_ms, from_vision: false }, Strike { worth: 4, at_ms: hl_ms, from_vision: false }];
         assert_eq!(decide(&l, total(&fresh, hl_ms, l.decay_half_life_hours)), Some(Response::Kick));
-        let spread = [Strike { worth: 4, at_ms: 0 }, Strike { worth: 4, at_ms: hl_ms }];
+        let spread = [Strike { worth: 4, at_ms: 0, from_vision: false }, Strike { worth: 4, at_ms: hl_ms, from_vision: false }];
         assert_eq!(decide(&l, total(&spread, hl_ms, l.decay_half_life_hours)), Some(Response::DeleteAndWarn));
     }
 }

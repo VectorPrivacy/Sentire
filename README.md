@@ -86,7 +86,14 @@ a member escalates once, not twice.
    deliver is given up on — but only after it has failed over time, and never in a way that
    unlocks a kick or ban against someone nothing has ever reached.
 
-Only *proven* convictions earn strikes, on either clock. Inference is reported and never
+Strikes carry whether they were charged on something replayable or on a model's opinion, and
+the total is split accordingly: a rung the **provable** points already reach is answered under
+the ordinary switches, while a rung only the full total reaches leans on inference and answers
+to `[arm] vision`. So one flagged image cannot make a member immune to being answered for
+everything else, and a total that only reaches a ban because a classifier said so is not
+carried out as though it were proven.
+
+Only *proven* convictions earn strikes from the engine, on either clock. Inference is reported and never
 sentenced — except where an operator arms it explicitly (`[arm] raid`, `[arm] vision`), which
 is a decision made in writing rather than inherited from a switch meant for something else.
 

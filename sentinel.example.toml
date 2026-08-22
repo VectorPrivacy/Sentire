@@ -12,6 +12,9 @@ poll_secs   = 120               # floor of 90: the report is memoised that long
 
 # Nothing is armed until you say so, and each class arms separately. A bot that
 # warns is not thereby a bot that bans.
+# Arm from the BOTTOM UP. Turning on a harsher class while a gentler one is off
+# is refused at boot: the rungs below the armed one would be answered in the
+# rehearsal's ledger, so the first real sentence would land without a warning.
 [arm]
 warn   = false
 delete = false

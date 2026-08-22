@@ -8,7 +8,7 @@ use rusqlite::Connection;
 
 use crate::ladder::Strike;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
@@ -101,6 +101,16 @@ impl Store {
             conn.execute("ALTER TABLE strikes ADD COLUMN policy TEXT NOT NULL DEFAULT ''", [])
                 .map_err(|e| format!("{path}: schema 4 migration failed: {e}"))?;
         }
+        if stored < 5 {
+            // Sentinel's own ids carry no rulebook by construction, and earlier
+            // builds stamped them anyway. An amnesty would erase them for good,
+            // since the id is identical next pass and the insert is ignored.
+            conn.execute(
+                "UPDATE strikes SET policy = '' WHERE conviction_id LIKE 'msg:%' OR conviction_id LIKE 'vision:%'",
+                [],
+            )
+            .map_err(|e| format!("{path}: schema 5 migration failed: {e}"))?;
+        }
         if stored < 4 {
             // The claim key space changed from live: to armed:; leave nothing
             // that only the old reader understood.
@@ -148,11 +158,20 @@ impl Store {
     pub fn strikes(&self, community: &str, subject: &str) -> Result<Vec<Strike>, String> {
         let conn = self.lock();
         let mut stmt = conn
-            .prepare("SELECT worth, at_ms FROM strikes WHERE community = ?1 AND subject = ?2 AND pardoned = 0")
+            .prepare(
+                "SELECT worth, at_ms, conviction_id LIKE 'vision:%' FROM strikes \
+                 WHERE community = ?1 AND subject = ?2 AND pardoned = 0",
+            )
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map(rusqlite::params![community, subject], |r| {
-                Ok(Strike { worth: r.get::<_, i64>(0)? as u32, at_ms: r.get::<_, i64>(1)? as u64 })
+                Ok(Strike {
+                    worth: r.get::<_, i64>(0)? as u32,
+                    at_ms: r.get::<_, i64>(1)? as u64,
+                    // The id already says where it came from; a second column
+                    // would be a second thing to keep in step.
+                    from_vision: r.get::<_, i64>(2)? == 1,
+                })
             })
             .map_err(|e| e.to_string())?;
         rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
@@ -299,10 +318,14 @@ impl Store {
     pub fn retire_policy(&self, community: &str, current: &str) -> Result<usize, String> {
         let mut guard = self.lock();
         let conn = guard.transaction().map_err(|e| e.to_string())?;
+        // DELETED, not tombstoned. These ids embed the policy hash, so they can
+        // never recur under the current rulebook — and a tombstone made the
+        // amnesty one-way: A -> B -> A left everyone permanently at zero,
+        // because A's convictions came back under ids already marked pardoned.
+        // (`pardon` still tombstones; ITS ids are stable and do recur.)
         let n = conn
             .execute(
-                "UPDATE strikes SET pardoned = 1 WHERE community = ?1 AND pardoned = 0 \
-                 AND policy != '' AND policy != ?2",
+                "DELETE FROM strikes WHERE community = ?1 AND policy != '' AND policy != ?2",
                 rusqlite::params![community, current],
             )
             .map_err(|e| e.to_string())?;
@@ -333,21 +356,6 @@ impl Store {
             .map_err(|e| e.to_string())
     }
 
-    /// Does this member carry any live strike from the media lane? Provenance
-    /// follows the EVIDENCE, not the lane enforcing it: a total built partly
-    /// from a model's opinion is inference wherever it is answered from, and
-    /// the sweep was answering it under the text switches.
-    pub fn has_vision_strikes(&self, community: &str, subject: &str, since_ms: u64) -> Result<bool, String> {
-        self.lock()
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM strikes WHERE community = ?1 AND subject = ?2 \
-                 AND pardoned = 0 AND at_ms >= ?3 AND conviction_id LIKE 'vision:%')",
-                rusqlite::params![community, subject, since_ms as i64],
-                |r| r.get::<_, i64>(0).map(|n| n == 1),
-            )
-            .map_err(|e| e.to_string())
-    }
-
     /// How many times this exact sentence has failed against this member
     /// recently. Read by `enforce` to back off: a target that can never be
     /// actioned — gone, outranking us, no inbox relay — would otherwise be
@@ -358,13 +366,19 @@ impl Store {
         subject: &str,
         name: &str,
         since_ms: u64,
-    ) -> Result<(usize, Option<u64>), String> {
+    ) -> Result<(usize, Option<u64>, Option<u64>), String> {
         self.lock()
             .query_row(
-                "SELECT COUNT(*), MIN(at_ms) FROM actions WHERE community = ?1 AND subject = ?2 \
+                "SELECT COUNT(*), MIN(at_ms), MAX(at_ms) FROM actions WHERE community = ?1 AND subject = ?2 \
                  AND response = ?3 AND at_ms >= ?4",
                 rusqlite::params![community, subject, format!("failed:{name}"), since_ms as i64],
-                |r| Ok((r.get::<_, i64>(0)? as usize, r.get::<_, Option<i64>>(1)?.map(|v| v as u64))),
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)? as usize,
+                        r.get::<_, Option<i64>>(1)?.map(|v| v as u64),
+                        r.get::<_, Option<i64>>(2)?.map(|v| v as u64),
+                    ))
+                },
             )
             .map_err(|e| e.to_string())
     }
@@ -622,8 +636,8 @@ pub mod tests {
         // warnings spend the whole community's hourly budget.
         s.log_action("c", "npub1e", "failed:warn", false, 1000, "").unwrap();
         assert_eq!(s.actions_last_hour("c", false, 2000).unwrap(), 1, "a failure spends no budget");
-        assert_eq!(s.failure_span("c", "npub1e", "warn", 0).unwrap(), (1, Some(1000)), "counted for backoff");
-        assert_eq!(s.failure_span("c", "npub1e", "kick", 0).unwrap(), (0, None), "per response");
+        assert_eq!(s.failure_span("c", "npub1e", "warn", 0).unwrap(), (1, Some(1000), Some(1000)), "counted for backoff");
+        assert_eq!(s.failure_span("c", "npub1e", "kick", 0).unwrap(), (0, None, None), "per response");
         assert!(!s.has_delivered("c", "npub1e", 0).unwrap(), "a failure is not a delivery");
         assert!(s.has_delivered("c", "npub1a", 0).unwrap(), "a real action is");
         s.claim_cohort("c", "live:npub1d", 1000, 10_000).unwrap();
@@ -688,6 +702,9 @@ pub mod tests {
 
         assert_eq!(s.retire_policy("c", "p2").unwrap(), 1, "only what the retired rulebook keyed");
         assert_eq!(s.strikes("c", "npub1a").unwrap().len(), 3, "the stable ids survive");
+        // And an edit that reverts must not leave everyone permanently at zero.
+        s.record("c", "npub1a", "engine1", 4, 0, "", "p1").unwrap();
+        assert_eq!(s.strikes("c", "npub1a").unwrap().len(), 4, "a retired conviction can be charged again");
         assert_eq!(
             s.strongest_response("c", "npub1a", false, 0).unwrap().as_deref(),
             Some("kick"),
@@ -698,18 +715,32 @@ pub mod tests {
     /// An upgrade must not forgive a community's history as a side effect of
     /// shipping. Rows written before the column existed carry '' and are never
     /// retired.
-    /// The typo that made B7 inert: `'''vision:%'''` is a VALID literal whose
-    /// value has apostrophes in it, so it parsed, never errored, and never
-    /// matched anything.
+    /// Provenance rides the id, so the rows that built a total also say which
+    /// of them lean on a model's opinion.
     #[test]
-    fn a_vision_strike_is_recognised_as_one() {
+    fn a_strike_says_whether_it_came_from_a_model() {
         let s = mem();
         s.record("c", "npub1a", "vision:hash1:gore", 4, 0, "", "").unwrap();
-        s.record("c", "npub1b", "msg:slurs:evt1", 4, 0, "", "").unwrap();
-        assert!(s.has_vision_strikes("c", "npub1a", 0).unwrap(), "a media strike is media evidence");
-        assert!(!s.has_vision_strikes("c", "npub1b", 0).unwrap(), "a text one is not");
-        s.pardon("c", "npub1a").unwrap();
-        assert!(!s.has_vision_strikes("c", "npub1a", 0).unwrap(), "and a pardoned one no longer counts");
+        s.record("c", "npub1a", "msg:slurs:evt1", 4, 0, "", "").unwrap();
+        let rows = s.strikes("c", "npub1a").unwrap();
+        assert_eq!(rows.iter().filter(|r| r.from_vision).count(), 1, "the media one");
+        assert_eq!(rows.iter().filter(|r| !r.from_vision).count(), 1, "and the text one");
+    }
+
+    /// An upgrade adopts the rulebook in force for rows written before the
+    /// stamp existed — once, and never for Sentinel's own ids, which is the
+    /// invariant that makes re-running it harmless.
+    #[test]
+    fn an_upgrade_adopts_the_rulebook_but_never_sentinels_own_ids() {
+        let s = mem();
+        s.record("c", "npub1a", "deadbeefcafe", 4, 0, "", "").unwrap();
+        s.record("c", "npub1a", "msg:slurs:evt1", 4, 0, "", "").unwrap();
+        s.record("c", "npub1a", "vision:hash1:gore", 4, 0, "", "").unwrap();
+
+        assert_eq!(s.adopt_unstamped("c", "p1").unwrap(), 1, "the engine row only");
+        assert_eq!(s.adopt_unstamped("c", "p2").unwrap(), 0, "and once");
+        assert_eq!(s.retire_policy("c", "p2").unwrap(), 1, "so the next edit retires it");
+        assert_eq!(s.strikes("c", "npub1a").unwrap().len(), 2, "and the stable ids survive that edit");
     }
 
     #[test]

@@ -461,7 +461,7 @@ async fn screen(
     let ctx = live_ctx(cfg, &community, watches, me, false).await;
     if ladder::decide(&ctx.policy.ladder, total).is_some() {
         let v = live_verdict(&author, shield, &evidence, msg.message.id.clone(), &findings);
-        enforce(bot, &community, &ctx, store, watches, &Mutex::new(0), &v, total).await?;
+        enforce(bot, &community, &ctx, store, watches, &Mutex::new(0), &v, &strikes).await?;
     }
     Ok(())
 }
@@ -811,7 +811,7 @@ async fn watch_media(
                 let ctx = live_ctx(cfg, &community, watches, me, true).await;
                 if ladder::decide(&ctx.policy.ladder, total).is_some() {
                     let v = synthetic_verdict(&author, shield.clone(), &evidence, msg.message.id.clone());
-                    enforce(bot, &community, &ctx, store, watches, &Mutex::new(0), &v, total).await?;
+                    enforce(bot, &community, &ctx, store, watches, &Mutex::new(0), &v, &strikes).await?;
                 }
             }
         }
@@ -1121,9 +1121,8 @@ async fn sweep(
                 .map_err(vector_sdk::Error::Other)?;
         }
         let strikes = store.strikes(community.id(), &v.npub).map_err(vector_sdk::Error::Other)?;
-        let total = ladder::total(&strikes, now, ctx.policy.ladder.decay_half_life_hours);
         handled.insert(v.npub.clone());
-        if enforce(bot, community, &ctx, store, wires, &pass, v, total).await? == Outcome::Halted {
+        if enforce(bot, community, &ctx, store, wires, &pass, v, &strikes).await? == Outcome::Halted {
             halted = true;
             break;
         }
@@ -1142,10 +1141,8 @@ async fn sweep(
         let roster = roster_of_community(wires, community.id());
         for (npub, shield) in debt_subjects(&handled, &roster, owed, me) {
             let strikes = store.strikes(community.id(), &npub).map_err(vector_sdk::Error::Other)?;
-            let total = ladder::total(&strikes, now, ctx.policy.ladder.decay_half_life_hours);
-
             let v = carried_verdict(&npub, shield, store.evidence(community.id(), &npub).unwrap_or_default());
-            if enforce(bot, community, &ctx, store, wires, &pass, &v, total).await? == Outcome::Halted {
+            if enforce(bot, community, &ctx, store, wires, &pass, &v, &strikes).await? == Outcome::Halted {
                 halted = true;
                 break;
             }
@@ -1403,35 +1400,37 @@ pub fn select_rung(
     store: &Store,
     community: &str,
     npub: &str,
-    total: u32,
+    strikes: &[ladder::Strike],
     from_vision: bool,
     now: u64,
-    horizon: u64,
 ) -> Result<Option<(Response, bool)>, String> {
-    // Provenance follows the EVIDENCE, not the lane: a total built from a
-    // model's opinion is inference wherever it is answered from.
+    // Derived here, not taken: `now` and `horizon` were two parameters that
+    // must agree, in the function whose seams have failed seven passes running.
+    let horizon = answer_horizon(policy, now);
+    // Provenance is a property of the RUNG, not of the member.
     //
-    // RETURNED, not merely used here. Deriving it and letting the caller
-    // re-derive it from its own lane put the rung selection in one `dry` space
-    // and the arming, dedup, ceilings and recorded row in the other — so a rung
-    // chosen against a rehearsal was then carried out for real, every pass.
-    // Scoped to strikes that still carry real weight, not the full answer
-    // horizon: one image flagged in March should not leave every word-filter
-    // offense in October unarmed.
+    // A boolean taint over the whole member was wrong in both directions: one
+    // flagged image disarmed every response against them, so the worse the
+    // offense the more immune they became — and a taint that expired sooner
+    // than the strike still counted meant a total only inference could reach
+    // was carried out under the text switches.
     //
-    // Derived from the horizon rather than the clock — a function that reads
-    // the time cannot be driven by a test, which is how this glue went
-    // unchecked for six passes.
-    let half_life = policy.ladder.decay_half_life_hours.saturating_mul(3_600_000);
-    let vision_window = now.saturating_sub(half_life.saturating_mul(2));
-    let from_vision = from_vision || store.has_vision_strikes(community, npub, vision_window)?;
+    // So the total is split. Whatever the PROVABLE points reach is answerable
+    // under the text switches; a rung only the full total reaches leans on a
+    // model's opinion and answers to `arm.vision`.
+    let hl = policy.ladder.decay_half_life_hours;
+    let provable = ladder::provable_total(strikes, now, hl);
+    let total = ladder::total(strikes, now, hl);
+    let leans_on_vision = |r: Response| {
+        from_vision || ladder::decide(&policy.ladder, provable).map(|p| r.rank() > p.rank()).unwrap_or(true)
+    };
     let picked = ladder::next_step(
         &policy.ladder,
         total,
-        |r| store.strongest_response(community, npub, !adjudicate::armed_for(policy, r, from_vision), horizon),
+        |r| store.strongest_response(community, npub, !adjudicate::armed_for(policy, r, leans_on_vision(r)), horizon),
         |r| powers.can_deliver(r),
     )?;
-    Ok(picked.map(|r| (r, from_vision)))
+    Ok(picked.map(|r| (r, leans_on_vision(r))))
 }
 
 /// Carry out (or rehearse) whatever [`adjudicate`] decided.
@@ -1448,7 +1447,7 @@ async fn enforce(
     wires: &Watches,
     pass: &Mutex<usize>,
     v: &Verdict,
-    total: u32,
+    strikes: &[ladder::Strike],
 ) -> vector_sdk::Result<Outcome> {
     let gate = enforce_lock(wires, community.id());
     let _serial = gate.lock().await;
@@ -1471,7 +1470,7 @@ async fn enforce(
     // down: the rung was chosen against one `dry` space and then armed,
     // deduped, counted and recorded in the other.
     let Some((response, from_vision)) =
-        select_rung(&ctx.policy, ctx.powers, store, community.id(), &v.npub, total, ctx.from_vision, now, horizon)
+        select_rung(&ctx.policy, ctx.powers, store, community.id(), &v.npub, strikes, ctx.from_vision, now)
             .map_err(vector_sdk::Error::Other)?
     else {
         // Every rung up to what they earned is already answered.
@@ -1538,6 +1537,17 @@ async fn enforce(
     };
 
     let name = response.name();
+    // Back off before spending anything. A permanently unreachable member cost
+    // a DM round trip and a database row on every pass — inside the community's
+    // lock, so it starved every other sentence there too.
+    let (tries, _, last) = store
+        .failure_span(community.id(), &v.npub, name, now.saturating_sub(GIVE_UP_WINDOW_MS))
+        .map_err(vector_sdk::Error::Other)?;
+    if tries >= MAX_FAILURES && last.is_some_and(|l| now.saturating_sub(l) < BACKOFF_MS) {
+        return Ok(Outcome::Failed);
+    }
+
+    let total = ladder::total(strikes, now, ctx.policy.ladder.decay_half_life_hours);
     println!("[{id}] {} {name} {who} — {total} strike(s) — {why}", if armed { "ENFORCE" } else { "WOULD  " });
 
     // Act, THEN log. Logging first recorded a failed ban as a success: it
@@ -1591,7 +1601,7 @@ async fn enforce(
             // outranking us, no inbox relay. Advance the floor so the ladder can
             // move PAST it: leaving it unanswered pinned the member below the
             // rung forever, which turned "unreachable" into "untouchable".
-            let (tries, oldest) = store
+            let (tries, oldest, _) = store
                 .failure_span(community.id(), &v.npub, name, now.saturating_sub(GIVE_UP_WINDOW_MS))
                 .map_err(vector_sdk::Error::Other)?;
             // Three tries AND a span: a ten-minute relay wobble used to burn
@@ -1616,8 +1626,8 @@ async fn enforce(
                 // by anyone who simply publishes no inbox relay list.
                 let ttl = ctx.policy.raid.claim_ttl_secs.saturating_mul(1000);
                 if store
-                    .claim_cohort(community.id(), &format!("unreachable:{}:{name}", v.npub), now, ttl)
-                    .unwrap_or(false)
+                    .claim_cohort(community.id(), &format!("unreachable:{name}:{}", v.npub), now, ttl)
+                    .map_err(vector_sdk::Error::Other)?
                 {
                     announce(
                         bot,
@@ -1657,6 +1667,9 @@ const MAX_FAILURES: usize = 3;
 /// Sentinel treats a rung as undeliverable rather than unlucky.
 const GIVE_UP_WINDOW_MS: u64 = 6 * 3_600_000;
 const GIVE_UP_AFTER_MS: u64 = 30 * 60_000;
+
+/// How long to leave a failing sentence alone before trying it again.
+const BACKOFF_MS: u64 = 60 * 60_000;
 
 /// One community, as this pass sees it: its own rulebook, its own powers, its
 /// own roster. Nothing about judging one community may leak into another.
@@ -1773,7 +1786,10 @@ mod tests {
         let store = mem();
         let p = policy_with("warn = true\ndelete = true\nkick = true\nban = true");
         let all = Powers { hide: true, kick: true, ban: true };
-        let pick = |s: &Store| select_rung(&p, all, s, "c", "npub1a", 12, false, NOW, HORIZON).unwrap().map(|(r, _)| r);
+        let twelve = [ladder::Strike { worth: 12, at_ms: NOW, from_vision: false }];
+        let pick = |s: &Store| {
+            select_rung(&p, all, s, "c", "npub1a", &twelve, false, NOW).unwrap().map(|(r, _)| r)
+        };
 
         assert_eq!(pick(&store), Some(Response::Warn), "twelve points still starts at a warning");
         store.log_action("c", "npub1a", "warn", false, NOW, "").unwrap();
@@ -1789,12 +1805,20 @@ mod tests {
     /// The bug that silenced the whole ladder: with `[arm]` not uniform, a
     /// single lookup read one `dry` space for rungs recorded in another, so it
     /// proposed a rung that was always already answered.
+    ///
+    /// Validation now refuses this shape at boot (arming a class above an
+    /// unarmed one makes the first real sentence the armed rung). This stays as
+    /// the second line: the selection has to be right even if the config ever
+    /// reaches it another way.
     #[test]
     fn a_non_uniform_arm_block_still_climbs() {
         let store = mem();
         let p = policy_with("warn = false\ndelete = false\nkick = true\nban = true");
         let all = Powers { hide: true, kick: true, ban: true };
-        let pick = |s: &Store| select_rung(&p, all, s, "c", "npub1a", 12, false, NOW, HORIZON).unwrap().map(|(r, _)| r);
+        let twelve = [ladder::Strike { worth: 12, at_ms: NOW, from_vision: false }];
+        let pick = |s: &Store| {
+            select_rung(&p, all, s, "c", "npub1a", &twelve, false, NOW).unwrap().map(|(r, _)| r)
+        };
 
         // warn is unarmed, so its rehearsal lands in the dry space.
         assert_eq!(pick(&store), Some(Response::Warn));
@@ -1813,7 +1837,9 @@ mod tests {
         let no_hiding = Powers { hide: false, kick: true, ban: true };
         store.log_action("c", "npub1a", "warn", false, NOW, "").unwrap();
         assert_eq!(
-            select_rung(&p, no_hiding, &store, "c", "npub1a", 12, false, NOW, HORIZON).unwrap().map(|(r, _)| r),
+            select_rung(&p, no_hiding, &store, "c", "npub1a", &[ladder::Strike { worth: 12, at_ms: NOW, from_vision: false }], false, NOW)
+                .unwrap()
+                .map(|(r, _)| r),
             Some(Response::Kick),
             "delete_and_warn cannot be delivered here, so the ladder goes on"
         );
@@ -1834,11 +1860,43 @@ mod tests {
         store.log_action("c", "npub1a", "warn", false, NOW, "").unwrap();
 
         // Enforced from the SWEEP, which knows nothing about the media lane.
+        let seen = [ladder::Strike { worth: 12, at_ms: NOW, from_vision: true }];
         let (r, from_vision) =
-            select_rung(&p, all, &store, "c", "npub1a", 12, false, NOW, HORIZON).unwrap().expect("a rung");
+            select_rung(&p, all, &store, "c", "npub1a", &seen, false, NOW).unwrap().expect("a rung");
         assert!(from_vision, "the evidence is a model's opinion wherever it is answered from");
         assert_eq!(r, Response::Warn, "the live warn answers nothing: this rung is unarmed and lives in the dry space");
         assert!(!adjudicate::armed_for(&p, r, from_vision), "so it rehearses rather than acting");
+    }
+
+    /// A rung the PROVABLE points already reach answers under the text
+    /// switches; one only the full total reaches leans on a model and answers
+    /// to `arm.vision`. A boolean taint got both halves wrong.
+    #[test]
+    fn only_the_rungs_that_lean_on_inference_answer_to_the_vision_switch() {
+        let store = mem();
+        let p = policy_with("warn = true\ndelete = true\nkick = true\nban = true\nvision = false");
+        let all = Powers { hide: true, kick: true, ban: true };
+        // Eight provable points (a kick) plus four from a model (a ban).
+        let mixed = [
+            ladder::Strike { worth: 8, at_ms: NOW, from_vision: false },
+            ladder::Strike { worth: 4, at_ms: NOW, from_vision: true },
+        ];
+        let pick = |s: &Store| select_rung(&p, all, s, "c", "npub1a", &mixed, false, NOW).unwrap();
+
+        // Warn, delete and kick are all within the provable eight, so they are
+        // armed despite the member carrying media strikes.
+        for expected in [Response::Warn, Response::DeleteAndWarn, Response::Kick] {
+            let (r, leans) = pick(&store).expect("a rung");
+            assert_eq!(r, expected);
+            assert!(!leans, "{expected:?} is reached by provable points alone");
+            assert!(adjudicate::armed_for(&p, r, leans), "so it is carried out");
+            store.log_action("c", "npub1a", r.name(), false, NOW, "").unwrap();
+        }
+        // Ban is only reached with the model's four, so it answers to arm.vision.
+        let (r, leans) = pick(&store).expect("a rung");
+        assert_eq!(r, Response::Ban);
+        assert!(leans, "only the full total reaches a ban here");
+        assert!(!adjudicate::armed_for(&p, r, leans), "so it rehearses, with vision unarmed");
     }
 
     fn roster(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
