@@ -8,6 +8,90 @@
 
 use serde::Deserialize;
 
+/// Every check that reads a ladder, limits or raid settings — run against the
+/// FOLDED policy, so a per-community override cannot reach what the defaults
+/// are refused. `whose` names the block in the error.
+pub fn validate_policy(p: &crate::policy::CommunityPolicy, whose: &str) -> Result<(), String> {
+    let at = |msg: String| Err(format!("{whose}: {msg}"));
+    let s = &p.ladder.strikes;
+    if !(s.note <= s.minor && s.minor <= s.serious && s.serious <= s.grave) {
+        return at(format!(
+            "ladder.strikes must not punish a lesser gravity harder: note {} <= minor {} <= serious {} <= grave {}",
+            s.note, s.minor, s.serious, s.grave
+        ));
+    }
+    if [s.note, s.minor, s.serious, s.grave].iter().any(|w| *w > 10_000) {
+        return at("ladder.strikes over 10000: totals are summed, and absurd worths overflow rather than escalate".into());
+    }
+    if p.ladder.steps.is_empty() {
+        return at("ladder.steps is empty: with no steps, no strike total ever answers to anything".into());
+    }
+    if p.ladder.steps[0].at == 0 {
+        return at("ladder.steps starts at 0: that answers a total of zero, so every member is sentenced on sight".into());
+    }
+    for w in p.ladder.steps.windows(2) {
+        if w[1].at <= w[0].at {
+            return at(format!("ladder.steps must ascend: step at {} follows step at {}", w[1].at, w[0].at));
+        }
+        if w[1].response < w[0].response {
+            return at(format!(
+                "ladder.steps must not de-escalate: {:?} at {} follows {:?} at {}",
+                w[1].response, w[1].at, w[0].response, w[0].at
+            ));
+        }
+    }
+    if p.ladder.decay_half_life_hours == 0 {
+        return at("ladder.decay_half_life_hours = 0: strikes would never be forgiven, and the dedup horizon collapses".into());
+    }
+    if p.limits.halt_if_over_pct == 0 || p.limits.halt_if_over_pct > 100 {
+        return at(format!(
+            "limits.halt_if_over_pct = {} — must be 1..=100 (0 would mean 'never act', which is what [arm] is for)",
+            p.limits.halt_if_over_pct
+        ));
+    }
+    if p.limits.max_actions_per_run == 0 || p.limits.max_actions_per_hour == 0 {
+        return at("limits.max_actions_* = 0 silently disables enforcement; leave the class unarmed instead".into());
+    }
+    if p.raid.min_confidence > 99 {
+        return at(format!(
+            "raid.min_confidence = {}: confidence never reaches 100 by construction, so nothing would ever be contained",
+            p.raid.min_confidence
+        ));
+    }
+    if p.raid.max_batch == 0 || p.raid.max_batch > 500 {
+        return at(format!(
+            "raid.max_batch = {}: must be 1..=500 (the wire rejects an over-cap banlist whole)",
+            p.raid.max_batch
+        ));
+    }
+    if p.raid.tripwire_accounts < 2 {
+        return at("raid.tripwire_accounts must be at least 2: one member talking is a conversation".into());
+    }
+    if p.raid.tripwire_secs == 0 || p.raid.tripwire_secs > 86_400 {
+        return at("raid.tripwire_secs must be 1..=86400".into());
+    }
+    if p.raid.tripwire_cooldown_secs > 86_400 {
+        return at("raid.tripwire_cooldown_secs must be at most 86400".into());
+    }
+    if p.raid.claim_ttl_secs == 0 || p.raid.claim_ttl_secs > 30 * 86_400 {
+        return at("raid.claim_ttl_secs must be 1..=2592000 (0 would re-contain the same wave every sweep)".into());
+    }
+    for r in &p.rules.words {
+        if r.patterns.is_empty() {
+            return at(format!("rules.words '{}' has no patterns", r.id));
+        }
+        if r.id == "vision" {
+            return at("rules.words id 'vision' collides with the media lane's own provenance".into());
+        }
+    }
+    for r in &p.rules.links {
+        if r.domains.is_empty() {
+            return at(format!("rules.links '{}' has no domains", r.id));
+        }
+    }
+    Ok(())
+}
+
 /// Sentinel's own vocabulary for how bad something is. Deliberately NOT the
 /// engine's `Severity`: severity is the policy author's judgement, gravity is
 /// the operator's. The two map, they never silently merge.
@@ -207,7 +291,7 @@ impl Strikes {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 pub struct Step {
     pub at: u32,
     pub response: Response,
@@ -355,6 +439,10 @@ pub struct Raid {
     /// Never re-evaluate more often than this. An evaluation is a full corpus
     /// read, and a sustained wave would otherwise ask for one per message.
     pub tripwire_cooldown_secs: u64,
+    /// How long a containment claim binds. Long enough that a wave arriving
+    /// over many sweeps is one event; short enough that the same accounts
+    /// raiding next week are a new one.
+    pub claim_ttl_secs: u64,
     /// Members per ban call. The wire caps a banlist at 500 and rejects an
     /// over-cap batch WHOLE, so a bigger wave arrives in pieces.
     pub max_batch: usize,
@@ -389,6 +477,7 @@ impl Default for Raid {
             tripwire_accounts: 5,
             tripwire_secs: 30,
             tripwire_cooldown_secs: 60,
+            claim_ttl_secs: 6 * 3600,
             max_batch: 100,
         }
     }
@@ -430,62 +519,22 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), String> {
+        // Every policy that will actually be USED, not just the defaults. An
+        // override could otherwise set anything the checks below refuse by
+        // name — a ladder starting at 0 sentences on sight, a zero half-life
+        // makes strikes permanent, a zero batch panics the sweep.
+        validate_policy(&self.for_community(""), "defaults")?;
+        for id in self.community.keys() {
+            validate_policy(&self.for_community(id), &format!("[community.\"{id}\"]"))?;
+        }
+
         if !self.shields.respect_protected {
             return Err("shields.respect_protected = false: refusing to start. \
                         The owner and moderators are never Sentinel's to judge."
                 .into());
         }
-        let s = &self.ladder.strikes;
-        if !(s.note <= s.minor && s.minor <= s.serious && s.serious <= s.grave) {
-            return Err(format!(
-                "ladder.strikes must not punish a lesser gravity harder: note {} <= minor {} <= serious {} <= grave {}",
-                s.note, s.minor, s.serious, s.grave
-            ));
-        }
-        if self.ladder.steps.is_empty() {
-            return Err("ladder.steps is empty: with no steps, no strike total ever answers to anything".into());
-        }
-        if self.ladder.steps[0].at == 0 {
-            return Err("ladder.steps starts at 0: that answers a total of zero, so every member is sentenced on sight".into());
-        }
-        let worths = [s.note, s.minor, s.serious, s.grave];
-        if worths.iter().any(|w| *w > 10_000) {
-            return Err("ladder.strikes over 10000: totals are summed, and absurd worths overflow rather than escalate".into());
-        }
-        for w in self.ladder.steps.windows(2) {
-            if w[1].at <= w[0].at {
-                return Err(format!("ladder.steps must ascend: step at {} follows step at {}", w[1].at, w[0].at));
-            }
-            if w[1].response < w[0].response {
-                return Err(format!(
-                    "ladder.steps must not de-escalate: {:?} at {} follows {:?} at {}",
-                    w[1].response, w[1].at, w[0].response, w[0].at
-                ));
-            }
-        }
-        if self.raid.min_confidence > 99 {
-            return Err(format!(
-                "raid.min_confidence = {}: confidence never reaches 100 by construction, so nothing would ever be contained",
-                self.raid.min_confidence
-            ));
-        }
-        if self.limits.halt_if_over_pct == 0 || self.limits.halt_if_over_pct > 100 {
-            return Err(format!(
-                "limits.halt_if_over_pct = {} — must be 1..=100 (0 would mean 'never act', which is what [arm] is for)",
-                self.limits.halt_if_over_pct
-            ));
-        }
-        if self.limits.max_actions_per_run == 0 || self.limits.max_actions_per_hour == 0 {
-            return Err("limits.max_actions_* = 0 silently disables enforcement; leave the class unarmed instead".into());
-        }
         if self.bot.communities.is_empty() {
             return Err("bot.communities is empty: Sentinel would watch nothing. Use [\"*\"] for every community.".into());
-        }
-        if self.raid.tripwire_accounts < 2 {
-            return Err("raid.tripwire_accounts must be at least 2: one member talking is a conversation".into());
-        }
-        if self.raid.max_batch == 0 || self.raid.max_batch > 500 {
-            return Err(format!("raid.max_batch = {}: must be 1..=500 (the wire rejects an over-cap banlist whole)", self.raid.max_batch));
         }
         if self.vision.enabled {
             if self.vision.labels.is_empty() {
@@ -503,22 +552,11 @@ impl Config {
             }
             if !self.vision.is_local() && !self.vision.allow_remote {
                 return Err(format!(
-                    "vision.base_url {} is not loopback and vision.allow_remote is false.                      An attachment is end-to-end encrypted until Sentinel decrypts it and posts it                      to that host; say so on purpose or keep the model local.",
+                    "vision.base_url {} is not loopback and vision.allow_remote is false. \
+                     An attachment is end-to-end encrypted until Sentinel decrypts it and posts it \
+                     to that host; say so on purpose or keep the model local.",
                     self.vision.base_url
                 ));
-            }
-        }
-        if self.ladder.decay_half_life_hours == 0 {
-            return Err("ladder.decay_half_life_hours = 0: strikes would vanish instantly".into());
-        }
-        for r in &self.rules.words {
-            if r.patterns.is_empty() {
-                return Err(format!("rules.words '{}' has no patterns", r.id));
-            }
-        }
-        for r in &self.rules.links {
-            if r.domains.is_empty() {
-                return Err(format!("rules.links '{}' has no domains", r.id));
             }
         }
         Ok(())
@@ -568,6 +606,12 @@ mod tests {
             ("[vision]\nenabled = true\nbase_url = \"https://api.example.com/v1\"\n[[vision.labels]]\nname = \"gore\"\nthreshold = 0.9\ngravity = \"grave\"", "allow_remote"),
             ("[vision]\nenabled = true\n[[vision.labels]]\nname = \"gore\"\nthreshold = 4.0\ngravity = \"grave\"", "threshold"),
             ("[[rules.words]]\nid = \"empty\"\npatterns = []\ngravity = \"note\"", "empty"),
+            // An override must not reach what the defaults are refused.
+            ("[community.\"x\".ladder]\nsteps = [{ at = 0, response = \"ban\" }]", "sentenced on sight"),
+            ("[community.\"x\".ladder]\ndecay_half_life_hours = 0", "decay_half_life_hours"),
+            ("[community.\"x\".raid]\nmax_batch = 0", "max_batch"),
+            ("[community.\"x\".limits]\nhalt_if_over_pct = 0", "halt_if_over_pct"),
+            ("[community.\"x\".raid]\ntripwire_accounts = 1", "tripwire_accounts"),
         ];
         for (toml_text, expect) in cases {
             let cfg: Config = toml::from_str(toml_text).unwrap();

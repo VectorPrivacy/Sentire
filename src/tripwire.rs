@@ -56,8 +56,8 @@ impl Tripwire {
     pub fn new(threshold: usize, window_secs: u64, cooldown_secs: u64) -> Self {
         Tripwire {
             threshold: threshold.max(2),
-            window_ms: window_secs.max(1) * 1000,
-            cooldown_ms: cooldown_secs * 1000,
+            window_ms: window_secs.max(1).saturating_mul(1000),
+            cooldown_ms: cooldown_secs.saturating_mul(1000),
             pings: VecDeque::new(),
             live: HashMap::new(),
             last_trip_ms: 0,

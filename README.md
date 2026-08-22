@@ -86,6 +86,11 @@ Every sentence — the sweep's ladder, the live text screen, the media lane, rai
 is decided by a single pure function, `adjudicate`. It takes the facts and returns a verdict:
 spare, already answered, held, halt, powerless, or carry it out.
 
+Raid containment answers to its own gates as well as this one — a raid is one event rather
+than N sentences, so it applies standing, powers and the roster ceiling through
+`raid::select` and per-member claims, and it is skipped entirely in a pass where the ladder
+already halted.
+
 The lanes do not decide anything. They gather facts, ask, and obey. That is what makes the
 guards testable without a network, and what stops the next lane reaching an action without
 passing them — a guard living inside the function that *acts* is a guard each new caller can
@@ -173,10 +178,10 @@ has synced, and it says so rather than implying more.
 
 ## Building against the Vector working tree
 
-`Cargo.toml` carries a commented `[patch.crates-io]` block. Uncomment it to build against
-a local Vector checkout at `../Vector` while developing SDK or core changes underneath
-Sentinel. It is currently **required**: the verdict fields Sentinel reads (`band`,
-`shield`, `findings`) are not in a published release yet.
+`Cargo.toml` carries an **active** `[patch.crates-io]` block pointing at a local Vector
+checkout at `../Vector`. It is currently required: the verdict fields Sentinel reads
+(`band`, `shield`, `findings`, `coverage`) are not in a published release yet. Comment it
+out once `vector-core 0.9` and `vector_sdk 0.10` are on crates.io.
 
 ## License
 

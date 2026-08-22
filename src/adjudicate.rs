@@ -61,6 +61,18 @@ pub fn roster_ceiling(cfg: &CommunityPolicy, roster: usize) -> Option<usize> {
     Some(((cfg.limits.halt_if_over_pct as usize * roster) / 100).max(1))
 }
 
+/// Whether this class is armed for this provenance. One source of truth: the
+/// caller scopes its dedup lookup by the same answer the sentence uses.
+pub fn armed_for(cfg: &CommunityPolicy, response: Response, from_vision: bool) -> bool {
+    cfg.arm.vision_ok(from_vision)
+        && match response {
+            Response::Warn => cfg.arm.warn,
+            Response::DeleteAndWarn => cfg.arm.delete,
+            Response::Kick => cfg.arm.kick,
+            Response::Ban => cfg.arm.ban,
+        }
+}
+
 /// The decision. Order matters and is the order below.
 pub fn adjudicate(cfg: &CommunityPolicy, powers: Powers, facts: &Facts, response: Response) -> Sentence {
     // Sentinel is not its own subject.
@@ -74,6 +86,8 @@ pub fn adjudicate(cfg: &CommunityPolicy, powers: Powers, facts: &Facts, response
         "trusted" if cfg.shields.respect_trusted => return Sentence::Spare { why: "trusted" },
         // Not knowing is not the same as knowing they are ordinary. Before the
         // first evaluation fills the roster, holding is the honest answer.
+        // ("absent" is different: the roster IS known and they are not in it, so
+        // the caller has already resolved them against the community's roles.)
         "unknown" => return Sentence::Spare { why: "standing not yet established" },
         _ => {}
     }
@@ -109,14 +123,7 @@ pub fn adjudicate(cfg: &CommunityPolicy, powers: Powers, facts: &Facts, response
         }
     }
 
-    let armed = cfg.arm.vision_ok(facts.from_vision)
-        && match response {
-            Response::Warn => cfg.arm.warn,
-            Response::DeleteAndWarn => cfg.arm.delete,
-            Response::Kick => cfg.arm.kick,
-            Response::Ban => cfg.arm.ban,
-        };
-    Sentence::Carry { response, armed }
+    Sentence::Carry { response, armed: armed_for(cfg, response, facts.from_vision) }
 }
 
 #[cfg(test)]
@@ -156,6 +163,8 @@ mod tests {
             ("none", false),
             // Tenure unknowable is explicitly NOT standing.
             ("indeterminate", false),
+            // Resolved by the caller against the community's roles.
+            ("absent", false),
         ] {
             let f = Facts { shield, ..facts() };
             let got = adjudicate(&cfg, all_powers(), &f, Response::Ban);
@@ -258,6 +267,21 @@ mod tests {
             adjudicate(&cfg, all_powers(), &seen, Response::Kick),
             Sentence::Carry { response: Response::Kick, armed: true }
         );
+    }
+
+    /// The armed-ness that scopes the dedup lookup must be the one the sentence
+    /// is carried out under, or a rehearsal is deduped against real actions.
+    #[test]
+    fn the_arming_a_caller_computes_matches_the_one_used() {
+        let mut cfg = policy();
+        cfg.arm.kick = true;
+        for from_vision in [false, true] {
+            let f = Facts { from_vision, ..facts() };
+            let Sentence::Carry { armed, .. } = adjudicate(&cfg, all_powers(), &f, Response::Kick) else {
+                panic!("expected a sentence")
+            };
+            assert_eq!(armed, armed_for(&cfg, Response::Kick, from_vision), "from_vision {from_vision}");
+        }
     }
 
     #[test]

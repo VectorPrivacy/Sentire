@@ -5,7 +5,8 @@
 use vector_sdk::policy::{Policy, PolicyRule, Seriousness};
 use vector_sdk::Community;
 
-use crate::config::{Config, Gravity};
+use crate::config::Gravity;
+use crate::policy::CommunityPolicy;
 
 /// The id Sentinel's compiled policy is stored under. One writer, one slot:
 /// re-running the compile replaces it rather than stacking copies.
@@ -23,7 +24,7 @@ fn seriousness(g: Gravity) -> Seriousness {
 /// Build the policy the config describes. None when the config adds no rules of
 /// its own — the built-in raid defaults run regardless, and storing an empty
 /// policy would be a no-op with a hash.
-pub fn compile(cfg: &Config) -> Option<Policy> {
+pub fn compile(cfg: &CommunityPolicy) -> Option<Policy> {
     let r = &cfg.rules;
     let mut policy = Policy::named("Sentinel");
     let mut any = false;
@@ -61,8 +62,12 @@ pub fn compile(cfg: &Config) -> Option<Policy> {
 }
 
 /// Install the compiled rulebook into one community's local policy store.
-pub async fn install(community: &Community, cfg: &Config) -> Result<&'static str, String> {
-    match compile(cfg) {
+pub async fn install(community: &Community, cfg: &crate::config::Config) -> Result<&'static str, String> {
+    // The COMMUNITY's rulebook, not the defaults. Installing the top-level one
+    // everywhere meant a community's own `[rules]` override changed how
+    // findings were scored while the engine went on matching somebody else's
+    // rule ids — so every gravity lookup missed and quietly downgraded.
+    match compile(&cfg.for_community(community.id())) {
         Some(policy) => {
             community.policies().set(POLICY_ID, policy).await.map_err(|e| e.to_string())?;
             Ok("installed")
@@ -81,16 +86,44 @@ pub async fn install(community: &Community, cfg: &Config) -> Result<&'static str
 mod tests {
     use super::*;
 
+    fn policy(toml_text: &str) -> CommunityPolicy {
+        toml::from_str::<crate::config::Config>(toml_text).unwrap().for_community("aa")
+    }
+
     #[test]
     fn an_empty_rules_section_compiles_to_nothing() {
-        assert!(compile(&Config::default()).is_none());
+        assert!(compile(&policy("")).is_none());
+    }
+
+    /// The rulebook a community gets is its own. Compiling the defaults
+    /// everywhere left its gravity lookups matching nothing.
+    #[test]
+    fn a_community_compiles_its_own_rules() {
+        let cfg: crate::config::Config = toml::from_str(
+            r#"
+            [[rules.words]]
+            id = "house"
+            patterns = ["darn"]
+            gravity = "note"
+            [community."strict".rules]
+            [[community."strict".rules.words]]
+            id = "strict-words"
+            patterns = ["blast"]
+            gravity = "grave"
+            "#,
+        )
+        .unwrap();
+        let strict = compile(&cfg.for_community("strict")).unwrap().build().unwrap();
+        assert!(strict.contains("strict-words") && !strict.contains("house"));
+        let default = compile(&cfg.for_community("other")).unwrap().build().unwrap();
+        assert!(default.contains("house") && !default.contains("strict-words"));
     }
 
     /// The whole translation, end to end: every configured rule shape lands in
     /// a policy the engine's validator accepts.
     #[test]
     fn a_full_config_compiles_to_a_valid_policy() {
-        let cfg: Config = toml::from_str(
+        let cfg = policy(
             r#"
             [[rules.words]]
             id = "slurs"
@@ -111,8 +144,7 @@ mod tests {
             enabled = true
             gravity = "minor"
             "#,
-        )
-        .unwrap();
+        );
         let policy = compile(&cfg).expect("five rules in, a policy out");
         let bytes = policy.build().expect("and the engine's validator accepts it");
         for id in ["slurs", "shorteners", "rate", "mass-tagging", "repetition"] {
@@ -124,10 +156,7 @@ mod tests {
 
     #[test]
     fn a_disabled_toggle_stays_out_of_the_policy() {
-        let cfg: Config = toml::from_str(
-            "[rules.rate]\nenabled = false\nper_secs = 60\ngravity = \"minor\"",
-        )
-        .unwrap();
+        let cfg = policy("[rules.rate]\nenabled = false\nper_secs = 60\ngravity = \"minor\"");
         assert!(compile(&cfg).is_none(), "disabled is absent, not present-but-off");
     }
 }

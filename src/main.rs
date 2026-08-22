@@ -41,6 +41,12 @@ use tripwire::Tripwire;
 #[derive(Default)]
 struct Watch {
     tripwire: Option<Tripwire>,
+    /// Held across the whole of one sentence. The SDK spawns a task per
+    /// inbound message, so without this forty concurrent screens each read
+    /// `acted_this_hour = 0`, each pass the ceiling, and each act — the guard
+    /// voided during exactly the event it exists for. A tokio mutex, because
+    /// it is deliberately held across the kick/ban await.
+    enforcing: Arc<tokio::sync::Mutex<()>>,
     /// A sweep is in flight. The timer and the tripwire both call `sweep`, and
     /// two overlapping passes each read the corpus, each decide, and each act —
     /// which for a ban is two key rotations for one member.
@@ -72,13 +78,51 @@ impl Drop for SweepGuard {
     }
 }
 
+/// If the sweep task ever unwinds, say so loudly rather than degrading into a
+/// bot that enforces on a frozen roster.
+struct SweepTaskGuard;
+
+impl Drop for SweepTaskGuard {
+    fn drop(&mut self) {
+        eprintln!("FATAL: the sweep task stopped. Sentinel cannot refresh standing; exiting.");
+        std::process::exit(1);
+    }
+}
+
+/// One community's turn to sentence. Everything from reading the ceilings to
+/// writing the row happens under this, so the read is a reservation rather than
+/// a guess that another task has already invalidated.
+fn enforce_lock(wires: &Watches, community: &str) -> Arc<tokio::sync::Mutex<()>> {
+    wires
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(community.to_string())
+        .or_default()
+        .enforcing
+        .clone()
+}
+
 /// A member's standing as the last sweep saw it. `"unknown"` before the first
 /// sweep, and `enforce` holds rather than acts on that.
 fn standing_of(watches: &Watches, community: &str, npub: &str) -> String {
     let guard = watches.lock().unwrap_or_else(|e| e.into_inner());
     match guard.get(community) {
-        Some(w) if w.known => w.standing.get(npub).cloned().unwrap_or_else(|| "none".into()),
+        // Present in the roster the last sweep read: that IS their standing.
+        Some(w) if w.known => w.standing.get(npub).cloned().unwrap_or_else(|| "absent".into()),
         _ => "unknown".into(),
+    }
+}
+
+/// A member the last sweep never saw — joined since, or the roster is stale.
+/// Their standing is not knowable from the cache, so ask the community's own
+/// roles before treating them as ordinary.
+fn resolve_absent(shield: String, msg: &vector_sdk::IncomingMessage) -> String {
+    if shield != "absent" {
+        return shield;
+    }
+    match msg.member() {
+        Some(m) if m.is_admin() => "protected".into(),
+        _ => "none".into(),
     }
 }
 use vision::Vision as _;
@@ -131,18 +175,20 @@ async fn main() -> vector_sdk::Result<()> {
         .communities()
         .await
         .into_iter()
-        .filter(|c| {
-            cfg.bot.communities.iter().any(|want| want == "*" || want == c.id())
-        })
+        .filter(|c| cfg.watches(c.id()))
         .collect();
     if communities.is_empty() {
         println!("Not a member of any watched community yet. Invite Sentinel from the Vector app.");
     }
+    let mut installed_at_boot: std::collections::HashSet<String> = std::collections::HashSet::new();
     for c in &communities {
         let powers = powers_of(c).await;
         match rules::install(c, &cfg).await {
-            Ok(what) => println!("watching {} — {what} — {}", short(c.id()), powers.describe()),
-            Err(e) => eprintln!("watching {} — rulebook rejected: {e}", short(c.id())),
+            Ok(what) => {
+                installed_at_boot.insert(c.id().to_string());
+                println!("watching {} — {what} — {}", short(c.id()), powers.describe());
+            }
+            Err(e) => eprintln!("watching {} — rulebook rejected: {e} — retrying next pass", short(c.id())),
         }
     }
 
@@ -157,29 +203,55 @@ async fn main() -> vector_sdk::Result<()> {
     let poll = Duration::from_secs(cfg.bot.poll_secs.max(90));
     {
         let (bot, store, cfg, wires) = (bot.clone(), store.clone(), cfg.clone(), wires.clone());
+        let installed_at_boot = installed_at_boot;
         tokio::spawn(async move {
-            let mut installed: std::collections::HashSet<String> = communities.iter().map(|c| c.id().to_string()).collect();
+            let mut installed: std::collections::HashSet<String> = installed_at_boot;
+            // Unsupervised, a panic here kills the sweep silently and leaves the
+            // live lanes enforcing against a standing cache that never updates
+            // again. Losing the sweep is worse than stopping.
+            let _guard = SweepTaskGuard;
             loop {
                 // Re-resolved every pass: a community joined after startup was
                 // never swept and never got a rulebook, and one Sentinel was
                 // removed from kept being polled forever.
-                for c in bot.communities().await.into_iter().filter(|c| cfg.watches(c.id())) {
-                    if installed.insert(c.id().to_string()) {
+                let mine: Vec<Community> =
+                    bot.communities().await.into_iter().filter(|c| cfg.watches(c.id())).collect();
+                // Forget the ones Sentinel has left, so a re-invite reinstalls.
+                installed.retain(|id| mine.iter().any(|c| c.id() == id));
+                for c in mine {
+                    // Marked installed only on SUCCESS. Inserting first meant a
+                    // transient failure at boot left that community watched with
+                    // no rulebook forever, printing a healthy heartbeat.
+                    if !installed.contains(c.id()) {
                         let powers = powers_of(&c).await;
                         match rules::install(&c, &cfg).await {
-                            Ok(what) => println!("watching {} — {what} — {}", short(c.id()), powers.describe()),
-                            Err(e) => eprintln!("watching {} — rulebook rejected: {e}", short(c.id())),
+                            Ok(what) => {
+                                installed.insert(c.id().to_string());
+                                println!("watching {} — {what} — {}", short(c.id()), powers.describe());
+                            }
+                            Err(e) => eprintln!("watching {} — rulebook rejected: {e} — retrying next pass", short(c.id())),
                         }
                     }
                     if let Err(e) = sweep(&bot, &c, &cfg, &store, &wires, &me).await {
                         eprintln!("{}: {e}", short(c.id()));
                     }
                 }
-                // Nothing older than a fully-decayed strike can affect a
-                // verdict, and this process is meant to run for months.
-                let horizon = now_ms()
-                    .saturating_sub(cfg.ladder.decay_half_life_hours.saturating_mul(3_600_000).saturating_mul(32));
-                let _ = store.prune(horizon);
+                // The store holds every community's history, so the janitor
+                // keeps the LONGEST memory any of them asked for. Pruning on the
+                // default forgave a long-memory community early and deleted the
+                // record of what had already been done there.
+                let widest = cfg
+                    .community
+                    .values()
+                    .filter_map(|o| o.ladder.as_ref().and_then(|l| l.decay_half_life_hours))
+                    .chain(std::iter::once(cfg.ladder.decay_half_life_hours))
+                    .max()
+                    .unwrap_or(cfg.ladder.decay_half_life_hours);
+                let horizon =
+                    now_ms().saturating_sub(widest.saturating_mul(3_600_000).saturating_mul(32));
+                if let Err(e) = store.prune(horizon) {
+                    eprintln!("prune: {e}");
+                }
                 tokio::time::sleep(poll).await;
             }
         });
@@ -197,11 +269,11 @@ async fn main() -> vector_sdk::Result<()> {
             async move {
                 match event {
                     BotEvent::Message(msg) => {
-                        if let Err(e) = screen(&bot, &msg, &cfg, &store, &wires).await {
+                        if let Err(e) = screen(&bot, &msg, &cfg, &store, &wires, &me).await {
                             eprintln!("screen: {e}");
                         }
                         if let Err(e) =
-                            watch_media(&bot, &msg, &cfg, &store, eyes.as_ref().as_ref(), &wires, &budget).await
+                            watch_media(&bot, &msg, &cfg, &store, eyes.as_ref().as_ref(), &wires, &budget, &me).await
                         {
                             eprintln!("media: {e}");
                         }
@@ -295,6 +367,7 @@ async fn screen(
     cfg: &Config,
     store: &Arc<Store>,
     watches: &Watches,
+    me: &str,
 ) -> vector_sdk::Result<()> {
     if !msg.is_group || msg.is_mine() {
         return Ok(());
@@ -313,7 +386,7 @@ async fn screen(
     // long-tenured regular reads as untrusted there — and their strikes piled
     // up invisibly while `enforce` spared them, ready to fire all at once if
     // `respect_trusted` were ever turned off.
-    let shield = standing_of(watches, community.id(), &author);
+    let shield = resolve_absent(standing_of(watches, community.id(), &author), msg);
     if matches!(shield.as_str(), "protected" | "unknown") || (shield == "trusted" && policy.shields.respect_trusted) {
         return Ok(());
     }
@@ -336,10 +409,7 @@ async fn screen(
         // differs, which is deliberate: an offense caught live and the same
         // offense re-read from the corpus are one event, and the sweep skips
         // members whose standing has already been answered.
-        // The SAME id the sweep would mint for this match. Splitting ownership
-        // between the clocks meant a message that arrived while Sentinel was
-        // down was charged by neither: the screen never saw it, and the sweep
-        // skipped it as the screen's business.
+        // The same id the sweep mints, so whichever clock arrives first wins.
         let conviction = conviction_id(&f.policy_hash, &f.rule_id, &msg.message.id);
         fresh |= store
             .record(community.id(), &author, &conviction, worth, now, &evidence)
@@ -356,10 +426,10 @@ async fn screen(
     }
     let strikes = store.strikes(community.id(), &author).map_err(vector_sdk::Error::Other)?;
     let total = ladder::total(&strikes, now, policy.ladder.decay_half_life_hours);
-    let ctx = live_ctx(cfg, &community, watches).await;
+    let ctx = live_ctx(cfg, &community, watches, me, false).await;
     if let Some(response) = ladder::decide(&ctx.policy.ladder, total) {
         let v = live_verdict(&author, shield, &evidence, msg.message.id.clone(), &findings);
-        enforce(bot, &community, &ctx, store, &Mutex::new(0), &v, response, total, now).await?;
+        enforce(bot, &community, &ctx, store, watches, &Mutex::new(0), &v, response, total, now).await?;
     }
     Ok(())
 }
@@ -367,13 +437,14 @@ async fn screen(
 /// One community's context for a live lane. Its rulebook and its powers, same
 /// as the sweep resolves — a message arriving is not a reason to judge it by
 /// somebody else's standards.
-async fn live_ctx(cfg: &Config, community: &Community, watches: &Watches) -> Ctx {
+async fn live_ctx(cfg: &Config, community: &Community, watches: &Watches, me: &str, from_vision: bool) -> Ctx {
     Ctx {
         policy: cfg.for_community(community.id()),
         powers: powers_of(community).await,
         roster: roster_of(watches, community.id()),
-        me: String::new(),
+        me: me.to_string(),
         mod_channel: cfg.bot.mod_channel.clone(),
+        from_vision,
     }
 }
 
@@ -384,15 +455,56 @@ async fn powers_of(community: &Community) -> Powers {
 
 /// The roster as the last sweep counted it, so a live action is bound by the
 /// same percentage ceiling the sweep obeys.
-/// One offense, one id, whichever clock reaches it first. `INSERT OR IGNORE`
-/// then does the deduplication rather than either lane having to know what the
-/// other saw.
+/// One offense, one id, whichever clock reaches it first.
 fn conviction_id(policy_hash: &str, rule_id: &str, message_id: &str) -> String {
     format!("msg:{policy_hash}:{rule_id}:{message_id}")
 }
 
+/// The roster as the last sweep counted it, so a live action is bound by the
+/// same percentage ceiling the sweep obeys.
 fn roster_of(watches: &Watches, community: &str) -> usize {
     watches.lock().unwrap_or_else(|e| e.into_inner()).get(community).map(|w| w.standing.len()).unwrap_or(0)
+}
+
+/// Media that was never judged. Silence here is a way to slip something past:
+/// twenty junk images exhaust the minute's budget and the twenty-first is
+/// dropped with nothing said. One line per minute-bucket, so a flood is one
+/// message rather than a hundred.
+#[allow(clippy::too_many_arguments)]
+async fn unclassified(
+    bot: &VectorBot,
+    community: &Community,
+    cfg: &Config,
+    store: &Arc<Store>,
+    watches: &Watches,
+    me: &str,
+    now: u64,
+    att_id: &str,
+    why: &str,
+) {
+    println!("[media] UNJUDGED {} — {why} — for review", short(att_id));
+    let bucket = format!("unjudged:{}", now / 60_000);
+    if store.claim_cohort(community.id(), &bucket, now, 3_600_000).unwrap_or(false) {
+        let ctx = live_ctx(cfg, community, watches, me, true).await;
+        announce(bot, community, &ctx, "Attachments arrived faster than I could check them — some were not judged.").await;
+    }
+}
+
+/// A member the store owes for, with no engine finding of their own — the
+/// ladder is the entire case.
+fn carried_verdict(npub: &str, shield: String) -> Verdict {
+    Verdict {
+        npub: npub.to_string(),
+        name: short(npub).to_string(),
+        confidence: 0,
+        proven: 0,
+        band: "alert".into(),
+        shield,
+        reasons: vec!["carrying strikes from an earlier finding".into()],
+        findings: vec![],
+        messages: 0,
+        tenure_secs: 0,
+    }
 }
 
 /// A live screen result, in the shape the ladder and the enforcer speak.
@@ -490,10 +602,22 @@ async fn watch_media(
     eyes: Option<&vision::openai::OpenAiVision>,
     watches: &Watches,
     budget: &Budget,
+    me: &str,
 ) -> vector_sdk::Result<()> {
     let (Some(eyes), true) = (eyes, msg.is_group && msg.is_file && !msg.is_mine()) else { return Ok(()) };
     let (Some(community), Some(author)) = (msg.community(), msg.author()) else { return Ok(()) };
     if !cfg.watches(community.id()) {
+        return Ok(());
+    }
+    // Before ANY byte is fetched. Nothing here could be acted on for a shielded
+    // member, and classifying anyway decrypted their private images and — with
+    // a remote endpoint — shipped them off the machine to produce a verdict
+    // that is then thrown away.
+    let shield = resolve_absent(standing_of(watches, community.id(), &author), msg);
+    let policy = cfg.for_community(community.id());
+    if matches!(shield.as_str(), "protected" | "unknown")
+        || (shield == "trusted" && policy.shields.respect_trusted)
+    {
         return Ok(());
     }
     let now = now_ms();
@@ -515,7 +639,7 @@ async fn watch_media(
         let bytes = match bot.download_attachment_from(att, msg.message.npub.as_deref()).await {
             Ok(b) => b,
             Err(e) => {
-                println!("[media] could not fetch {} — {e} — queued, not cleared", short(&att.id));
+                unclassified(bot, &community, cfg, store, watches, me, now, &att.id, &format!("{e}")).await;
                 continue;
             }
         };
@@ -540,13 +664,14 @@ async fn watch_media(
             None => {
                 let Ok(_slot) = budget.slot.try_acquire() else {
                     // Contention is not a reason to wait with megabytes pinned
-                    // in memory. The lane already treats "not classified" as
-                    // something for a person, which is the safe answer.
-                    println!("[media] {} — classifier busy, queued", short(&att.id));
+                    // in memory. Unclassified routes to a person, which is the
+                    // safe answer — but it must SAY so, or a wave of junk
+                    // images is a way to slip one past unnoticed.
+                    unclassified(bot, &community, cfg, store, watches, me, now, &att.id, "classifier busy").await;
                     continue;
                 };
                 if !budget.claim() {
-                    println!("[media] {} — classification budget spent this minute, queued", short(&att.id));
+                    unclassified(bot, &community, cfg, store, watches, me, now, &att.id, "budget spent this minute").await;
                     continue;
                 }
                 let v = eyes.classify(&bytes, actual).await;
@@ -564,24 +689,17 @@ async fn watch_media(
         match verdict {
             vision::Verdict::Clean => {}
             vision::Verdict::Unknown(why) => {
+                let _ = &why;
                 // Never an all-clear. An unreachable model is a reason to ask a
                 // person, not a reason to let everything through.
                 println!("[media] UNKNOWN {} from {} — {why} — for review", short(&att.id), short(&author));
                 // The reason can carry the endpoint URL, and this line goes
                 // into a community channel.
-                announce(bot, &community, &live_ctx(cfg, &community, watches).await, &format!("Could not classify an attachment from {}.", short(&author))).await;
+                announce(bot, &community, &live_ctx(cfg, &community, watches, me, true).await, &format!("Could not classify an attachment from {}.", short(&author))).await;
             }
             vision::Verdict::Flagged(labels) => {
                 let hits = vision::over_threshold(&labels, &cfg.vision.labels);
                 if hits.is_empty() {
-                    continue;
-                }
-                let shield = standing_of(watches, community.id(), &author);
-                let policy = cfg.for_community(community.id());
-                if matches!(shield.as_str(), "protected" | "unknown")
-                    || (shield == "trusted" && policy.shields.respect_trusted)
-                {
-                    println!("[media] QUEUED {} from {} — standing ({shield})", short(&att.id), short(&author));
                     continue;
                 }
                 let (label, gravity) = hits[0].clone();
@@ -599,10 +717,10 @@ async fn watch_media(
                 }
                 let strikes = store.strikes(community.id(), &author).map_err(vector_sdk::Error::Other)?;
                 let total = ladder::total(&strikes, now, policy.ladder.decay_half_life_hours);
-                let ctx = live_ctx(cfg, &community, watches).await;
+                let ctx = live_ctx(cfg, &community, watches, me, true).await;
                 if let Some(response) = ladder::decide(&ctx.policy.ladder, total) {
                     let v = synthetic_verdict(&author, shield.clone(), &evidence, msg.message.id.clone());
-                    enforce(bot, &community, &ctx, store, &Mutex::new(0), &v, response, total, now).await?;
+                    enforce(bot, &community, &ctx, store, watches, &Mutex::new(0), &v, response, total, now).await?;
                 }
             }
         }
@@ -647,26 +765,36 @@ fn synthetic_verdict(npub: &str, shield: String, evidence: &str, message_id: Str
 /// Read-only by default. `pardon` is the one command that changes anything, and
 /// it answers only to someone the community already trusts to moderate — a bot
 /// with no undo is not deployable, and an undo anyone can call is not either.
-fn operator_surface(bot: &VectorBot, cfg: &Config, store: &Arc<Store>) {
-    let armed = format!(
-        "{}{}{}{}{}",
-        if cfg.arm.warn { "warn " } else { "" },
-        if cfg.arm.delete { "delete " } else { "" },
-        if cfg.arm.kick { "kick " } else { "" },
-        if cfg.arm.ban { "ban " } else { "" },
-        if cfg.arm.raid { "raid " } else { "" },
-    );
-    let armed = if armed.trim().is_empty() { "nothing (dry run)".to_string() } else { armed.trim().to_string() };
+fn operator_surface(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<Store>) {
+    /// Resolved where the question was ASKED. Reporting the top-level config
+    /// answered "Armed: nothing (dry run)" in a community armed to ban.
+    fn armed_line(p: &CommunityPolicy) -> String {
+        let armed: String = [
+            (p.arm.warn, "warn "),
+            (p.arm.delete, "delete "),
+            (p.arm.kick, "kick "),
+            (p.arm.ban, "ban "),
+            (p.arm.raid, "raid "),
+            (p.arm.vision, "vision "),
+        ]
+        .iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, n)| *n)
+        .collect();
+        if armed.trim().is_empty() { "nothing (dry run)".into() } else { armed.trim().to_string() }
+    }
 
     bot.command("status", "What Sentinel is watching, and how much of it it can see").run({
-        let armed = armed.clone();
+        let cfg = cfg.clone();
         move |ctx| {
-            let armed = armed.clone();
+            let cfg = cfg.clone();
             async move {
                 let Some(community) = ctx.msg.community() else {
                     let _ = ctx.reply("Ask me this inside a community.").await;
                     return;
                 };
+                let armed = armed_line(&cfg.for_community(community.id()));
+                let powers = powers_of(&community).await;
                 let text = match community.verdicts().await {
                     Ok(v) => {
                         let cov = v.coverage();
@@ -681,10 +809,12 @@ fn operator_surface(bot: &VectorBot, cfg: &Config, store: &Arc<Store>) {
                             )
                         };
                         format!(
-                            "Watching {} members ({} trusted, {} protected). Armed: {armed}. Seeing {history}.",
+                            "Watching {} members ({} trusted, {} protected). Armed: {armed}. \
+                             Here I {}. Seeing {history}.",
                             v.all().count(),
                             v.all().filter(|m| m.shield == "trusted").count(),
                             v.all().filter(|m| m.shield == "protected").count(),
+                            powers.describe(),
                         )
                     }
                     Err(e) => format!("Could not evaluate: {e}"),
@@ -697,17 +827,18 @@ fn operator_surface(bot: &VectorBot, cfg: &Config, store: &Arc<Store>) {
     bot.command("why", "Why Sentinel has flagged someone")
         .user("member", "Whose standing to explain", true)
         .run({
-            let store = store.clone();
-            let half_life = cfg.ladder.decay_half_life_hours;
-            let ladder = cfg.ladder.clone();
+            let (store, cfg) = (store.clone(), cfg.clone());
             move |ctx| {
-                let (store, ladder) = (store.clone(), ladder.clone());
+                let (store, cfg) = (store.clone(), cfg.clone());
                 async move {
                     let (Some(community), Some(who)) = (ctx.msg.community(), ctx.str("member").map(str::to_string))
                     else {
                         let _ = ctx.reply("Ask me this inside a community, naming a member.").await;
                         return;
                     };
+                    // This community's ladder, not the defaults.
+                    let ladder = cfg.for_community(community.id()).ladder;
+                    let half_life = ladder.decay_half_life_hours;
                     let strikes = store.strikes(community.id(), &who).unwrap_or_default();
                     if strikes.is_empty() {
                         let _ = ctx.reply(format!("{} has no strikes with me.", short(&who))).await;
@@ -810,26 +941,37 @@ async fn sweep(
         roster: verdicts.all().count(),
         me: me.to_string(),
         mod_channel: cfg.bot.mod_channel.clone(),
+        from_vision: false,
     };
     let pass = Mutex::new(0usize);
     let mut convicted = 0usize;
+    let mut halted = false;
 
     // `all()`, not `proven()`: the shielded are filtered out upstream by
     // `proven()`, so gating on them inside that loop could never fire and the
     // operator never saw who was spared.
     for v in verdicts.all().filter(|v| v.is_proven()) {
-        convicted += 1;
         if v.npub == me {
             continue;
         }
+        convicted += 1;
 
         // Record what is NEW this poll. Verdicts re-report every standing
         // conviction, so the conviction id is the line between an offense and
         // an echo of one.
+        // Which rules already charged per message. A content rule convicts at
+        // BOTH scopes over the same citations, so charging the window rung too
+        // billed one offense twice — and pushed three flagged links from a kick
+        // to an instant ban.
+        let charged_per_message: std::collections::HashSet<&str> =
+            v.findings.iter().filter(|f| f.stateless).map(|f| f.rule_id.as_str()).collect();
         let mut fresh = false;
         for f in &v.findings {
             if !f.is_proven() {
                 continue; // inference never earns a strike
+            }
+            if !f.stateless && charged_per_message.contains(f.rule_id.as_str()) {
+                continue; // the density charges already cover this evidence
             }
             let gravity = ctx.policy.gravity_of(&f.rule_id, &f.severity);
             let worth = ctx.policy.ladder.strikes.worth(gravity);
@@ -862,8 +1004,34 @@ async fn sweep(
         let total = ladder::total(&strikes, now, ctx.policy.ladder.decay_half_life_hours);
         let Some(response) = ladder::decide(&ctx.policy.ladder, total) else { continue };
 
-        if enforce(bot, community, &ctx, store, &pass, v, response, total, now).await? == Outcome::Halted {
+        if enforce(bot, community, &ctx, store, wires, &pass, v, response, total, now).await? == Outcome::Halted {
+            halted = true;
             break;
+        }
+    }
+
+    // Everyone the store owes for, whom the engine did not report. A vision-only
+    // offender, or one whose live strikes never lifted their engine score, is
+    // invisible to the loop above — so a sentence held by a ceiling or lost to a
+    // failed action had nothing that would ever retry it.
+    if !halted {
+        let horizon = now.saturating_sub(
+            ctx.policy.ladder.decay_half_life_hours.saturating_mul(3_600_000).saturating_mul(32),
+        );
+        let seen: std::collections::HashSet<&str> = verdicts.all().map(|v| v.npub.as_str()).collect();
+        for npub in store.subjects_with_strikes(community.id(), horizon).map_err(vector_sdk::Error::Other)? {
+            if seen.contains(npub.as_str()) || npub == me {
+                continue;
+            }
+            let strikes = store.strikes(community.id(), &npub).map_err(vector_sdk::Error::Other)?;
+            let total = ladder::total(&strikes, now, ctx.policy.ladder.decay_half_life_hours);
+            let Some(response) = ladder::decide(&ctx.policy.ladder, total) else { continue };
+            let shield = standing_of(wires, community.id(), &npub);
+            let v = carried_verdict(&npub, shield);
+            if enforce(bot, community, &ctx, store, wires, &pass, &v, response, total, now).await? == Outcome::Halted {
+                halted = true;
+                break;
+            }
         }
     }
 
@@ -877,7 +1045,13 @@ async fn sweep(
             v.proven
         );
     }
-    contain(bot, community, &ctx, store, &verdicts, now).await?;
+    // A community that just tripped the emptying guard is not one to then run
+    // a bulk action against unattended.
+    if halted {
+        println!("[{id}] halt in force — raid containment deferred to a person");
+    } else {
+        contain(bot, community, &ctx, store, &verdicts, now).await?;
+    }
 
     heartbeat(id, &verdicts, convicted, &ctx.powers);
     Ok(())
@@ -907,7 +1081,11 @@ async fn contain(
             // long as its evidence sits in the window, and an unclaimed halt
             // republished this line into a community channel every 90 seconds
             // for a week.
-            if store.claim_cohort(community.id(), &format!("halt:{}", now / 3_600_000), now).map_err(vector_sdk::Error::Other)? {
+            let ttl = ctx.policy.raid.claim_ttl_secs.saturating_mul(1000);
+            if store
+                .claim_cohort(community.id(), &format!("halt:{}", now / 3_600_000), now, ttl)
+                .map_err(vector_sdk::Error::Other)?
+            {
                 let line = format!(
                     "RAID HALT — {suspects} of {roster} members are over the bar, past the {}% ceiling. \
                      Containing this many is a person's call, not mine.",
@@ -940,10 +1118,11 @@ async fn contain(
     // Claims are scoped to armed-ness, so a rehearsal never immunises a cohort
     // against a later real containment.
     let scope = if armed { "live" } else { "dry" };
+    let ttl = ctx.policy.raid.claim_ttl_secs.saturating_mul(1000);
     let mut fresh: Vec<String> = Vec::new();
     for npub in &suspects {
         if store
-            .claim_cohort(community.id(), &format!("{scope}:{npub}"), now)
+            .claim_cohort(community.id(), &format!("{scope}:{npub}"), now, ttl)
             .map_err(vector_sdk::Error::Other)?
         {
             fresh.push(npub.clone());
@@ -956,7 +1135,11 @@ async fn contain(
     let verb = response.name();
     let line = format!(
         "RAID {} — {} account(s), {verb}",
-        if armed { "CONTAINED" } else { "SUSPECTED (unarmed, nobody touched)" },
+        match (armed, response) {
+            (_, RaidResponse::Report) => "REPORTED (nobody touched)",
+            (true, _) => "CONTAINED",
+            (false, _) => "SUSPECTED (unarmed, nobody touched)",
+        },
         fresh.len()
     );
     println!("[{id}] {line}");
@@ -967,8 +1150,12 @@ async fn contain(
     if armed && response != RaidResponse::Report {
         match response {
             RaidResponse::Kick => {
-                // Kicks touch the guestbook and rotate nothing, so a loop is honest.
-                for npub in &fresh {
+                // Kicks rotate nothing, so a loop is honest about KEYS — but
+                // each one folds the control plane, so a large wave is minutes
+                // inside the single-flight guard, starving every other
+                // community. Bounded per pass; the rest keep no claim and are
+                // picked up next time.
+                for npub in fresh.iter().take(ctx.policy.raid.max_batch) {
                     match community.member(npub.clone()).kick().await {
                         Ok(()) => done.push(npub),
                         Err(e) => eprintln!("[{id}] kick {}: {e}", short(npub)),
@@ -988,14 +1175,21 @@ async fn contain(
             }
             RaidResponse::Report => {}
         }
-        if done.is_empty() {
-            // Nothing happened. Release the claims so the next pass can retry
-            // rather than marking this cohort handled forever.
-            for npub in &fresh {
+        // Anything past the per-pass bound never had an action attempted.
+        // Release every member the action did not actually reach. Releasing
+        // only on total failure stranded the ones a partial failure missed:
+        // they kept their claims and were never retried, silently.
+        for npub in &fresh {
+            if !done.iter().any(|d| *d == npub.as_str()) {
                 let _ = store.release_cohort(community.id(), &format!("{scope}:{npub}"));
             }
+        }
+        if done.is_empty() {
             eprintln!("[{id}] containment failed entirely — released for retry");
             return Ok(());
+        }
+        if done.len() < fresh.len() {
+            eprintln!("[{id}] contained {} of {} — the rest released for retry", done.len(), fresh.len());
         }
     } else {
         done = fresh.iter().map(String::as_str).collect();
@@ -1004,9 +1198,10 @@ async fn contain(
     // Prefixed, so a raid row is never read as a ladder response. An unarmed
     // raid stamping a bare "kick" on every suspect immunised all of them
     // against warn, delete and kick — permanently, on evidence nobody acted on.
+    let touched = armed && response != RaidResponse::Report;
     for npub in &done {
         store
-            .log_action(community.id(), npub, &format!("raid:{verb}"), !armed, now, "raid cohort")
+            .log_action(community.id(), npub, &format!("raid:{verb}"), !touched, now, "raid cohort")
             .map_err(vector_sdk::Error::Other)?;
     }
     if armed {
@@ -1014,9 +1209,6 @@ async fn contain(
     }
     Ok(())
 }
-
-/// A live screen result, in the shape the ladder and the enforcer speak.
-
 
 /// Carry out (or rehearse) whatever [`adjudicate`] decided.
 ///
@@ -1029,22 +1221,24 @@ async fn enforce(
     community: &Community,
     ctx: &Ctx,
     store: &Arc<Store>,
+    wires: &Watches,
     pass: &Mutex<usize>,
     v: &Verdict,
     response: Response,
     total: u32,
     now: u64,
 ) -> vector_sdk::Result<Outcome> {
+    let gate = enforce_lock(wires, community.id());
+    let _serial = gate.lock().await;
     let id = short(community.id());
     let why = v.why();
     let who = short(&v.npub);
 
-    let armed_class = match response {
-        Response::Warn => ctx.policy.arm.warn,
-        Response::DeleteAndWarn => ctx.policy.arm.delete,
-        Response::Kick => ctx.policy.arm.kick,
-        Response::Ban => ctx.policy.arm.ban,
-    };
+    // The SAME armed-ness the sentence will be carried out under. Computing it
+    // differently here scoped the dedup lookup to the wrong `dry` space, so a
+    // vision rehearsal was deduped against real kicks.
+    let from_vision = ctx.from_vision;
+    let armed_class = adjudicate::armed_for(&ctx.policy, response, from_vision);
     // Answers decay with the strikes they answered: `32` halvings is where a
     // strike reaches zero, so beyond that there is nothing left to have
     // answered for.
@@ -1056,10 +1250,15 @@ async fn enforce(
         shield: &v.shield,
         prior: prior.as_deref(),
         acted_this_pass: *pass.lock().unwrap_or_else(|e| e.into_inner()),
-        acted_this_hour: store.actions_last_hour(community.id(), now).map_err(vector_sdk::Error::Other)?,
+        // Scoped the same way the dedup lookup is. Counting only real actions
+        // meant a full dry run never hit a ceiling, so the operator rehearsed a
+        // run that looked nothing like the armed one.
+        acted_this_hour: store
+            .actions_last_hour(community.id(), !armed_class, now)
+            .map_err(vector_sdk::Error::Other)?,
         roster: ctx.roster,
         is_me: v.npub == ctx.me,
-        from_vision: v.findings.iter().any(|f| f.rule_id == "vision"),
+        from_vision,
     };
 
     let (response, armed) = match adjudicate::adjudicate(&ctx.policy, ctx.powers, &facts, response) {
@@ -1097,7 +1296,15 @@ async fn enforce(
             Response::DeleteAndWarn => {
                 // Capped: a member cited across fifty messages is one sentence,
                 // not fifty round trips inside one decision.
-                for msg_id in v.findings.iter().flat_map(|f| f.messages.iter()).take(MAX_HIDES) {
+                let mut hidden = std::collections::HashSet::new();
+                for msg_id in v
+                    .findings
+                    .iter()
+                    .filter(|f| f.is_proven())
+                    .flat_map(|f| f.messages.iter())
+                    .filter(|m| hidden.insert((*m).clone()))
+                    .take(MAX_HIDES)
+                {
                     if let Some(m) = bot.message(msg_id).await {
                         if let Err(e) = m.hide().await {
                             eprintln!("[{id}] hide {}: {e}", short(msg_id));
@@ -1138,6 +1345,9 @@ struct Ctx {
     roster: usize,
     me: String,
     mod_channel: Option<String>,
+    /// Provenance, carried rather than sniffed. Reading it back off a rule id
+    /// let an operator route a rule named "vision" through the wrong switch.
+    from_vision: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1171,7 +1381,11 @@ async fn announce(bot: &VectorBot, community: &Community, ctx: &Ctx, line: &str)
 
 /// Never panics on a short string, which a remote peer can supply.
 fn short(s: &str) -> &str {
-    &s[..12.min(s.len())]
+    let mut end = 12.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// What the sweep looked at, whether or not it found anything.
@@ -1226,10 +1440,12 @@ mod tests {
         // raw used to panic mid-handler, and the panic unwound the event
         // closure BEFORE the tripwire ran — an attacker could hide a raid
         // behind one one-byte field.
-        for s in ["", "a", "abcdefghijk", "abcdefghijkl", &"x".repeat(200)] {
+        for s in ["", "a", "abcdefghijk", "abcdefghijkl", &"x".repeat(200), "aaaaaaaaaa日本", "日"] {
             assert!(short(s).len() <= 12);
         }
         assert_eq!(short("abcdefghijklmnop"), "abcdefghijkl");
+        // A byte index inside a multi-byte character panics; back off to a boundary.
+        assert_eq!(short("aaaaaaaaaa日本"), "aaaaaaaaaa");
     }
 
     /// Both clocks must mint the SAME id for one offense, or it is charged

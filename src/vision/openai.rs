@@ -108,11 +108,17 @@ pub fn parse_labels(text: &str) -> Option<Vec<Label>> {
     }
     let obj: Value = serde_json::from_str(&text[start..end?]).ok()?;
     let map = obj.as_object()?;
-    Some(
-        map.iter()
-            .filter_map(|(k, v)| v.as_f64().map(|s| Label { name: k.clone(), score: s.clamp(0.0, 1.0) as f32 }))
-            .collect(),
-    )
+    let labels: Vec<Label> = map
+        .iter()
+        .filter_map(|(k, v)| v.as_f64().map(|s| Label { name: k.clone(), score: s.clamp(0.0, 1.0) as f32 }))
+        .collect();
+    // An answer we could only PARTLY read is not a clean one. `{"gore": "high"}`
+    // used to filter down to an empty list, which the caller reads as Clean and
+    // caches forever.
+    if labels.len() != map.len() {
+        return None;
+    }
+    Some(labels)
 }
 
 /// Base64, standard alphabet with padding. Small enough not to earn a
@@ -164,6 +170,10 @@ mod tests {
         assert!(parse_labels("I'm sorry, I can't help with that.").is_none());
         assert!(parse_labels("").is_none());
         assert!(parse_labels("{ unbalanced").is_none());
+        // The dangerous one: a model answering in words. Filtering these away
+        // left an empty list, which reads as a full all-clear.
+        assert!(parse_labels(r#"{"gore": "high", "sexual_content": "yes"}"#).is_none());
+        assert!(parse_labels(r#"{"gore": 0.1, "sexual_content": "yes"}"#).is_none(), "partly readable is not readable");
     }
 
     /// A model that answers with an out-of-range score is clamped, not trusted:

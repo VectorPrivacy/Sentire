@@ -30,26 +30,115 @@ pub struct CommunityPolicy {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct Overrides {
-    pub arm: Option<Arm>,
-    pub limits: Option<Limits>,
+    pub arm: Option<ArmOverride>,
+    pub limits: Option<LimitsOverride>,
     pub rules: Option<Rules>,
-    pub ladder: Option<Ladder>,
-    pub shields: Option<Shields>,
-    pub raid: Option<Raid>,
+    pub ladder: Option<LadderOverride>,
+    pub shields: Option<ShieldsOverride>,
+    pub raid: Option<RaidOverride>,
+}
+
+/// Overrides fold FIELD by field. A whole-block override reset everything the
+/// operator had customised globally back to library defaults — naming one
+/// tighter limit silently loosened the other two.
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[serde(default)]
+pub struct ArmOverride {
+    pub warn: Option<bool>,
+    pub delete: Option<bool>,
+    pub kick: Option<bool>,
+    pub ban: Option<bool>,
+    pub raid: Option<bool>,
+    pub vision: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[serde(default)]
+pub struct LimitsOverride {
+    pub max_actions_per_run: Option<usize>,
+    pub max_actions_per_hour: Option<usize>,
+    pub halt_if_over_pct: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct LadderOverride {
+    pub strikes: Option<crate::config::Strikes>,
+    pub decay_half_life_hours: Option<u64>,
+    pub steps: Option<Vec<crate::config::Step>>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[serde(default)]
+pub struct ShieldsOverride {
+    pub respect_trusted: Option<bool>,
+    pub respect_protected: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[serde(default)]
+pub struct RaidOverride {
+    pub min_confidence: Option<u32>,
+    pub response: Option<crate::config::RaidResponse>,
+    pub tripwire_accounts: Option<usize>,
+    pub tripwire_secs: Option<u64>,
+    pub tripwire_cooldown_secs: Option<u64>,
+    pub claim_ttl_secs: Option<u64>,
+    pub max_batch: Option<usize>,
 }
 
 impl Config {
     /// This community's rulebook: the defaults, with its overrides folded over.
     pub fn for_community(&self, id: &str) -> CommunityPolicy {
         let o = self.community.get(id);
-        CommunityPolicy {
-            arm: o.and_then(|o| o.arm).unwrap_or(self.arm),
-            limits: o.and_then(|o| o.limits).unwrap_or(self.limits),
+        let mut p = CommunityPolicy {
+            arm: self.arm,
+            limits: self.limits,
             rules: o.and_then(|o| o.rules.clone()).unwrap_or_else(|| self.rules.clone()),
-            ladder: o.and_then(|o| o.ladder.clone()).unwrap_or_else(|| self.ladder.clone()),
-            shields: o.and_then(|o| o.shields).unwrap_or(self.shields),
-            raid: o.and_then(|o| o.raid).unwrap_or(self.raid),
+            ladder: self.ladder.clone(),
+            shields: self.shields,
+            raid: self.raid,
+        };
+        let Some(o) = o else { return p };
+        if let Some(a) = &o.arm {
+            let f = |over: Option<bool>, base: bool| over.unwrap_or(base);
+            p.arm = Arm {
+                warn: f(a.warn, p.arm.warn),
+                delete: f(a.delete, p.arm.delete),
+                kick: f(a.kick, p.arm.kick),
+                ban: f(a.ban, p.arm.ban),
+                raid: f(a.raid, p.arm.raid),
+                vision: f(a.vision, p.arm.vision),
+            };
         }
+        if let Some(l) = &o.limits {
+            p.limits.max_actions_per_run = l.max_actions_per_run.unwrap_or(p.limits.max_actions_per_run);
+            p.limits.max_actions_per_hour = l.max_actions_per_hour.unwrap_or(p.limits.max_actions_per_hour);
+            p.limits.halt_if_over_pct = l.halt_if_over_pct.unwrap_or(p.limits.halt_if_over_pct);
+        }
+        if let Some(l) = &o.ladder {
+            p.ladder.strikes = l.strikes.unwrap_or(p.ladder.strikes);
+            p.ladder.decay_half_life_hours = l.decay_half_life_hours.unwrap_or(p.ladder.decay_half_life_hours);
+            if let Some(steps) = &l.steps {
+                p.ladder.steps = steps.clone();
+            }
+        }
+        if let Some(sh) = &o.shields {
+            p.shields.respect_trusted = sh.respect_trusted.unwrap_or(p.shields.respect_trusted);
+            // respect_protected is refused as false at validation, so an
+            // override cannot reach it either.
+            p.shields.respect_protected = sh.respect_protected.unwrap_or(p.shields.respect_protected);
+        }
+        if let Some(r) = &o.raid {
+            p.raid.min_confidence = r.min_confidence.unwrap_or(p.raid.min_confidence);
+            p.raid.response = r.response.unwrap_or(p.raid.response);
+            p.raid.tripwire_accounts = r.tripwire_accounts.unwrap_or(p.raid.tripwire_accounts);
+            p.raid.tripwire_secs = r.tripwire_secs.unwrap_or(p.raid.tripwire_secs);
+            p.raid.tripwire_cooldown_secs = r.tripwire_cooldown_secs.unwrap_or(p.raid.tripwire_cooldown_secs);
+            p.raid.claim_ttl_secs = r.claim_ttl_secs.unwrap_or(p.raid.claim_ttl_secs);
+            p.raid.max_batch = r.max_batch.unwrap_or(p.raid.max_batch);
+        }
+        p
     }
 }
 
@@ -128,15 +217,10 @@ mod tests {
     fn an_override_applies_to_its_community_and_nowhere_else() {
         let cfg: Config = toml::from_str(
             r#"
-            [community."strict"]
-            arm = { warn = true, delete = false, kick = true, ban = false, raid = false, vision = false }
+            [community."strict".arm]
+            kick = true
             [community."strict".raid]
             min_confidence = 50
-            response = "ban"
-            tripwire_accounts = 3
-            tripwire_secs = 30
-            tripwire_cooldown_secs = 60
-            max_batch = 100
             "#,
         )
         .unwrap();
@@ -148,6 +232,31 @@ mod tests {
         let other = cfg.for_community("relaxed");
         assert!(!other.arm.kick, "and arms nobody else");
         assert_eq!(other.raid.min_confidence, 75, "defaults are untouched next door");
+    }
+
+    /// A partial block must not reset the operator's other choices. Naming one
+    /// tighter limit used to restore the library defaults for the rest.
+    #[test]
+    fn an_override_folds_field_by_field() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [limits]
+            max_actions_per_run = 5
+            max_actions_per_hour = 10
+            halt_if_over_pct = 50
+            [community."x".limits]
+            halt_if_over_pct = 20
+            [community."x".raid]
+            response = "ban"
+            "#,
+        )
+        .unwrap();
+        let p = cfg.for_community("x");
+        assert_eq!(p.limits.halt_if_over_pct, 20, "the named field changes");
+        assert_eq!(p.limits.max_actions_per_run, 5, "and the operator's others survive");
+        assert_eq!(p.limits.max_actions_per_hour, 10);
+        assert_eq!(p.raid.response, crate::config::RaidResponse::Ban);
+        assert_eq!(p.raid.tripwire_accounts, 5, "untouched raid fields keep their defaults");
     }
 
     #[test]
