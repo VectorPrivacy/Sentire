@@ -167,12 +167,14 @@ must survive as tombstones because the engine re-reports the same convictions fo
 the evidence sits in its window, and the history must go because a forgiven member who kept it
 stays immune to every response below the one they already received.
 
-Editing `[rules]` forgives the strikes that rulebook minted. The engine keys its
+Editing `[rules]` forgives the strikes that rulebook minted — the engine's window-scoped
+convictions, and only those. The engine keys its
 window-scoped convictions on the rulebook, so a change re-reports them under fresh ids, and
-charging both copies would roughly double every total. Each strike carries the rulebook it
-was charged under, so this is a fact about the row rather than a guess from its shape — and
-the ladder floor is left alone, because an amnesty on the evidence is not an amnesty on the
-answers already given.
+charging both copies would roughly double every total. Each such strike carries the rulebook it was charged under, so the amnesty is a fact about
+the row rather than a guess from its shape. Sentinel's own convictions — a screened message,
+a classified image — carry no rulebook and are never forgiven by an edit: their ids are
+stable, so a tombstone would erase them for good. The ladder floor is left alone too, because
+an amnesty on the evidence is not an amnesty on the answers already given.
 
 ## Proven vs unproven
 

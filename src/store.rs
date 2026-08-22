@@ -262,6 +262,12 @@ impl Store {
 
     /// Forgive strikes minted under a rulebook that is no longer in force.
     ///
+    /// Only rows STAMPED with a rulebook are candidates. Sentinel's own ids
+    /// (`msg:`, `vision:`) carry no policy hash by construction, so they are
+    /// stamped `''` and never retired — tombstoning them erased the media
+    /// lane's and live screen's history permanently, since the id is identical
+    /// next pass and INSERT OR IGNORE hits the tombstone forever.
+    ///
     /// The engine keys its window-scoped conviction ids on the policy hash, so
     /// an operator adding one pattern re-reports those convictions under ids
     /// nothing has seen: left alone they land again at full worth stamped
@@ -274,6 +280,22 @@ impl Store {
     /// already given, and was walked up the ladder again from a warning.
     ///
     /// Returns how many were forgiven.
+    /// Adopt the current rulebook for rows written before the stamp existed.
+    ///
+    /// One-shot, per community. Leaving them `''` forever meant the FIRST edit
+    /// after this release double-charged exactly the cohort the amnesty exists
+    /// for — they would never be retired, and the engine would re-report them
+    /// under fresh ids alongside.
+    pub fn adopt_unstamped(&self, community: &str, current: &str) -> Result<usize, String> {
+        self.lock()
+            .execute(
+                "UPDATE strikes SET policy = ?2 WHERE community = ?1 AND policy = '' \
+                 AND conviction_id NOT LIKE 'msg:%' AND conviction_id NOT LIKE 'vision:%'",
+                rusqlite::params![community, current],
+            )
+            .map_err(|e| e.to_string())
+    }
+
     pub fn retire_policy(&self, community: &str, current: &str) -> Result<usize, String> {
         let mut guard = self.lock();
         let conn = guard.transaction().map_err(|e| e.to_string())?;
@@ -313,13 +335,13 @@ impl Store {
 
     /// Does this member carry any live strike from the media lane? Provenance
     /// follows the EVIDENCE, not the lane enforcing it: a total built partly
-    /// from a model'''s opinion is inference wherever it is answered from, and
+    /// from a model's opinion is inference wherever it is answered from, and
     /// the sweep was answering it under the text switches.
     pub fn has_vision_strikes(&self, community: &str, subject: &str, since_ms: u64) -> Result<bool, String> {
         self.lock()
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM strikes WHERE community = ?1 AND subject = ?2 \
-                 AND pardoned = 0 AND at_ms >= ?3 AND conviction_id LIKE '''vision:%''')",
+                 AND pardoned = 0 AND at_ms >= ?3 AND conviction_id LIKE 'vision:%')",
                 rusqlite::params![community, subject, since_ms as i64],
                 |r| r.get::<_, i64>(0).map(|n| n == 1),
             )
@@ -504,8 +526,13 @@ impl Store {
         // leaves them behind — and a pardoned member who keeps a raid claim can
         // never be contained again.
         conn.execute(
-            "DELETE FROM actions WHERE community = ?1 AND response = 'raid:claim' AND (subject = ?2 OR subject = ?3)",
-            rusqlite::params![community, format!("live:{subject}"), format!("dry:{subject}")],
+            // Any scope, however it was keyed. Hardcoded prefixes went stale
+            // twice: a claim nothing could clear meant a pardoned member could
+            // never be contained again inside the TTL. npubs are bech32, so
+            // there are no LIKE metacharacters to escape.
+            "DELETE FROM actions WHERE community = ?1 AND response = 'raid:claim' \
+             AND (subject = ?2 OR subject LIKE '%:' || ?2)",
+            rusqlite::params![community, subject],
         )
         .map_err(|e| e.to_string())?;
         conn.commit().map_err(|e| e.to_string())?;
@@ -651,12 +678,16 @@ pub mod tests {
     fn retiring_a_rulebook_forgives_only_its_own_strikes() {
         let s = mem();
         s.record("c", "npub1a", "engine1", 4, 0, "", "p1").unwrap();
-        s.record("c", "npub1a", "msg:slurs:evt1", 4, 0, "", "p1").unwrap();
+        // Sentinel's own ids are stable and carry no rulebook, so they are
+        // stamped '' and must survive: the id is identical next pass, so a
+        // tombstone erases that conviction for good.
+        s.record("c", "npub1a", "msg:slurs:evt1", 4, 0, "", "").unwrap();
+        s.record("c", "npub1a", "vision:hash1:gore", 4, 0, "", "").unwrap();
         s.record("c", "npub1a", "engine2", 4, 0, "", "p2").unwrap();
         s.log_action("c", "npub1a", "kick", false, 0, "").unwrap();
 
-        assert_eq!(s.retire_policy("c", "p2").unwrap(), 2, "everything minted under the old rulebook");
-        assert_eq!(s.strikes("c", "npub1a").unwrap().len(), 1, "and only that");
+        assert_eq!(s.retire_policy("c", "p2").unwrap(), 1, "only what the retired rulebook keyed");
+        assert_eq!(s.strikes("c", "npub1a").unwrap().len(), 3, "the stable ids survive");
         assert_eq!(
             s.strongest_response("c", "npub1a", false, 0).unwrap().as_deref(),
             Some("kick"),
@@ -667,6 +698,20 @@ pub mod tests {
     /// An upgrade must not forgive a community's history as a side effect of
     /// shipping. Rows written before the column existed carry '' and are never
     /// retired.
+    /// The typo that made B7 inert: `'''vision:%'''` is a VALID literal whose
+    /// value has apostrophes in it, so it parsed, never errored, and never
+    /// matched anything.
+    #[test]
+    fn a_vision_strike_is_recognised_as_one() {
+        let s = mem();
+        s.record("c", "npub1a", "vision:hash1:gore", 4, 0, "", "").unwrap();
+        s.record("c", "npub1b", "msg:slurs:evt1", 4, 0, "", "").unwrap();
+        assert!(s.has_vision_strikes("c", "npub1a", 0).unwrap(), "a media strike is media evidence");
+        assert!(!s.has_vision_strikes("c", "npub1b", 0).unwrap(), "a text one is not");
+        s.pardon("c", "npub1a").unwrap();
+        assert!(!s.has_vision_strikes("c", "npub1a", 0).unwrap(), "and a pardoned one no longer counts");
+    }
+
     #[test]
     fn strikes_from_before_the_stamp_are_never_retired() {
         let s = mem();
@@ -702,8 +747,12 @@ pub mod tests {
     #[test]
     fn a_pardon_clears_a_raid_claim_however_it_was_scoped() {
         let s = mem();
-        s.claim_cohort("c", "live:npub1a", 0, 10_000).unwrap();
+        // The scope `contain` actually mints today.
+        s.claim_cohort("c", "armed:kick:npub1a", 0, 10_000).unwrap();
         s.pardon("c", "npub1a").unwrap();
-        assert!(s.claim_cohort("c", "live:npub1a", 0, 10_000).unwrap(), "a pardoned member is containable again");
+        assert!(
+            s.claim_cohort("c", "armed:kick:npub1a", 0, 10_000).unwrap(),
+            "a pardoned member is containable again, whatever scope claimed them"
+        );
     }
 }

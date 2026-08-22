@@ -96,7 +96,11 @@ pub async fn install(
             // and an upgrade that changes the hashing cannot forgive a
             // community's history as a side effect, because rows written before
             // the stamp existed carry '' and are never retired.
-            let retired = store.retire_policy(community.id(), &fingerprint(cfg, community.id()))?;
+            let fp = fingerprint(cfg, community.id());
+            // Rows from before the stamp adopt the rulebook in force, once, so
+            // the first edit after this release does not double-charge them.
+            store.adopt_unstamped(community.id(), &fp)?;
+            let retired = store.retire_policy(community.id(), &fp)?;
             if retired > 0 {
                 return Ok("rulebook changed — strikes it minted forgiven");
             }
@@ -107,6 +111,13 @@ pub async fn install(
             // remove the policy. Writing nothing left the last one installed
             // and still convicting.
             let _ = community.policies().delete(POLICY_ID).await;
+            // And retire what the old rulebook minted, or emptying `[rules]` —
+            // the obvious way to stop a misbehaving bot — leaves the debt loop
+            // climbing the ladder on strikes nothing can convict for any more.
+            let retired = store.retire_policy(community.id(), "")?;
+            if retired > 0 {
+                return Ok("no custom rules — the old rulebook's strikes forgiven");
+            }
             Ok("no custom rules — built-in raid defaults only")
         }
     }

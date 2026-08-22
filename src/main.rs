@@ -444,7 +444,7 @@ async fn screen(
         // The same id the sweep mints, so whichever clock arrives first wins.
         let conviction = conviction_id(&f.rule_id, &msg.message.id);
         fresh |= store
-            .record(community.id(), &author, &conviction, worth, now, &evidence, &rules::fingerprint(cfg, community.id()))
+            .record(community.id(), &author, &conviction, worth, now, &evidence, "")
             .map_err(vector_sdk::Error::Other)?;
         // The GRAVEST finding speaks for the batch, not whichever arrived first.
         if worst.as_ref().is_none_or(|(g, _)| gravity > *g) {
@@ -794,7 +794,10 @@ async fn watch_media(
                 // the same offense, escalating happens by posting more.
                 let conviction = format!("vision:{content_hash}:{}", label.name);
                 let fresh = store
-                    .record(community.id(), &author, &conviction, worth, now, &evidence, &rules::fingerprint(cfg, community.id()))
+                    // Sentinel's own id, stable and rulebook-free: stamped ''
+                    // so a rules edit cannot tombstone it. The id is identical
+                    // next pass, so a tombstone would erase it for good.
+                    .record(community.id(), &author, &conviction, worth, now, &evidence, "")
                     .map_err(vector_sdk::Error::Other)?;
                 println!("[media] FLAGGED {} from {} — {evidence}", short(&att.id), short(&author));
                 if !fresh {
@@ -1108,7 +1111,7 @@ async fn sweep(
                 // posted while Sentinel was down was never charged at all.
                 for mid in &f.messages {
                     store
-                        .record(community.id(), &v.npub, &conviction_id(&f.rule_id, mid), worth, now, &evidence, &policy_fp)
+                        .record(community.id(), &v.npub, &conviction_id(&f.rule_id, mid), worth, now, &evidence, "")
                         .map_err(vector_sdk::Error::Other)?;
                 }
                 continue;
@@ -1402,18 +1405,33 @@ pub fn select_rung(
     npub: &str,
     total: u32,
     from_vision: bool,
+    now: u64,
     horizon: u64,
-) -> Result<Option<Response>, String> {
-    // Provenance follows the EVIDENCE, not the lane. A total built from a
-    // model's opinion is inference wherever it is enforced from, and the sweep
-    // used to enforce it under the text switches.
-    let from_vision = from_vision || store.has_vision_strikes(community, npub, horizon)?;
-    ladder::next_step(
+) -> Result<Option<(Response, bool)>, String> {
+    // Provenance follows the EVIDENCE, not the lane: a total built from a
+    // model's opinion is inference wherever it is answered from.
+    //
+    // RETURNED, not merely used here. Deriving it and letting the caller
+    // re-derive it from its own lane put the rung selection in one `dry` space
+    // and the arming, dedup, ceilings and recorded row in the other — so a rung
+    // chosen against a rehearsal was then carried out for real, every pass.
+    // Scoped to strikes that still carry real weight, not the full answer
+    // horizon: one image flagged in March should not leave every word-filter
+    // offense in October unarmed.
+    //
+    // Derived from the horizon rather than the clock — a function that reads
+    // the time cannot be driven by a test, which is how this glue went
+    // unchecked for six passes.
+    let half_life = policy.ladder.decay_half_life_hours.saturating_mul(3_600_000);
+    let vision_window = now.saturating_sub(half_life.saturating_mul(2));
+    let from_vision = from_vision || store.has_vision_strikes(community, npub, vision_window)?;
+    let picked = ladder::next_step(
         &policy.ladder,
         total,
         |r| store.strongest_response(community, npub, !adjudicate::armed_for(policy, r, from_vision), horizon),
         |r| powers.can_deliver(r),
-    )
+    )?;
+    Ok(picked.map(|r| (r, from_vision)))
 }
 
 /// Carry out (or rehearse) whatever [`adjudicate`] decided.
@@ -1441,18 +1459,19 @@ async fn enforce(
     let why = v.why();
     let who = short(&v.npub);
 
-    let from_vision = ctx.from_vision;
     let horizon = answer_horizon(&ctx.policy, now);
 
     // Pick the rung HERE, one place, asking each candidate about the space it
-    // would actually be recorded in.
+    // would actually be recorded in — and take the PROVENANCE it derived back
+    // with it.
     //
     // A caller that chose the rung had to guess an armed-ness for its lookup,
-    // and any `[arm]` block that was not uniform made that guess wrong: the
-    // ladder read one `dry` space and the dedup another, so it proposed a rung
-    // already answered in the other space and the whole ladder went silent.
-    let Some(response) =
-        select_rung(&ctx.policy, ctx.powers, store, community.id(), &v.npub, total, from_vision, horizon)
+    // and any `[arm]` block that was not uniform made that guess wrong. Letting
+    // it re-derive the provenance from its own lane was the same bug one level
+    // down: the rung was chosen against one `dry` space and then armed,
+    // deduped, counted and recorded in the other.
+    let Some((response, from_vision)) =
+        select_rung(&ctx.policy, ctx.powers, store, community.id(), &v.npub, total, ctx.from_vision, now, horizon)
             .map_err(vector_sdk::Error::Other)?
     else {
         // Every rung up to what they earned is already answered.
@@ -1582,16 +1601,32 @@ async fn enforce(
             // And a rung nobody could deliver does not authorise a REMOVAL on
             // its own. A member Sentinel cannot talk to is a case for the mod
             // channel, not a silent kick.
+            // Measured over the ANSWER horizon, not the give-up window: a member
+            // whose last delivered action was seven hours ago is reachable, and
+            // a six-hour lookback called them a stranger and jumped the ladder.
             let unlocks_removal = matches!(response, Response::Warn | Response::DeleteAndWarn)
-                && !store
-                    .has_delivered(community.id(), &v.npub, now.saturating_sub(GIVE_UP_WINDOW_MS))
-                    .map_err(vector_sdk::Error::Other)?;
+                && !store.has_delivered(community.id(), &v.npub, horizon).map_err(vector_sdk::Error::Other)?;
             if persistent && !unlocks_removal {
                 println!("[{id}] GAVE UP {name} {who} after {tries} tries — moving past this rung");
                 let _ = store.log_action(community.id(), &v.npub, &format!("attempted:{name}"), !armed, now, &why);
             } else if persistent {
                 println!("[{id}] UNREACHABLE {who} — {name} keeps failing and nothing has ever reached them");
-                announce(bot, community, ctx, &format!("Cannot reach {who}: {name} keeps failing. A person should look.")).await;
+                // Claimed like every other repeating announcement. Unbounded,
+                // this was a mod-channel publish every poll forever, triggerable
+                // by anyone who simply publishes no inbox relay list.
+                let ttl = ctx.policy.raid.claim_ttl_secs.saturating_mul(1000);
+                if store
+                    .claim_cohort(community.id(), &format!("unreachable:{}:{name}", v.npub), now, ttl)
+                    .unwrap_or(false)
+                {
+                    announce(
+                        bot,
+                        community,
+                        ctx,
+                        &format!("Cannot reach {who}: {name} keeps failing. A person should look."),
+                    )
+                    .await;
+                }
             }
             return Ok(Outcome::Failed);
         }
@@ -1613,9 +1648,9 @@ async fn enforce(
 /// A member cited across many messages is still one sentence.
 const MAX_HIDES: usize = 10;
 
-/// Attempts of one sentence against one member per hour before Sentinel stops
-/// trying. Enough that a relay blip retries, few enough that a permanently
-/// unreachable target is not a per-pass publish forever.
+/// Attempts of one sentence against one member, within [`GIVE_UP_WINDOW_MS`],
+/// before Sentinel stops trying. Enough that a relay blip retries, few enough
+/// that a permanently unreachable target is not a per-pass publish forever.
 const MAX_FAILURES: usize = 3;
 
 /// How far back failures are counted, and how long they must span before
@@ -1738,7 +1773,7 @@ mod tests {
         let store = mem();
         let p = policy_with("warn = true\ndelete = true\nkick = true\nban = true");
         let all = Powers { hide: true, kick: true, ban: true };
-        let pick = |s: &Store| select_rung(&p, all, s, "c", "npub1a", 12, false, HORIZON).unwrap();
+        let pick = |s: &Store| select_rung(&p, all, s, "c", "npub1a", 12, false, NOW, HORIZON).unwrap().map(|(r, _)| r);
 
         assert_eq!(pick(&store), Some(Response::Warn), "twelve points still starts at a warning");
         store.log_action("c", "npub1a", "warn", false, NOW, "").unwrap();
@@ -1759,7 +1794,7 @@ mod tests {
         let store = mem();
         let p = policy_with("warn = false\ndelete = false\nkick = true\nban = true");
         let all = Powers { hide: true, kick: true, ban: true };
-        let pick = |s: &Store| select_rung(&p, all, s, "c", "npub1a", 12, false, HORIZON).unwrap();
+        let pick = |s: &Store| select_rung(&p, all, s, "c", "npub1a", 12, false, NOW, HORIZON).unwrap().map(|(r, _)| r);
 
         // warn is unarmed, so its rehearsal lands in the dry space.
         assert_eq!(pick(&store), Some(Response::Warn));
@@ -1778,7 +1813,7 @@ mod tests {
         let no_hiding = Powers { hide: false, kick: true, ban: true };
         store.log_action("c", "npub1a", "warn", false, NOW, "").unwrap();
         assert_eq!(
-            select_rung(&p, no_hiding, &store, "c", "npub1a", 12, false, HORIZON).unwrap(),
+            select_rung(&p, no_hiding, &store, "c", "npub1a", 12, false, NOW, HORIZON).unwrap().map(|(r, _)| r),
             Some(Response::Kick),
             "delete_and_warn cannot be delivered here, so the ladder goes on"
         );
@@ -1792,15 +1827,18 @@ mod tests {
         let store = mem();
         let p = policy_with("warn = true\nkick = true\nvision = false");
         let all = Powers { hide: true, kick: true, ban: true };
-        store.record("c", "npub1a", "vision:hash1:gore", 12, NOW, "gore", "p1").unwrap();
+        store.record("c", "npub1a", "vision:hash1:gore", 12, NOW, "gore", "").unwrap();
+        // A REAL warning on file. If provenance came from the lane, the sweep
+        // would read this live row, call the rung answered and climb; reading
+        // the dry space (where an unarmed vision rehearsal lives) it does not.
+        store.log_action("c", "npub1a", "warn", false, NOW, "").unwrap();
 
         // Enforced from the SWEEP, which knows nothing about the media lane.
-        let r = select_rung(&p, all, &store, "c", "npub1a", 12, false, HORIZON).unwrap();
-        assert_eq!(r, Some(Response::Warn));
-        assert!(
-            !adjudicate::armed_for(&p, r.unwrap(), true),
-            "and it is unarmed, because the evidence is a model's opinion"
-        );
+        let (r, from_vision) =
+            select_rung(&p, all, &store, "c", "npub1a", 12, false, NOW, HORIZON).unwrap().expect("a rung");
+        assert!(from_vision, "the evidence is a model's opinion wherever it is answered from");
+        assert_eq!(r, Response::Warn, "the live warn answers nothing: this rung is unarmed and lives in the dry space");
+        assert!(!adjudicate::armed_for(&p, r, from_vision), "so it rehearses rather than acting");
     }
 
     fn roster(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
