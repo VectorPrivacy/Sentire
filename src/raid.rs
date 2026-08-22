@@ -12,8 +12,11 @@
 //! default and the code below refuses to move without it.
 
 use vector_sdk::policy::{Verdict, Verdicts};
+#[cfg(test)]
+use crate::config::Config;
 
-use crate::config::{Config, RaidResponse};
+use crate::config::RaidResponse;
+use crate::policy::CommunityPolicy;
 
 /// What one pass decided about a suspected raid.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,7 +36,7 @@ pub enum Containment {
 /// Shields gate here exactly as they do everywhere else. A raid is the loudest
 /// reason to reach for a mass action and the worst possible time to catch a
 /// regular in one.
-pub fn select(verdicts: &Verdicts, cfg: &Config, me: &str) -> Containment {
+pub fn select(verdicts: &Verdicts, cfg: &CommunityPolicy, me: &str) -> Containment {
     select_from(verdicts.all(), verdicts.raid_detected(), cfg, me)
 }
 
@@ -44,7 +47,7 @@ pub fn select(verdicts: &Verdicts, cfg: &Config, me: &str) -> Containment {
 pub fn select_from<'a>(
     members: impl Iterator<Item = &'a Verdict>,
     raid_detected: bool,
-    cfg: &Config,
+    cfg: &CommunityPolicy,
     me: &str,
 ) -> Containment {
     if !raid_detected {
@@ -63,8 +66,13 @@ pub fn select_from<'a>(
     if suspects.is_empty() {
         return Containment::Quiet;
     }
-    if roster > 0 && suspects.len() * 100 > cfg.limits.halt_if_over_pct as usize * roster {
-        return Containment::Halt { suspects: suspects.len(), roster };
+    // The same floor the ladder's ceiling uses. Without it, 10% of a five-member
+    // community rounds to zero and ONE suspect halts containment — trivially
+    // triggerable, and it flooded the mod channel every sweep.
+    if let Some(ceiling) = crate::adjudicate::roster_ceiling(cfg, roster) {
+        if suspects.len() > ceiling {
+            return Containment::Halt { suspects: suspects.len(), roster };
+        }
     }
     if cfg.arm.raid {
         Containment::Contain { suspects, response: cfg.raid.response }
@@ -100,19 +108,23 @@ mod tests {
         (0..n).map(|i| verdict(&format!("npub1raider{i:03}"), confidence, shield)).collect()
     }
 
-    fn pick(rows: &[Verdict], raid: bool, cfg: &Config, me: &str) -> Containment {
+    fn pick(rows: &[Verdict], raid: bool, cfg: &CommunityPolicy, me: &str) -> Containment {
         select_from(rows.iter(), raid, cfg, me)
     }
 
-    fn permissive() -> Config {
-        let mut cfg = Config::default();
+    fn base() -> CommunityPolicy {
+        Config::default().for_community("aa")
+    }
+
+    fn permissive() -> CommunityPolicy {
+        let mut cfg = base();
         cfg.limits.halt_if_over_pct = 100;
         cfg
     }
 
     #[test]
     fn no_cohort_is_no_raid_however_busy_the_room() {
-        assert_eq!(pick(&crowd(50, 99, "none"), false, &Config::default(), "me"), Containment::Quiet);
+        assert_eq!(pick(&crowd(50, 99, "none"), false, &base(), "me"), Containment::Quiet);
     }
 
     #[test]
@@ -142,7 +154,7 @@ mod tests {
 
     #[test]
     fn a_pass_that_would_empty_the_community_stops_and_asks() {
-        let mut cfg = Config::default();
+        let mut cfg = base();
         cfg.arm.raid = true; // even armed
         assert_eq!(
             pick(&crowd(50, 99, "none"), true, &cfg, "me"),

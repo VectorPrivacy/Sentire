@@ -80,9 +80,29 @@ Only *proven* convictions earn strikes, on either clock. Inference is reported a
 sentenced — except where an operator arms it explicitly (`[arm] raid`, `[arm] vision`), which
 is a decision made in writing rather than inherited from a switch meant for something else.
 
-Every sentence, from every lane, goes through one function that owns standing, ceilings and
-dedup in that order. A guard that lives in one of three callers is a guard two paths do not
-have.
+## One decision, four lanes
+
+Every sentence — the sweep's ladder, the live text screen, the media lane, raid containment —
+is decided by a single pure function, `adjudicate`. It takes the facts and returns a verdict:
+spare, already answered, held, halt, powerless, or carry it out.
+
+The lanes do not decide anything. They gather facts, ask, and obey. That is what makes the
+guards testable without a network, and what stops the next lane reaching an action without
+passing them — a guard living inside the function that *acts* is a guard each new caller can
+route around, which is exactly what happened twice before this shape.
+
+The order is fixed: standing, then powers, then dedup, then ceilings.
+
+## Per-community, all the way down
+
+Sentinel is invited into communities it does not own, whose standards differ and whose
+operators trust it with different amounts. Nothing leaks between them: separate rulebooks,
+ladders, arming, tripwires, strike history and roster ceilings.
+
+And separate **powers**. Being a member is not being a moderator. A community can grant
+`MANAGE_MESSAGES` and withhold `BAN`, so Sentinel reads what each one actually permits and
+reports a sentence it cannot carry out rather than attempting it and having every reader drop
+the publish. The boot line says what it can do where.
 
 ## Raids skip the ladder
 

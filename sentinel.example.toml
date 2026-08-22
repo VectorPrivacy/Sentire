@@ -125,3 +125,26 @@ mimes        = ["image/png", "image/jpeg", "image/webp", "image/gif"]
 [shields]
 respect_trusted   = true        # a trusted regular is queued for a human, never actioned
 respect_protected = true        # the owner and moderators are never Sentinel's to judge
+
+
+# ── Per-community overrides ─────────────────────────────────────────────────
+#
+# Everything above is the default. A community can override any block of it,
+# and nothing about how Sentinel judges one community reaches another: separate
+# rulebooks, ladders, arming, tripwires and strike history.
+#
+# Sentinel also reads what each community actually PERMITS it to do. Being a
+# member is not being a moderator: a community can grant MANAGE_MESSAGES and
+# withhold BAN, and a sentence it cannot carry out is reported as such rather
+# than attempted. The boot line says which powers it has where.
+#
+# [community."fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea"]
+# arm = { warn = true, delete = true, kick = true, ban = false, raid = false, vision = false }
+#
+# [community."fe4abeb3…".ladder]
+# strikes = { note = 1, minor = 3, serious = 6, grave = 12 }
+# decay_half_life_hours = 72
+#
+# [[community."fe4abeb3…".ladder.steps]]
+# at = 1
+# response = "warn"

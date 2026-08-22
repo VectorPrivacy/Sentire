@@ -8,7 +8,7 @@ use rusqlite::Connection;
 
 use crate::ladder::Strike;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
@@ -60,6 +60,14 @@ impl Store {
             .unwrap_or(SCHEMA_VERSION);
         if stored > SCHEMA_VERSION {
             return Err(format!("{path} was written by a newer Sentinel (schema {stored} > {SCHEMA_VERSION})"));
+        }
+        if stored < 2 {
+            // Version 1 wrote bare "kick"/"ban" rows for UNARMED raid
+            // containment. Those read as ladder responses, so every suspect of
+            // a rehearsed raid is immune to warn, delete and kick — forever,
+            // on evidence nobody acted on.
+            conn.execute("DELETE FROM actions WHERE evidence = 'raid cohort' AND response NOT LIKE 'raid:%'", [])
+                .map_err(|e| e.to_string())?;
         }
         conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema', ?1)", [SCHEMA_VERSION])
             .map_err(|e| e.to_string())?;
@@ -123,14 +131,20 @@ impl Store {
         Ok(())
     }
 
-    /// Real (non-dry) actions in the last hour, across every community — the
-    /// ceiling is per bot, since a bug is per bot.
-    pub fn actions_last_hour(&self, now_ms: u64) -> Result<usize, String> {
+    /// Real (non-dry) ladder actions in this community in the last hour.
+    ///
+    /// Per community, deliberately: a wave in one room must not starve the
+    /// ceiling everywhere else Sentinel works. Raid rows are excluded — they
+    /// carry a `raid:` prefix and answer to their own bound.
+    pub fn actions_last_hour(&self, community: &str, now_ms: u64) -> Result<usize, String> {
         let since = now_ms.saturating_sub(3_600_000) as i64;
         self.lock()
-            .query_row("SELECT COUNT(*) FROM actions WHERE dry = 0 AND at_ms >= ?1", [since], |r| {
-                r.get::<_, i64>(0).map(|n| n as usize)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM actions WHERE community = ?1 AND dry = 0 AND at_ms >= ?2 \
+                 AND response NOT LIKE 'raid:%'",
+                rusqlite::params![community, since],
+                |r| r.get::<_, i64>(0).map(|n| n as usize),
+            )
             .map_err(|e| e.to_string())
     }
 
@@ -144,19 +158,38 @@ impl Store {
     ///
     /// STRONGEST, not latest: ordering by time let a later, lesser response
     /// reopen a member to everything above it.
-    pub fn strongest_response(&self, community: &str, subject: &str, dry: bool) -> Result<Option<String>, String> {
-        use rusqlite::OptionalExtension;
-        self.lock()
-            .query_row(
-                "SELECT response FROM actions \
-                 WHERE community = ?1 AND subject = ?2 AND dry = ?3 AND response IN ('warn','delete_and_warn','kick','ban') \
-                 ORDER BY CASE response WHEN 'ban' THEN 4 WHEN 'kick' THEN 3 WHEN 'delete_and_warn' THEN 2 ELSE 1 END DESC \
-                 LIMIT 1",
-                rusqlite::params![community, subject, dry as i64],
-                |r| r.get(0),
+    ///
+    /// Bounded by `since_ms`, because a response older than the strikes it
+    /// answered is not an answer to anything. Unbounded, one warning made a
+    /// member permanently un-warnable and the ladder became lifetime-monotonic
+    /// despite the half-life the config advertises.
+    pub fn strongest_response(
+        &self,
+        community: &str,
+        subject: &str,
+        dry: bool,
+        since_ms: u64,
+    ) -> Result<Option<String>, String> {
+        // Read every response on file and rank them in Rust. A second severity
+        // table in SQL would drift from `Response` the first time a variant is
+        // renamed, and the drift reads as "no prior action" — re-sentencing
+        // everyone from scratch.
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT response FROM actions WHERE community = ?1 AND subject = ?2 AND dry = ?3 AND at_ms >= ?4",
             )
-            .optional()
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![community, subject, dry as i64, since_ms as i64], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        let mut best: Option<String> = None;
+        for name in rows.flatten() {
+            if crate::config::Response::rank_of(&name) > best.as_deref().map(crate::config::Response::rank_of).unwrap_or(0) {
+                best = Some(name);
+            }
+        }
+        Ok(best)
     }
 
     /// Has this exact cohort already been contained? A raid stays detected for
@@ -205,6 +238,33 @@ impl Store {
     }
 
     /// The one command that undoes: clear a member's strikes.
+    /// Drop what can no longer matter. A strike past 32 halvings is worth zero
+    /// and still costs a row in every total; an action older than that answered
+    /// for strikes that no longer exist. Unattended for months, this is the
+    /// difference between a working database and a growing one.
+    pub fn prune(&self, before_ms: u64) -> Result<usize, String> {
+        let conn = self.lock();
+        let a = conn
+            .execute("DELETE FROM strikes WHERE at_ms < ?1", [before_ms as i64])
+            .map_err(|e| e.to_string())?;
+        let b = conn
+            .execute("DELETE FROM actions WHERE at_ms < ?1", [before_ms as i64])
+            .map_err(|e| e.to_string())?;
+        Ok(a + b)
+    }
+
+    /// Give a claim back, so a containment that did nothing can be retried
+    /// rather than marking those members handled forever.
+    pub fn release_cohort(&self, community: &str, fingerprint: &str) -> Result<(), String> {
+        self.lock()
+            .execute(
+                "DELETE FROM actions WHERE community = ?1 AND subject = ?2 AND response = 'raid:claim'",
+                rusqlite::params![community, fingerprint],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
     /// Clears strikes AND the action history. Leaving the history behind meant a
     /// pardoned member stayed immune to every response up to whatever they had
     /// already received — forgiven on paper, unreachable in practice.
@@ -269,7 +329,7 @@ mod tests {
         assert_eq!(s.pardon("c", "npub1a").unwrap(), 1);
         assert!(s.strikes("c", "npub1a").unwrap().is_empty());
         assert_eq!(
-            s.strongest_response("c", "npub1a", false).unwrap(),
+            s.strongest_response("c", "npub1a", false, 0).unwrap(),
             None,
             "a pardoned member who kept a 'kick' on file could only ever be banned next"
         );
@@ -280,8 +340,12 @@ mod tests {
         let s = mem();
         s.log_action("c", "npub1a", "warn", true, 1000, "").unwrap();
         s.log_action("c", "npub1a", "warn", false, 1000, "").unwrap();
-        assert_eq!(s.actions_last_hour(2000).unwrap(), 1, "rehearsals never count against the ceiling");
-        assert_eq!(s.actions_last_hour(3_700_000 + 1000).unwrap(), 0, "and the hour rolls off");
+        assert_eq!(s.actions_last_hour("c", 2000).unwrap(), 1, "rehearsals never count against the ceiling");
+        assert_eq!(s.actions_last_hour("c", 3_700_000 + 1000).unwrap(), 0, "and the hour rolls off");
+        s.log_action("other", "npub1b", "kick", false, 1000, "").unwrap();
+        assert_eq!(s.actions_last_hour("c", 2000).unwrap(), 1, "another community's wave does not starve this one");
+        s.log_action("c", "npub1c", "raid:kick", false, 1000, "").unwrap();
+        assert_eq!(s.actions_last_hour("c", 2000).unwrap(), 1, "raid rows answer to their own bound");
     }
 
     /// The trap this replaced: a day of dry running marked everyone as already
@@ -290,8 +354,8 @@ mod tests {
     fn a_rehearsal_only_dedups_rehearsals() {
         let s = mem();
         s.log_action("c", "npub1a", "warn", true, 1000, "").unwrap();
-        assert_eq!(s.strongest_response("c", "npub1a", true).unwrap().as_deref(), Some("warn"));
-        assert_eq!(s.strongest_response("c", "npub1a", false).unwrap(), None, "arming starts clean");
+        assert_eq!(s.strongest_response("c", "npub1a", true, 0).unwrap().as_deref(), Some("warn"));
+        assert_eq!(s.strongest_response("c", "npub1a", false, 0).unwrap(), None, "arming starts clean");
     }
 
     /// Ordering by time let a later, lesser response reopen a member to
@@ -301,18 +365,30 @@ mod tests {
         let s = mem();
         s.log_action("c", "npub1a", "kick", false, 1000, "").unwrap();
         s.log_action("c", "npub1a", "warn", false, 2000, "").unwrap();
-        assert_eq!(s.strongest_response("c", "npub1a", false).unwrap().as_deref(), Some("kick"));
+        assert_eq!(s.strongest_response("c", "npub1a", false, 0).unwrap().as_deref(), Some("kick"));
+        // And an answer older than the strikes it answered is not an answer.
+        assert_eq!(s.strongest_response("c", "npub1a", false, 5000).unwrap(), None, "stale responses expire");
     }
 
     /// Raid rows share the actions table and must never be read as a ladder
     /// response: an unarmed raid stamping 'kick' on every suspect would
     /// immunise all of them against warn, delete and kick, permanently.
     #[test]
+    fn prune_drops_what_can_no_longer_matter() {
+        let s = mem();
+        s.record("c", "npub1a", "old", 4, 1_000, "").unwrap();
+        s.record("c", "npub1a", "new", 4, 9_000, "").unwrap();
+        s.log_action("c", "npub1a", "warn", false, 1_000, "").unwrap();
+        assert_eq!(s.prune(5_000).unwrap(), 2, "one strike and one action");
+        assert_eq!(s.strikes("c", "npub1a").unwrap().len(), 1, "the live one stays");
+    }
+
+    #[test]
     fn a_raid_claim_is_not_a_ladder_response() {
         let s = mem();
         assert!(s.claim_cohort("c", "fingerprint1", 0).unwrap(), "the first claim wins");
         assert!(!s.claim_cohort("c", "fingerprint1", 5000).unwrap(), "the same cohort is contained once");
         assert!(s.claim_cohort("c", "fingerprint2", 0).unwrap(), "a different cohort is its own event");
-        assert_eq!(s.strongest_response("c", "fingerprint1", false).unwrap(), None);
+        assert_eq!(s.strongest_response("c", "fingerprint1", false, 0).unwrap(), None);
     }
 }

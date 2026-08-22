@@ -47,6 +47,9 @@ pub struct Config {
     pub shields: Shields,
     pub raid: Raid,
     pub vision: VisionCfg,
+    /// Per-community overrides, keyed by community id. Anything absent falls
+    /// back to the blocks above, so an operator names only what differs.
+    pub community: std::collections::HashMap<String, crate::policy::Overrides>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -72,7 +75,7 @@ impl Default for Bot {
 /// Every one defaults false. Dry-run is the resting state, and arming is a
 /// choice made per action class — a bot that warns is not thereby a bot that
 /// bans.
-#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
 #[serde(default)]
 pub struct Arm {
     pub warn: bool,
@@ -84,6 +87,13 @@ pub struct Arm {
     /// switch. Riding the booleans an operator set for provable text rules
     /// would let a classifier ban on evidence nobody can replay.
     pub vision: bool,
+}
+
+impl Arm {
+    /// A vision finding needs BOTH its class armed and the vision switch on.
+    pub fn vision_ok(self, from_vision: bool) -> bool {
+        !from_vision || self.vision
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -220,16 +230,24 @@ impl Response {
         self as u8 + 1
     }
 
+    /// The wire name, so the enum is the only place these strings live.
+    pub fn name(self) -> &'static str {
+        match self {
+            Response::Warn => "warn",
+            Response::DeleteAndWarn => "delete_and_warn",
+            Response::Kick => "kick",
+            Response::Ban => "ban",
+        }
+    }
+
+    /// Every response, for callers that must enumerate them (the store's
+    /// severity ordering, tests that prove the two agree).
+    pub const ALL: [Response; 4] = [Response::Warn, Response::DeleteAndWarn, Response::Kick, Response::Ban];
+
     /// The rank of a stored response name. `None` maps to 0 — an unrecognised
     /// row is not a prior action, which is the safe reading in both directions.
     pub fn rank_of(name: &str) -> u8 {
-        match name {
-            "warn" => Response::Warn.rank(),
-            "delete_and_warn" => Response::DeleteAndWarn.rank(),
-            "kick" => Response::Kick.rank(),
-            "ban" => Response::Ban.rank(),
-            _ => 0,
-        }
+        Response::ALL.iter().find(|r| r.name() == name).map(|r| r.rank()).unwrap_or(0)
     }
 }
 
@@ -353,6 +371,16 @@ pub enum RaidResponse {
     Ban,
 }
 
+impl RaidResponse {
+    pub fn name(self) -> &'static str {
+        match self {
+            RaidResponse::Report => "report",
+            RaidResponse::Kick => "kick",
+            RaidResponse::Ban => "ban",
+        }
+    }
+}
+
 impl Default for Raid {
     fn default() -> Self {
         Raid {
@@ -441,6 +469,18 @@ impl Config {
                 self.raid.min_confidence
             ));
         }
+        if self.limits.halt_if_over_pct == 0 || self.limits.halt_if_over_pct > 100 {
+            return Err(format!(
+                "limits.halt_if_over_pct = {} — must be 1..=100 (0 would mean 'never act', which is what [arm] is for)",
+                self.limits.halt_if_over_pct
+            ));
+        }
+        if self.limits.max_actions_per_run == 0 || self.limits.max_actions_per_hour == 0 {
+            return Err("limits.max_actions_* = 0 silently disables enforcement; leave the class unarmed instead".into());
+        }
+        if self.bot.communities.is_empty() {
+            return Err("bot.communities is empty: Sentinel would watch nothing. Use [\"*\"] for every community.".into());
+        }
         if self.raid.tripwire_accounts < 2 {
             return Err("raid.tripwire_accounts must be at least 2: one member talking is a conversation".into());
         }
@@ -492,22 +532,6 @@ impl Config {
     pub fn watches(&self, community_id: &str) -> bool {
         self.bot.communities.iter().any(|w| w == "*" || w == community_id)
     }
-
-    /// The gravity the operator assigned to a rule, if they named one.
-    pub fn gravity_of(&self, rule_id: &str) -> Option<Gravity> {
-        if let Some(w) = self.rules.words.iter().find(|w| w.id == rule_id) {
-            return Some(w.gravity);
-        }
-        if let Some(l) = self.rules.links.iter().find(|l| l.id == rule_id) {
-            return Some(l.gravity);
-        }
-        match rule_id {
-            "rate" => self.rules.rate.as_ref().map(|r| r.gravity),
-            "mass-tagging" => self.rules.mass_tagging.map(|r| r.gravity),
-            "repetition" => self.rules.repetition.map(|r| r.gravity),
-            _ => None,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -533,6 +557,10 @@ mod tests {
             ("[raid]\nmax_batch = 0", "max_batch"),
             ("[raid]\nmax_batch = 900", "max_batch"),
             ("[raid]\ntripwire_accounts = 1", "tripwire_accounts"),
+            ("[limits]\nhalt_if_over_pct = 0", "halt_if_over_pct"),
+            ("[limits]\nhalt_if_over_pct = 200", "halt_if_over_pct"),
+            ("[limits]\nmax_actions_per_run = 0", "max_actions_"),
+            ("[bot]\ncommunities = []", "communities"),
             ("[[ladder.steps]]\nat = 0\nresponse = \"ban\"", "sentenced on sight"),
             ("[ladder]\nstrikes = { note = 1, minor = 2, serious = 4, grave = 999999 }", "overflow"),
             ("[vision]\nenabled = true\n[[vision.labels]]\nname = \"g\"\nthreshold = 0.0\ngravity = \"grave\"", "greater than 0.0"),
@@ -568,7 +596,10 @@ mod tests {
         assert_eq!(Gravity::from_severity("severe"), Gravity::Grave);
         assert_eq!(Gravity::from_severity(""), Gravity::Note, "an unknown severity must be the LEAST punitive");
         assert_eq!(Gravity::from_severity("catastrophic"), Gravity::Note);
-        let cfg = Config::default();
-        assert_eq!(cfg.gravity_of("nonexistent"), None, "unnamed rules defer to severity");
+        // An unnamed rule defers to the engine's severity, resolved per
+        // community — see policy::CommunityPolicy::gravity_of.
+        let p = Config::default().for_community("aa");
+        assert_eq!(p.gravity_of("nonexistent", "severe"), Gravity::Grave);
+        assert_eq!(p.gravity_of("nonexistent", "nonsense"), Gravity::Note);
     }
 }
