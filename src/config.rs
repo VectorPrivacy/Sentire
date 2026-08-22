@@ -297,6 +297,14 @@ pub struct Raid {
     /// floor — the engine's own word for "convinced".
     pub min_confidence: u32,
     pub response: RaidResponse,
+    /// Distinct accounts that must speak (or join) inside `tripwire_secs` for
+    /// Sentinel to stop waiting for the sweep and evaluate immediately. The
+    /// tripwire decides WHEN to ask, never who is guilty.
+    pub tripwire_accounts: usize,
+    pub tripwire_secs: u64,
+    /// Never re-evaluate more often than this. An evaluation is a full corpus
+    /// read, and a sustained wave would otherwise ask for one per message.
+    pub tripwire_cooldown_secs: u64,
     /// Members per ban call. The wire caps a banlist at 500 and rejects an
     /// over-cap batch WHOLE, so a bigger wave arrives in pieces.
     pub max_batch: usize,
@@ -315,7 +323,14 @@ pub enum RaidResponse {
 
 impl Default for Raid {
     fn default() -> Self {
-        Raid { min_confidence: 75, response: RaidResponse::Kick, max_batch: 100 }
+        Raid {
+            min_confidence: 75,
+            response: RaidResponse::Kick,
+            tripwire_accounts: 5,
+            tripwire_secs: 30,
+            tripwire_cooldown_secs: 60,
+            max_batch: 100,
+        }
     }
 }
 
@@ -379,6 +394,9 @@ impl Config {
                 "raid.min_confidence = {}: confidence never reaches 100 by construction, so nothing would ever be contained",
                 self.raid.min_confidence
             ));
+        }
+        if self.raid.tripwire_accounts < 2 {
+            return Err("raid.tripwire_accounts must be at least 2: one member talking is a conversation".into());
         }
         if self.raid.max_batch == 0 || self.raid.max_batch > 500 {
             return Err(format!("raid.max_batch = {}: must be 1..=500 (the wire rejects an over-cap banlist whole)", self.raid.max_batch));
@@ -454,6 +472,7 @@ mod tests {
             ("[raid]\nmin_confidence = 100", "min_confidence"),
             ("[raid]\nmax_batch = 0", "max_batch"),
             ("[raid]\nmax_batch = 900", "max_batch"),
+            ("[raid]\ntripwire_accounts = 1", "tripwire_accounts"),
             ("[vision]\nenabled = true", "vision.labels"),
             ("[vision]\nenabled = true\nbase_url = \"https://api.example.com/v1\"\n[[vision.labels]]\nname = \"gore\"\nthreshold = 0.9\ngravity = \"grave\"", "allow_remote"),
             ("[vision]\nenabled = true\n[[vision.labels]]\nname = \"gore\"\nthreshold = 4.0\ngravity = \"grave\"", "threshold"),

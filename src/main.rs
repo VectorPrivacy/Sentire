@@ -16,18 +16,21 @@
 mod config;
 mod ladder;
 mod raid;
+mod tripwire;
 mod vision;
 mod rules;
 mod store;
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use vector_sdk::policy::{Verdict, Verdicts};
-use vector_sdk::{Community, VectorBot};
+use vector_sdk::{BotEvent, Community, VectorBot};
 
 use config::{Config, Gravity, RaidResponse, Response};
 use store::Store;
+use tripwire::Tripwire;
 use vision::Vision as _;
 
 fn now_ms() -> u64 {
@@ -107,24 +110,87 @@ async fn main() -> vector_sdk::Result<()> {
         });
     }
 
-    // The media lane rides the live stream rather than the sweep: an image is
-    // judged when it lands, not up to two minutes later.
+    // The live stream, not the sweep: content and media are judged when they
+    // land, and a wave trips an immediate evaluation rather than waiting out a
+    // 90-second cache. `on_event` rather than `on_message` because joins are
+    // half the raid signal and a message handler never sees them.
     {
-        let (cfg, store) = (cfg.clone(), store.clone());
-        bot.on_message(move |bot, msg| {
-            let (cfg, store, eyes) = (cfg.clone(), store.clone(), eyes.clone());
+        let (cfg, store, me) = (cfg.clone(), store.clone(), bot.npub().to_string());
+        let wires: Arc<Mutex<HashMap<String, Tripwire>>> = Arc::new(Mutex::new(HashMap::new()));
+        bot.on_event(move |bot, event| {
+            let (cfg, store, eyes, wires, me) =
+                (cfg.clone(), store.clone(), eyes.clone(), wires.clone(), me.clone());
             async move {
-                if let Err(e) = screen(&bot, &msg, &cfg, &store).await {
-                    eprintln!("screen: {e}");
-                }
-                if let Err(e) = watch_media(&bot, &msg, &cfg, &store, eyes.as_ref().as_ref()).await {
-                    eprintln!("media: {e}");
+                match event {
+                    BotEvent::Message(msg) => {
+                        if let Err(e) = screen(&bot, &msg, &cfg, &store).await {
+                            eprintln!("screen: {e}");
+                        }
+                        if let Err(e) = watch_media(&bot, &msg, &cfg, &store, eyes.as_ref().as_ref()).await {
+                            eprintln!("media: {e}");
+                        }
+                        if let (Some(community), Some(author)) = (msg.community(), msg.author()) {
+                            if !msg.is_mine() {
+                                trip(&bot, &community, &cfg, &store, &wires, &author, &me).await;
+                            }
+                        }
+                    }
+                    // A join flood is the other half of the raid shape, and it
+                    // arrives before anyone has said anything at all.
+                    BotEvent::MemberJoin { channel_id, npub } => {
+                        if let Some(community) = bot.channel(channel_id).community() {
+                            trip(&bot, &community, &cfg, &store, &wires, &npub, &me).await;
+                        }
+                    }
+                    _ => {}
                 }
             }
         })
         .await?;
     }
     Ok(())
+}
+
+/// Feed one live arrival to the community's tripwire, and evaluate immediately
+/// if it trips.
+///
+/// The tripwire decides WHEN to ask, never who is guilty: it drops the memoised
+/// verdict and asks the engine, which judges exactly as it would have on the
+/// next sweep. Keeping those separate is what stops a second, sloppier detector
+/// growing beside the real one.
+async fn trip(
+    bot: &VectorBot,
+    community: &Community,
+    cfg: &Config,
+    store: &Arc<Store>,
+    wires: &Arc<Mutex<HashMap<String, Tripwire>>>,
+    who: &str,
+    me: &str,
+) {
+    let tripped = {
+        let mut guard = wires.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .entry(community.id().to_string())
+            .or_insert_with(|| {
+                Tripwire::new(cfg.raid.tripwire_accounts, cfg.raid.tripwire_secs, cfg.raid.tripwire_cooldown_secs)
+            })
+            .observe(who, now_ms())
+    };
+    if !tripped {
+        return;
+    }
+    println!(
+        "[{}] TRIPWIRE — {} distinct accounts inside {}s, evaluating now",
+        &community.id()[..12],
+        cfg.raid.tripwire_accounts,
+        cfg.raid.tripwire_secs
+    );
+    // The 90-second memoisation is right for a background pass and far too slow
+    // for a wave in progress.
+    community.invalidate();
+    if let Err(e) = sweep(bot, community, cfg, store, me).await {
+        eprintln!("{}: {e}", &community.id()[..12]);
+    }
 }
 
 /// Screen one message the instant it lands.

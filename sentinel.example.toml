@@ -85,6 +85,14 @@ min_confidence = 75             # the Alert band's floor
 response       = "kick"         # report | kick | ban
 max_batch      = 100            # per ban call; the wire rejects an over-cap banlist whole
 
+# The live tripwire. The engine's verdict is memoised for 90 seconds, which is
+# right for a background pass and far too slow for a wave in progress. When this
+# many DISTINCT accounts speak or join inside the window, Sentinel drops the
+# cache and evaluates immediately. It decides WHEN to ask, never who is guilty.
+tripwire_accounts      = 5
+tripwire_secs          = 30
+tripwire_cooldown_secs = 60     # an evaluation is a full corpus read
+
 # The media lane. Off by default: it decrypts attachments and ships the bytes to
 # a model, and that is a decision an operator makes rather than inherits.
 #

@@ -42,6 +42,18 @@ the next tick is not a word filter.
 bursts are statements about a *window*. There is nothing for them to measure in one message,
 so they belong to the sweep. They are absent from the live path rather than wrongly clean.
 
+**Tripped — the moment a wave starts.** Waiting up to 90 seconds to notice a raid is not
+moderation, so the sweep is a floor, not the only clock. Sentinel watches the live stream for
+the one thing a raid cannot hide: many *distinct* accounts speaking or joining at once. When
+`[raid] tripwire_accounts` of them appear inside `tripwire_secs`, it drops the memoised
+verdict and evaluates immediately.
+
+The tripwire decides **when to ask, never who is guilty**. It counts distinct actors and
+nothing else; the engine still reaches every verdict. Keeping those apart is what stops a
+second, sloppier detector growing beside the real one. A cooldown bounds it, because an
+evaluation is a full corpus read and a sustained wave would otherwise ask for one per
+message.
+
 Both paths run the same engine over the same policies, so a verdict reached live is the
 verdict the sweep would reach later over the same text, and both feed one strike ladder —
 a member escalates once, not twice.
