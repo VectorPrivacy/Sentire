@@ -42,6 +42,7 @@ pub struct Config {
     pub rules: Rules,
     pub ladder: Ladder,
     pub shields: Shields,
+    pub raid: Raid,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -217,6 +218,38 @@ impl Default for Ladder {
     }
 }
 
+/// What a detected raid answers to. Deliberately outside the ladder: a raid is
+/// one event, and escalating through warnings while a hundred accounts post the
+/// same line is the wrong shape.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default)]
+pub struct Raid {
+    /// Confidence a suspect must reach to be contained. 75 is the Alert band's
+    /// floor — the engine's own word for "convinced".
+    pub min_confidence: u32,
+    pub response: RaidResponse,
+    /// Members per ban call. The wire caps a banlist at 500 and rejects an
+    /// over-cap batch WHOLE, so a bigger wave arrives in pieces.
+    pub max_batch: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RaidResponse {
+    /// Name the cohort and touch nobody.
+    Report,
+    /// They can come back. Cheap to undo, and it breaks a wave.
+    Kick,
+    /// Terminal, and in a private community it rekeys around them.
+    Ban,
+}
+
+impl Default for Raid {
+    fn default() -> Self {
+        Raid { min_confidence: 75, response: RaidResponse::Kick, max_batch: 100 }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(default)]
 pub struct Shields {
@@ -272,6 +305,15 @@ impl Config {
                 ));
             }
         }
+        if self.raid.min_confidence > 99 {
+            return Err(format!(
+                "raid.min_confidence = {}: confidence never reaches 100 by construction, so nothing would ever be contained",
+                self.raid.min_confidence
+            ));
+        }
+        if self.raid.max_batch == 0 || self.raid.max_batch > 500 {
+            return Err(format!("raid.max_batch = {}: must be 1..=500 (the wire rejects an over-cap banlist whole)", self.raid.max_batch));
+        }
         if self.ladder.decay_half_life_hours == 0 {
             return Err("ladder.decay_half_life_hours = 0: strikes would vanish instantly".into());
         }
@@ -324,6 +366,9 @@ mod tests {
             ("[[ladder.steps]]\nat = 4\nresponse = \"warn\"\n[[ladder.steps]]\nat = 1\nresponse = \"kick\"", "ascend"),
             ("[[ladder.steps]]\nat = 1\nresponse = \"kick\"\n[[ladder.steps]]\nat = 4\nresponse = \"warn\"", "de-escalate"),
             ("[ladder]\ndecay_half_life_hours = 0", "decay_half_life_hours"),
+            ("[raid]\nmin_confidence = 100", "min_confidence"),
+            ("[raid]\nmax_batch = 0", "max_batch"),
+            ("[raid]\nmax_batch = 900", "max_batch"),
             ("[[rules.words]]\nid = \"empty\"\npatterns = []\ngravity = \"note\"", "empty"),
         ];
         for (toml_text, expect) in cases {

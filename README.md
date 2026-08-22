@@ -41,7 +41,23 @@ BAN or MANAGE_MESSAGES to carry a sentence out.
 4. The running total meets the **ladder** and a response comes out: warn, delete and warn,
    kick, ban.
 
-Only *proven* convictions earn strikes. Inference is reported and never sentenced.
+Only *proven* convictions earn strikes. Inference is reported and never sentenced — with one
+deliberate exception.
+
+## Raids skip the ladder
+
+A raid is a single event, not forty members each earning strikes. Escalating through warnings
+while a hundred fresh accounts post the same line is the wrong shape entirely, so a detected
+raid elevates straight to whatever `[raid] response` you chose: report, kick, or ban.
+
+This is the one place Sentinel acts on **inference**. A cohort reads high confidence and zero
+proven: nobody can replay it, and the engine's rule is that inference may not sentence. Arming
+`[arm] raid` is you overriding that, deliberately, for this case. It is false by default.
+
+Even armed, three things still hold: shields survive (a trusted regular caught in a wave is
+never contained), a pass that would touch more than `halt_if_over_pct` of the roster stops and
+asks for a person, and bans go out via `ban_many` in batches — each individual ban rotates the
+community's keys, and forty rotations strand everyone.
 
 ## Asking it things
 

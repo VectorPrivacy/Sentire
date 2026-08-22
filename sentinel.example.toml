@@ -76,6 +76,15 @@ response = "kick"
 at = 12
 response = "ban"
 
+# A raid is one event, not forty members each earning strikes, so it skips the
+# ladder entirely and answers to whatever you set here. This is also the ONLY
+# place Sentinel acts on inference: a cohort reads high confidence and zero
+# proven, nobody can replay it, and arming it is you overriding that on purpose.
+[raid]
+min_confidence = 75             # the Alert band's floor
+response       = "kick"         # report | kick | ban
+max_batch      = 100            # per ban call; the wire rejects an over-cap banlist whole
+
 [shields]
 respect_trusted   = true        # a trusted regular is queued for a human, never actioned
 respect_protected = true        # the owner and moderators are never Sentinel's to judge

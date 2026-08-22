@@ -15,6 +15,7 @@
 
 mod config;
 mod ladder;
+mod raid;
 mod rules;
 mod store;
 
@@ -24,7 +25,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use vector_sdk::policy::{Verdict, Verdicts};
 use vector_sdk::{Community, VectorBot};
 
-use config::{Config, Gravity, Response};
+use config::{Config, Gravity, RaidResponse, Response};
 use store::Store;
 
 fn now_ms() -> u64 {
@@ -307,11 +308,81 @@ async fn sweep(
             v.proven
         );
     }
-    if verdicts.raid_detected() {
-        println!("[{id}] RAID SUSPECTED — containment is not in this build; a human decides");
-    }
+    contain(bot, community, cfg, store, &verdicts, me, now).await?;
 
     heartbeat(id, &verdicts, convicted);
+    Ok(())
+}
+
+/// A raid answers to itself, not to the ladder. See [`raid`] for why this is
+/// the one path where inference is allowed to act, and only once armed.
+async fn contain(
+    bot: &VectorBot,
+    community: &Community,
+    cfg: &Config,
+    store: &Arc<Store>,
+    verdicts: &Verdicts,
+    me: &str,
+    now: u64,
+) -> vector_sdk::Result<()> {
+    let id = &community.id()[..12];
+    let (suspects, response, armed) = match raid::select(verdicts, cfg, me) {
+        raid::Containment::Quiet => return Ok(()),
+        raid::Containment::Halt { suspects, roster } => {
+            let line = format!(
+                "RAID HALT — {suspects} of {roster} members are over the bar, past the {}% ceiling.                  Containing this many is a person's call, not mine.",
+                cfg.limits.halt_if_over_pct
+            );
+            println!("[{id}] {line}");
+            announce(bot, community, cfg, &line).await;
+            return Ok(());
+        }
+        raid::Containment::WouldContain { suspects, response } => (suspects, response, false),
+        raid::Containment::Contain { suspects, response } => (suspects, response, true),
+    };
+
+    let verb = match response {
+        RaidResponse::Report => "report",
+        RaidResponse::Kick => "kick",
+        RaidResponse::Ban => "ban",
+    };
+    let line = format!(
+        "RAID {} — {} account(s), {verb}",
+        if armed { "CONTAINED" } else { "SUSPECTED (unarmed, nobody touched)" },
+        suspects.len()
+    );
+    println!("[{id}] {line}");
+    for npub in &suspects {
+        store
+            .log_action(community.id(), npub, verb, !armed, now, "raid cohort")
+            .map_err(vector_sdk::Error::Other)?;
+    }
+    announce(bot, community, cfg, &line).await;
+    if !armed || response == RaidResponse::Report {
+        return Ok(());
+    }
+
+    match response {
+        RaidResponse::Report => {}
+        RaidResponse::Kick => {
+            // Kicks touch the guestbook and rotate nothing, so a loop is honest here.
+            for npub in &suspects {
+                if let Err(e) = community.member(npub.clone()).kick().await {
+                    eprintln!("[{id}] kick {}: {e}", short(npub));
+                }
+            }
+        }
+        RaidResponse::Ban => {
+            // ban_many, never a loop of ban(): each single ban rotates the
+            // community's keys, and forty rotations strand everyone.
+            for chunk in suspects.chunks(cfg.raid.max_batch.min(raid::BAN_CHUNK)) {
+                let refs: Vec<&str> = chunk.iter().map(String::as_str).collect();
+                if let Err(e) = community.ban_many(&refs).await {
+                    eprintln!("[{id}] ban batch of {}: {e}", refs.len());
+                }
+            }
+        }
+    }
     Ok(())
 }
 
