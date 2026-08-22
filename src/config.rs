@@ -13,6 +13,11 @@ use serde::Deserialize;
 /// are refused. `whose` names the block in the error.
 pub fn validate_policy(p: &crate::policy::CommunityPolicy, whose: &str) -> Result<(), String> {
     let at = |msg: String| Err(format!("{whose}: {msg}"));
+    if !p.shields.respect_protected {
+        return at("shields.respect_protected = false: refusing to start. \
+                   The owner and moderators are never Sentinel's to judge."
+            .into());
+    }
     let s = &p.ladder.strikes;
     if !(s.note <= s.minor && s.minor <= s.serious && s.serious <= s.grave) {
         return at(format!(
@@ -79,9 +84,6 @@ pub fn validate_policy(p: &crate::policy::CommunityPolicy, whose: &str) -> Resul
     for r in &p.rules.words {
         if r.patterns.is_empty() {
             return at(format!("rules.words '{}' has no patterns", r.id));
-        }
-        if r.id == "vision" {
-            return at("rules.words id 'vision' collides with the media lane's own provenance".into());
         }
     }
     for r in &p.rules.links {
@@ -528,11 +530,6 @@ impl Config {
             validate_policy(&self.for_community(id), &format!("[community.\"{id}\"]"))?;
         }
 
-        if !self.shields.respect_protected {
-            return Err("shields.respect_protected = false: refusing to start. \
-                        The owner and moderators are never Sentinel's to judge."
-                .into());
-        }
         if self.bot.communities.is_empty() {
             return Err("bot.communities is empty: Sentinel would watch nothing. Use [\"*\"] for every community.".into());
         }
@@ -587,6 +584,7 @@ mod tests {
     fn every_refusal_names_its_field() {
         let cases: &[(&str, &str)] = &[
             ("[shields]\nrespect_protected = false", "respect_protected"),
+            ("[community.\"x\".shields]\nrespect_protected = false", "respect_protected"),
             ("[ladder]\nstrikes = { note = 5, minor = 2, serious = 4, grave = 12 }", "strikes"),
             ("[[ladder.steps]]\nat = 4\nresponse = \"warn\"\n[[ladder.steps]]\nat = 1\nresponse = \"kick\"", "ascend"),
             ("[[ladder.steps]]\nat = 1\nresponse = \"kick\"\n[[ladder.steps]]\nat = 4\nresponse = \"warn\"", "de-escalate"),

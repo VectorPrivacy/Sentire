@@ -8,7 +8,7 @@ use rusqlite::Connection;
 
 use crate::ladder::Strike;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS strikes (
     worth         INTEGER NOT NULL,
     at_ms         INTEGER NOT NULL,
     evidence      TEXT NOT NULL DEFAULT '',
+    pardoned      INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (community, subject, conviction_id)
 );
 CREATE TABLE IF NOT EXISTS classifications (
@@ -66,6 +67,11 @@ impl Store {
         if stored > SCHEMA_VERSION {
             return Err(format!("{path} was written by a newer Sentinel (schema {stored} > {SCHEMA_VERSION})"));
         }
+        if stored < 3 {
+            // Pre-3 databases have no tombstone column; adding it is enough,
+            // since anything pardoned under 2 was deleted outright.
+            let _ = conn.execute("ALTER TABLE strikes ADD COLUMN pardoned INTEGER NOT NULL DEFAULT 0", []);
+        }
         if stored < 2 {
             // Version 1 wrote bare "kick"/"ban" rows for UNARMED raid
             // containment. Those read as ladder responses, so every suspect of
@@ -106,7 +112,7 @@ impl Store {
     pub fn strikes(&self, community: &str, subject: &str) -> Result<Vec<Strike>, String> {
         let conn = self.lock();
         let mut stmt = conn
-            .prepare("SELECT worth, at_ms FROM strikes WHERE community = ?1 AND subject = ?2")
+            .prepare("SELECT worth, at_ms FROM strikes WHERE community = ?1 AND subject = ?2 AND pardoned = 0")
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map(rusqlite::params![community, subject], |r| {
@@ -198,6 +204,20 @@ impl Store {
             }
         }
         Ok(best)
+    }
+
+    /// Members contained here in the last hour. Containment's own bound, since
+    /// `actions_last_hour` deliberately excludes `raid:%` rows.
+    pub fn raid_actions_last_hour(&self, community: &str, now_ms: u64) -> Result<usize, String> {
+        let since = now_ms.saturating_sub(3_600_000) as i64;
+        self.lock()
+            .query_row(
+                "SELECT COUNT(*) FROM actions WHERE community = ?1 AND dry = 0 AND at_ms >= ?2 \
+                 AND response LIKE 'raid:%' AND response != 'raid:claim'",
+                rusqlite::params![community, since],
+                |r| r.get::<_, i64>(0).map(|n| n as usize),
+            )
+            .map_err(|e| e.to_string())
     }
 
     /// Has this member already been contained in this wave? A raid stays
@@ -301,8 +321,17 @@ impl Store {
     /// already received — forgiven on paper, unreachable in practice.
     pub fn pardon(&self, community: &str, subject: &str) -> Result<usize, String> {
         let conn = self.lock();
+        // TOMBSTONED, not deleted. A conviction id is stable for as long as its
+        // evidence sits in the engine's window, so deleting the row let the very
+        // next sweep re-insert it — stamped at `now`, which made the strikes
+        // YOUNGER and the decayed total HIGHER than before the pardon. The one
+        // control an operator needs when a bot misbehaves lasted one poll and
+        // came back stronger.
         let n = conn
-            .execute("DELETE FROM strikes WHERE community = ?1 AND subject = ?2", rusqlite::params![community, subject])
+            .execute(
+                "UPDATE strikes SET pardoned = 1 WHERE community = ?1 AND subject = ?2 AND pardoned = 0",
+                rusqlite::params![community, subject],
+            )
             .map_err(|e| e.to_string())?;
         conn.execute("DELETE FROM actions WHERE community = ?1 AND subject = ?2", rusqlite::params![community, subject])
             .map_err(|e| e.to_string())?;
@@ -367,6 +396,15 @@ mod tests {
         s.log_action("c", "npub1a", "kick", false, 0, "").unwrap();
         assert_eq!(s.pardon("c", "npub1a").unwrap(), 1);
         assert!(s.strikes("c", "npub1a").unwrap().is_empty());
+
+        // The producer re-reports the same conviction all week. A deleted row
+        // would be re-inserted at `now` — younger, so the total comes back
+        // HIGHER than it was before the pardon.
+        assert!(!s.record("c", "npub1a", "x", 4, 5_000, "").unwrap(), "a pardoned strike does not return");
+        assert!(s.strikes("c", "npub1a").unwrap().is_empty(), "and stays gone");
+        // A genuinely new offense still lands.
+        assert!(s.record("c", "npub1a", "y", 4, 5_000, "").unwrap());
+        assert_eq!(s.strikes("c", "npub1a").unwrap().len(), 1);
         assert_eq!(
             s.strongest_response("c", "npub1a", false, 0).unwrap(),
             None,
@@ -386,6 +424,9 @@ mod tests {
         assert_eq!(s.actions_last_hour("c", false, 2000).unwrap(), 1, "another community's wave does not starve this one");
         s.log_action("c", "npub1c", "raid:kick", false, 1000, "").unwrap();
         assert_eq!(s.actions_last_hour("c", false, 2000).unwrap(), 1, "raid rows answer to their own bound");
+        assert_eq!(s.raid_actions_last_hour("c", 2000).unwrap(), 1, "and that bound counts them");
+        s.claim_cohort("c", "live:npub1d", 1000, 10_000).unwrap();
+        assert_eq!(s.raid_actions_last_hour("c", 2000).unwrap(), 1, "a claim is not a containment");
     }
 
     /// The trap this replaced: a day of dry running marked everyone as already

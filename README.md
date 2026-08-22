@@ -16,7 +16,9 @@ Early, but complete: live content screening, a periodic sweep, raid containment,
 optional media lane, all feeding one strike ladder. **Nothing is armed by default**, so it
 rehearses and prints instead of acting.
 
-Not yet run against a real raid. Every safety property below is unit-tested and none is
+Not yet run against a real raid. The decision itself (`adjudicate`), the ladder, the store,
+the tripwire, raid selection and config validation are unit-tested; the lanes that gather
+facts and carry sentences out are exercised only by those parts. Nothing here is
 field-tested.
 
 ## Running

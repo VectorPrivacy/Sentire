@@ -80,15 +80,23 @@ pub fn adjudicate(cfg: &CommunityPolicy, powers: Powers, facts: &Facts, response
         return Sentence::Spare { why: "self" };
     }
 
+    // An empty roster is a failed read, not an empty community — and with no
+    // members the percentage ceiling bounds nothing at all, so the
+    // community-emptying guard would be silently off.
+    if facts.roster == 0 {
+        return Sentence::Spare { why: "roster unknown" };
+    }
+
     // Standing, first and unconditional.
     match facts.shield {
         "protected" => return Sentence::Spare { why: "protected" },
         "trusted" if cfg.shields.respect_trusted => return Sentence::Spare { why: "trusted" },
-        // Not knowing is not the same as knowing they are ordinary. Before the
-        // first evaluation fills the roster, holding is the honest answer.
-        // ("absent" is different: the roster IS known and they are not in it, so
-        // the caller has already resolved them against the community's roles.)
+        // Not knowing is not the same as knowing they are ordinary.
         "unknown" => return Sentence::Spare { why: "standing not yet established" },
+        // The roster was read and does not list them. A caller that CAN resolve
+        // this — a live lane, which has the member in hand — passes the resolved
+        // value; one that cannot gets a refusal rather than a default.
+        "absent" => return Sentence::Spare { why: "not on the roster" },
         _ => {}
     }
 
@@ -163,13 +171,27 @@ mod tests {
             ("none", false),
             // Tenure unknowable is explicitly NOT standing.
             ("indeterminate", false),
-            // Resolved by the caller against the community's roles.
-            ("absent", false),
+            // The roster was read and does not list them: nobody resolved this,
+            // so it fails closed. A live lane passes "none" or "protected"
+            // instead, having asked the community's own roles.
+            ("absent", true),
         ] {
             let f = Facts { shield, ..facts() };
             let got = adjudicate(&cfg, all_powers(), &f, Response::Ban);
             assert_eq!(matches!(got, Sentence::Spare { .. }), spared, "shield {shield} -> {got:?}");
         }
+    }
+
+    /// An empty roster is missing data, not a clean answer: with no members
+    /// the percentage ceiling has nothing to bound, so it must refuse rather
+    /// than permit.
+    #[test]
+    fn an_unread_roster_sentences_nobody() {
+        let f = Facts { roster: 0, ..facts() };
+        assert_eq!(
+            adjudicate(&policy(), all_powers(), &f, Response::Ban),
+            Sentence::Spare { why: "roster unknown" }
+        );
     }
 
     #[test]

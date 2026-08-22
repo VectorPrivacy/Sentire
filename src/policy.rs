@@ -32,7 +32,7 @@ pub struct CommunityPolicy {
 pub struct Overrides {
     pub arm: Option<ArmOverride>,
     pub limits: Option<LimitsOverride>,
-    pub rules: Option<Rules>,
+    pub rules: Option<RulesOverride>,
     pub ladder: Option<LadderOverride>,
     pub shields: Option<ShieldsOverride>,
     pub raid: Option<RaidOverride>,
@@ -50,6 +50,19 @@ pub struct ArmOverride {
     pub ban: Option<bool>,
     pub raid: Option<bool>,
     pub vision: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct RulesOverride {
+    pub window_hours: Option<u64>,
+    pub window_messages: Option<usize>,
+    pub raid_detection: Option<bool>,
+    pub words: Option<Vec<crate::config::WordRule>>,
+    pub links: Option<Vec<crate::config::LinkRule>>,
+    pub rate: Option<crate::config::RateRule>,
+    pub mass_tagging: Option<crate::config::ToggleRule>,
+    pub repetition: Option<crate::config::ToggleRule>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Default)]
@@ -94,7 +107,7 @@ impl Config {
         let mut p = CommunityPolicy {
             arm: self.arm,
             limits: self.limits,
-            rules: o.and_then(|o| o.rules.clone()).unwrap_or_else(|| self.rules.clone()),
+            rules: self.rules.clone(),
             ladder: self.ladder.clone(),
             shields: self.shields,
             raid: self.raid,
@@ -125,9 +138,29 @@ impl Config {
         }
         if let Some(sh) = &o.shields {
             p.shields.respect_trusted = sh.respect_trusted.unwrap_or(p.shields.respect_trusted);
-            // respect_protected is refused as false at validation, so an
-            // override cannot reach it either.
             p.shields.respect_protected = sh.respect_protected.unwrap_or(p.shields.respect_protected);
+        }
+        if let Some(r) = &o.rules {
+            p.rules.window_hours = r.window_hours.unwrap_or(p.rules.window_hours);
+            p.rules.window_messages = r.window_messages.unwrap_or(p.rules.window_messages);
+            // The loosening one: a whole-block override restored
+            // `raid_detection = true` for an operator who had turned it off.
+            p.rules.raid_detection = r.raid_detection.unwrap_or(p.rules.raid_detection);
+            if let Some(w) = &r.words {
+                p.rules.words = w.clone();
+            }
+            if let Some(l) = &r.links {
+                p.rules.links = l.clone();
+            }
+            if r.rate.is_some() {
+                p.rules.rate = r.rate.clone();
+            }
+            if r.mass_tagging.is_some() {
+                p.rules.mass_tagging = r.mass_tagging;
+            }
+            if r.repetition.is_some() {
+                p.rules.repetition = r.repetition;
+            }
         }
         if let Some(r) = &o.raid {
             p.raid.min_confidence = r.min_confidence.unwrap_or(p.raid.min_confidence);
@@ -257,6 +290,28 @@ mod tests {
         assert_eq!(p.limits.max_actions_per_hour, 10);
         assert_eq!(p.raid.response, crate::config::RaidResponse::Ban);
         assert_eq!(p.raid.tripwire_accounts, 5, "untouched raid fields keep their defaults");
+    }
+
+    /// The loosening case: naming one rule for a community used to restore
+    /// `raid_detection = true` for an operator who had turned it off globally.
+    #[test]
+    fn a_rules_override_keeps_the_settings_it_does_not_name() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [rules]
+            window_hours = 720
+            raid_detection = false
+            [[community."x".rules.words]]
+            id = "theirs"
+            patterns = ["blast"]
+            gravity = "note"
+            "#,
+        )
+        .unwrap();
+        let p = cfg.for_community("x");
+        assert_eq!(p.rules.words.len(), 1, "their own words");
+        assert_eq!(p.rules.window_hours, 720, "and the operator's window");
+        assert!(!p.rules.raid_detection, "and their decision to turn raid detection off");
     }
 
     #[test]
