@@ -333,7 +333,11 @@ impl Response {
     /// The rank of a stored response name. `None` maps to 0 — an unrecognised
     /// row is not a prior action, which is the safe reading in both directions.
     pub fn rank_of(name: &str) -> u8 {
-        Response::ALL.iter().find(|r| r.name() == name).map(|r| r.rank()).unwrap_or(0)
+        // `attempted:` is a rung Sentinel gave up on after repeated failures.
+        // It ranks like the rung so the ladder can move PAST something
+        // undeliverable — otherwise "unreachable" became "untouchable".
+        let bare = name.strip_prefix("attempted:").unwrap_or(name);
+        Response::ALL.iter().find(|r| r.name() == bare).map(|r| r.rank()).unwrap_or(0)
     }
 }
 

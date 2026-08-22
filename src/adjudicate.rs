@@ -44,6 +44,9 @@ pub struct Facts<'a> {
     pub prior: Option<&'a str>,
     pub acted_this_pass: usize,
     pub acted_this_hour: usize,
+    /// Distinct people actioned this hour. The roster halt reads THIS, because
+    /// the ladder climbs and one member spends several rows.
+    pub subjects_this_hour: usize,
     /// Members this community has, as the last evaluation counted them.
     pub roster: usize,
     pub is_me: bool,
@@ -126,7 +129,7 @@ pub fn adjudicate(cfg: &CommunityPolicy, powers: Powers, facts: &Facts, response
     if let Some(ceiling) = roster_ceiling(cfg, facts.roster) {
         // Measured against the hour, not one pass: the live lanes act one
         // message at a time, and a per-pass count is always zero for them.
-        if facts.acted_this_hour >= ceiling {
+        if facts.subjects_this_hour >= ceiling {
             return Sentence::Halt { ceiling, roster: facts.roster };
         }
     }
@@ -152,6 +155,7 @@ mod tests {
             roster: 100,
             is_me: false,
             from_vision: false,
+            subjects_this_hour: 0,
         }
     }
 
@@ -267,7 +271,7 @@ mod tests {
     #[test]
     fn the_roster_halt_measures_the_hour_not_one_pass() {
         let cfg = policy();
-        let f = Facts { roster: 40, acted_this_hour: 4, acted_this_pass: 0, ..facts() };
+        let f = Facts { roster: 40, subjects_this_hour: 4, acted_this_pass: 0, ..facts() };
         assert_eq!(adjudicate(&cfg, all_powers(), &f, Response::Ban), Sentence::Halt { ceiling: 4, roster: 40 });
     }
 

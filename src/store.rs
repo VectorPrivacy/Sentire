@@ -168,7 +168,8 @@ impl Store {
         self.lock()
             .query_row(
                 "SELECT COUNT(*) FROM actions WHERE community = ?1 AND dry = ?3 AND at_ms >= ?2 \
-                 AND response NOT LIKE 'raid:%' AND response NOT LIKE 'failed:%'",
+                 AND response NOT LIKE 'raid:%' AND response NOT LIKE 'failed:%' \
+                 AND response NOT LIKE 'attempted:%'",
                 rusqlite::params![community, since, dry as i64],
                 |r| r.get::<_, i64>(0).map(|n| n as usize),
             )
@@ -226,8 +227,8 @@ impl Store {
         let conn = self.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT DISTINCT evidence FROM strikes WHERE community = ?1 AND subject = ?2 \
-                 AND pardoned = 0 AND evidence != '' ORDER BY at_ms DESC LIMIT 3",
+                "SELECT evidence, MAX(at_ms) AS t FROM strikes WHERE community = ?1 AND subject = ?2 \
+                 AND pardoned = 0 AND evidence != '' GROUP BY evidence ORDER BY t DESC LIMIT 3",
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
@@ -257,8 +258,22 @@ impl Store {
         };
         let changed = seen.as_deref().is_some_and(|s| s != hash);
         if changed {
+            // ONLY the ids the engine keyed on the policy hash. Sentinel's own
+            // `msg:` and `vision:` ids are stable by construction, so
+            // tombstoning them erased those convictions permanently —
+            // INSERT OR IGNORE hit the tombstone on every later report.
             conn.execute(
-                "UPDATE strikes SET pardoned = 1 WHERE community = ?1 AND pardoned = 0",
+                "UPDATE strikes SET pardoned = 1 WHERE community = ?1 AND pardoned = 0 \
+                 AND conviction_id NOT LIKE 'msg:%' AND conviction_id NOT LIKE 'vision:%'",
+                rusqlite::params![community],
+            )
+            .map_err(|e| e.to_string())?;
+            // The ladder floor lives in `actions`, and an amnesty that leaves it
+            // standing gives a previously-kicked member a total of zero and a
+            // floor of `kick`: nothing until they earn a ban, which then lands
+            // without a warning ever having been delivered.
+            conn.execute(
+                "DELETE FROM actions WHERE community = ?1 AND response NOT LIKE 'raid:%'",
                 rusqlite::params![community],
             )
             .map_err(|e| e.to_string())?;
@@ -267,6 +282,23 @@ impl Store {
             .map_err(|e| e.to_string())?;
         conn.commit().map_err(|e| e.to_string())?;
         Ok(changed)
+    }
+
+    /// Distinct PEOPLE actioned here in the last hour. The roster halt bounds
+    /// how much of a community may be touched, and the ladder climbs — so
+    /// counting rows let one member's four rungs trip a guard sized for four
+    /// members.
+    pub fn subjects_actioned_last_hour(&self, community: &str, dry: bool, now_ms: u64) -> Result<usize, String> {
+        let since = now_ms.saturating_sub(3_600_000) as i64;
+        self.lock()
+            .query_row(
+                "SELECT COUNT(DISTINCT subject) FROM actions WHERE community = ?1 AND dry = ?3 \
+                 AND at_ms >= ?2 AND response NOT LIKE 'raid:%' AND response NOT LIKE 'failed:%' \
+                 AND response NOT LIKE 'attempted:%'",
+                rusqlite::params![community, since, dry as i64],
+                |r| r.get::<_, i64>(0).map(|n| n as usize),
+            )
+            .map_err(|e| e.to_string())
     }
 
     /// How many times this exact sentence has failed against this member
@@ -566,13 +598,44 @@ mod tests {
     #[test]
     fn a_rulebook_change_forgives_the_window_rather_than_doubling_it() {
         let s = mem();
+        // An engine-minted id: re-keyed by a policy change, so forgiving it is
+        // the only way not to charge the same offense twice.
         s.record("c", "npub1a", "x", 4, 0, "").unwrap();
+        s.log_action("c", "npub1a", "kick", false, 0, "").unwrap();
         assert!(!s.note_policy("c", "hash1").unwrap(), "the first sight of a rulebook changes nothing");
         assert_eq!(s.strikes("c", "npub1a").unwrap().len(), 1);
         assert!(!s.note_policy("c", "hash1").unwrap(), "and neither does seeing it again");
 
         assert!(s.note_policy("c", "hash2").unwrap(), "a different rulebook is a change");
         assert!(s.strikes("c", "npub1a").unwrap().is_empty(), "its window is forgiven, not re-charged");
+        assert_eq!(s.strongest_response("c", "npub1a", false, 0).unwrap(), None, "and the floor goes with it");
+    }
+
+    /// Sentinel's own ids are stable by construction, so a rulebook change does
+    /// not re-key them — tombstoning them erased those convictions for good.
+    #[test]
+    fn the_carried_warning_names_what_it_is_for() {
+        let s = mem();
+        s.record("c", "npub1a", "a", 2, 1_000, "slurs [severe] 1×").unwrap();
+        s.record("c", "npub1a", "b", 2, 9_000, "links [major] 2×").unwrap();
+        s.record("c", "npub1a", "c", 2, 5_000, "slurs [severe] 1×").unwrap();
+        let ev = s.evidence("c", "npub1a").unwrap();
+        assert_eq!(ev.first().map(String::as_str), Some("links [major] 2×"), "newest first, deduped");
+        assert_eq!(ev.len(), 2);
+    }
+
+    #[test]
+    fn a_rulebook_change_leaves_sentinels_own_convictions_alone() {
+        let s = mem();
+        s.record("c", "npub1a", "msg:slurs:evt1", 4, 0, "").unwrap();
+        s.record("c", "npub1a", "vision:hash1:gore", 12, 0, "").unwrap();
+        s.note_policy("c", "hash1").unwrap();
+        assert!(s.note_policy("c", "hash2").unwrap());
+        assert_eq!(
+            s.strikes("c", "npub1a").unwrap().len(),
+            2,
+            "an id the rulebook never keyed must survive its change, or it can never be charged again"
+        );
     }
 
     #[test]

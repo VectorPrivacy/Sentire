@@ -42,15 +42,27 @@ pub fn decide(ladder: &Ladder, total: u32) -> Option<Response> {
 /// first observed offense is a grave one. Climbing one rung per answer means
 /// every step is actually delivered, and a total that keeps rising keeps
 /// climbing.
-pub fn next_step(ladder: &Ladder, total: u32, already: Option<&str>) -> Option<Response> {
-    let reached = decide(ladder, total)?;
-    let floor = already.map(Response::rank_of).unwrap_or(0);
-    ladder
-        .steps
-        .iter()
-        .map(|s| s.response)
-        .filter(|r| r.rank() > floor && r.rank() <= reached.rank())
-        .min_by_key(|r| r.rank())
+/// `answered_at` is asked PER RUNG, because whether a rung has been answered
+/// depends on the space it would be recorded in — and an `[arm]` block that is
+/// not uniform puts different rungs in different spaces. A single prior, looked
+/// up once with a guessed armed-ness, read the wrong space for half the ladder
+/// and proposed a rung that was always already answered.
+pub fn next_step<E>(
+    ladder: &Ladder,
+    total: u32,
+    answered_at: impl Fn(Response) -> Result<Option<String>, E>,
+) -> Result<Option<Response>, E> {
+    let Some(reached) = decide(ladder, total) else { return Ok(None) };
+    for r in Response::ALL {
+        if r.rank() > reached.rank() {
+            break;
+        }
+        let prior = answered_at(r)?;
+        if prior.as_deref().map(Response::rank_of).unwrap_or(0) < r.rank() {
+            return Ok(Some(r));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -60,23 +72,56 @@ mod tests {
 
     /// Arming after a rehearsal used to fire the whole backlog at the top rung,
     /// so a member accumulated to Ban was banned without ever being warned.
+    /// Every rung the same answer, which is what a uniform `[arm]` block gives.
+    fn flat(answer: Option<&str>) -> impl Fn(Response) -> Result<Option<String>, ()> + '_ {
+        move |_| Ok(answer.map(String::from))
+    }
+
     #[test]
     fn the_ladder_is_climbed_one_rung_at_a_time() {
         let l = ladder();
         // Twelve points reaches Ban, but the first answer is still a warning.
-        assert_eq!(next_step(&l, 12, None), Some(Response::Warn));
-        assert_eq!(next_step(&l, 12, Some("warn")), Some(Response::DeleteAndWarn));
-        assert_eq!(next_step(&l, 12, Some("delete_and_warn")), Some(Response::Kick));
-        assert_eq!(next_step(&l, 12, Some("kick")), Some(Response::Ban));
-        assert_eq!(next_step(&l, 12, Some("ban")), None, "nothing above the top");
+        assert_eq!(next_step(&l, 12, flat(None)), Ok(Some(Response::Warn)));
+        assert_eq!(next_step(&l, 12, flat(Some("warn"))), Ok(Some(Response::DeleteAndWarn)));
+        assert_eq!(next_step(&l, 12, flat(Some("delete_and_warn"))), Ok(Some(Response::Kick)));
+        assert_eq!(next_step(&l, 12, flat(Some("kick"))), Ok(Some(Response::Ban)));
+        assert_eq!(next_step(&l, 12, flat(Some("ban"))), Ok(None), "nothing above the top");
 
         // And it never climbs past what the total has actually earned.
-        assert_eq!(next_step(&l, 4, Some("warn")), Some(Response::DeleteAndWarn));
-        assert_eq!(next_step(&l, 4, Some("delete_and_warn")), None, "four points is not a kick");
-        assert_eq!(next_step(&l, 0, None), None, "and a clean member answers to nothing");
+        assert_eq!(next_step(&l, 4, flat(Some("warn"))), Ok(Some(Response::DeleteAndWarn)));
+        assert_eq!(next_step(&l, 4, flat(Some("delete_and_warn"))), Ok(None), "four points is not a kick");
+        assert_eq!(next_step(&l, 0, flat(None)), Ok(None), "and a clean member answers to nothing");
 
         // An unrecognised prior ranks 0, so it never blocks the first rung.
-        assert_eq!(next_step(&l, 12, Some("raid:kick")), Some(Response::Warn));
+        assert_eq!(next_step(&l, 12, flat(Some("raid:kick"))), Ok(Some(Response::Warn)));
+    }
+
+    /// The case a single guessed lookup could not express: `[arm]` with warn
+    /// off and kick on puts those two rungs in different `dry` spaces, so each
+    /// has its own idea of what has been answered. Asking once wedged the
+    /// ladder silently.
+    #[test]
+    fn each_rung_is_asked_about_its_own_space() {
+        let l = ladder();
+        // warn was rehearsed (answered in the dry space); kick never was.
+        let per_rung = |r: Response| -> Result<Option<String>, ()> {
+            Ok(match r {
+                Response::Warn | Response::DeleteAndWarn => Some(r.name().to_string()),
+                _ => None,
+            })
+        };
+        assert_eq!(next_step(&l, 12, per_rung), Ok(Some(Response::Kick)), "it climbs past what is answered");
+    }
+
+    /// A failed rung that gave up records `attempted:{name}`, which must rank
+    /// like the rung so the ladder can move past something undeliverable.
+    #[test]
+    fn a_rung_given_up_on_does_not_pin_the_ladder() {
+        let l = ladder();
+        let gave_up = |r: Response| -> Result<Option<String>, ()> {
+            Ok((r == Response::Warn).then(|| "warn".to_string()))
+        };
+        assert_eq!(next_step(&l, 12, gave_up), Ok(Some(Response::DeleteAndWarn)));
     }
 
     fn ladder() -> Ladder {

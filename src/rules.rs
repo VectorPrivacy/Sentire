@@ -83,11 +83,12 @@ pub async fn install(
     // rule ids — so every gravity lookup missed and quietly downgraded.
     match compile(&cfg.for_community(community.id())) {
         Some(policy) => {
-            let bytes = policy.clone().build().map_err(|e| e.to_string())?;
             community.policies().set(POLICY_ID, policy).await.map_err(|e| e.to_string())?;
-            // The engine keys its window-rung convictions on the policy hash, so
-            // a changed rulebook re-reports the whole window under fresh ids.
-            if store.note_policy(community.id(), &format!("{:016x}", fnv(&bytes)))? {
+            // The OPERATOR's rules, not the SDK's serialization of them: hashing
+            // the built document meant any SDK field addition or serde
+            // reordering forgave every community's window on the next upgrade.
+            let fingerprint = format!("{:?}", cfg.for_community(community.id()).rules);
+            if store.note_policy(community.id(), &format!("{:016x}", fnv(&fingerprint)))? {
                 return Ok("rulebook changed — its open window forgiven");
             }
             Ok("installed")

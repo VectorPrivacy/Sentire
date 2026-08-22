@@ -156,8 +156,14 @@ Inside a community, from any client that renders slash commands:
 - `/why <member>` — their strike record, decayed, and the next step
 - `/pardon <member>` — clear it. Moderators only; the community's own roles decide.
 
-A pardon clears the action history as well as the strikes: leaving the history behind meant a
-forgiven member stayed immune to every response below the one they had already received.
+A pardon tombstones the strikes and clears the action history. Both halves matter: the strikes
+must survive as tombstones because the engine re-reports the same convictions for as long as
+the evidence sits in its window, and the history must go because a forgiven member who kept it
+stays immune to every response below the one they already received.
+
+Editing `[rules]` is a smaller amnesty of the same shape. The engine keys its window-scoped
+convictions on the rulebook, so a change re-reports them under fresh ids — Sentinel forgives
+that community's open window rather than charging it twice.
 
 ## Proven vs unproven
 

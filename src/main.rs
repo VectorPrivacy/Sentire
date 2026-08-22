@@ -362,13 +362,7 @@ async fn trip(
     if !tripped {
         return;
     }
-    if sweep_in_flight(wires, community.id()) {
-        // The evaluation this would ask for is already happening. Give the
-        // trip back rather than consuming the cooldown on a sweep that returns
-        // immediately and re-evaluates nothing.
-        untrip(wires, community.id());
-        return;
-    }
+
     let r = cfg.for_community(&cid).raid;
     println!(
         "[{}] TRIPWIRE — {} distinct accounts inside {}s, evaluating now",
@@ -379,8 +373,14 @@ async fn trip(
     // The 90-second memoisation is right for a background pass and far too slow
     // for a wave in progress.
     community.invalidate();
-    if let Err(e) = sweep(bot, community, cfg, store, wires, me).await {
-        eprintln!("{}: {e}", short(community.id()));
+    match sweep(bot, community, cfg, store, wires, me).await {
+        // It declined — another sweep is already in flight. Give the trip back
+        // rather than spending the cooldown on an evaluation that never ran.
+        // Checking `sweeping` beforehand was a race: both handlers could see
+        // false and the loser still lost its trip.
+        Ok(false) => untrip(wires, community.id()),
+        Ok(true) => {}
+        Err(e) => eprintln!("{}: {e}", short(community.id())),
     }
 }
 
@@ -460,11 +460,9 @@ async fn screen(
     let strikes = store.strikes(community.id(), &author).map_err(vector_sdk::Error::Other)?;
     let total = ladder::total(&strikes, now, policy.ladder.decay_half_life_hours);
     let ctx = live_ctx(cfg, &community, watches, me, false).await;
-    let armed_any = ctx.policy.arm.warn || ctx.policy.arm.delete || ctx.policy.arm.kick || ctx.policy.arm.ban;
-    let prior = prior_answer(store, &community, &author, armed_any, answer_horizon(&ctx.policy, now));
-    if let Some(response) = ladder::next_step(&ctx.policy.ladder, total, prior.as_deref()) {
+    if ladder::decide(&ctx.policy.ladder, total).is_some() {
         let v = live_verdict(&author, shield, &evidence, msg.message.id.clone(), &findings);
-        enforce(bot, &community, &ctx, store, watches, &Mutex::new(0), &v, response, total).await?;
+        enforce(bot, &community, &ctx, store, watches, &Mutex::new(0), &v, total).await?;
     }
     Ok(())
 }
@@ -546,11 +544,6 @@ fn debt_subjects(
         .filter(|n| !handled.contains(n) && n != me)
         .filter_map(|n| roster.get(&n).cloned().map(|shield| (n, shield)))
         .collect()
-}
-
-/// Is a sweep already running here?
-fn sweep_in_flight(watches: &Watches, community: &str) -> bool {
-    watches.lock().unwrap_or_else(|e| e.into_inner()).get(community).is_some_and(|w| w.sweeping)
 }
 
 /// Return a spent trip, so the cooldown is not burnt on an evaluation that
@@ -710,13 +703,16 @@ async fn watch_media(
     let now = now_ms();
 
     for att in &msg.message.attachments {
-        // A cheap pre-filter on the sender's own claims; both are re-checked
-        // against the real bytes below.
+        // A pre-filter on the sender's own claims, so it is a REFUSAL to look
+        // rather than a clean answer: declaring an oversize or odd-typed
+        // attachment must not be a way to have it never judged in silence.
         if att.size > cfg.vision.max_bytes {
+            unclassified(bot, &community, cfg, store, watches, me, now, &att.id, "declared over the size limit").await;
             continue;
         }
         let declared = vector_sdk::vector_core::crypto::mime_from_extension(&att.extension);
         if !cfg.vision.mimes.iter().any(|m| m == declared) {
+            unclassified(bot, &community, cfg, store, watches, me, now, &att.id, "declared a type I do not judge").await;
             continue;
         }
         // The bytes have to arrive before anything about them can be trusted.
@@ -809,11 +805,9 @@ async fn watch_media(
                 // the community gate must not each pin megabytes.
                 drop(bytes);
                 let ctx = live_ctx(cfg, &community, watches, me, true).await;
-                let armed_any = ctx.policy.arm.vision;
-                let prior = prior_answer(store, &community, &author, armed_any, answer_horizon(&ctx.policy, now));
-                if let Some(response) = ladder::next_step(&ctx.policy.ladder, total, prior.as_deref()) {
+                if ladder::decide(&ctx.policy.ladder, total).is_some() {
                     let v = synthetic_verdict(&author, shield.clone(), &evidence, msg.message.id.clone());
-                    enforce(bot, &community, &ctx, store, watches, &Mutex::new(0), &v, response, total).await?;
+                    enforce(bot, &community, &ctx, store, watches, &Mutex::new(0), &v, total).await?;
                 }
             }
         }
@@ -996,17 +990,19 @@ async fn sweep(
     store: &Arc<Store>,
     wires: &Watches,
     me: &str,
-) -> vector_sdk::Result<()> {
+) -> vector_sdk::Result<bool> {
     if !cfg.watches(community.id()) {
-        return Ok(());
+        return Ok(false);
     }
     // Single-flight. Claimed before the corpus read, released however this
-    // returns, so an error path cannot wedge the community closed.
+    // returns, so an error path cannot wedge the community closed. Returns
+    // whether it actually RAN: a caller that lost the race must be able to give
+    // its trip back rather than spend a cooldown on nothing.
     {
         let mut guard = wires.lock().unwrap_or_else(|e| e.into_inner());
         let w = guard.entry(community.id().to_string()).or_default();
         if w.sweeping {
-            return Ok(());
+            return Ok(false);
         }
         w.sweeping = true;
     }
@@ -1020,9 +1016,9 @@ async fn sweep(
     if verdicts.all().next().is_none() {
         // The coverage line is the whole reason a quiet pass is legible, and it
         // is most needed on the pass that explains itself least.
-        heartbeat(short(community.id()), &verdicts, 0, &Powers::default());
+        heartbeat(short(community.id()), &verdicts, 0, None);
         println!("[{}] roster read returned no members — holding this pass", short(community.id()));
-        return Ok(());
+        return Ok(false);
     }
 
     let ctx_raid = cfg.for_community(community.id()).raid;
@@ -1093,7 +1089,6 @@ async fn sweep(
             .filter(|f| f.stateless && f.is_proven() && !f.messages.is_empty() && f.citation_count as usize <= f.messages.len())
             .map(|f| f.rule_id.as_str())
             .collect();
-        let mut fresh = false;
         for f in &v.findings {
             if !f.is_proven() {
                 continue; // inference never earns a strike
@@ -1110,32 +1105,20 @@ async fn sweep(
                 // an ignored insert. Skipping these outright meant anything
                 // posted while Sentinel was down was never charged at all.
                 for mid in &f.messages {
-                    fresh |= store
+                    store
                         .record(community.id(), &v.npub, &conviction_id(&f.rule_id, mid), worth, now, &evidence)
                         .map_err(vector_sdk::Error::Other)?;
                 }
                 continue;
             }
-            fresh |= store
+            store
                 .record(community.id(), &v.npub, &f.conviction_id, worth, now, &evidence)
                 .map_err(vector_sdk::Error::Other)?;
         }
-        // Deliberately NOT gated on "anything new this poll": a sentence the
-        // last pass could not carry out — a ceiling, a failed ban, a permission
-        // Sentinel did not have — left no record, so re-checking only on a NEW
-        // offense meant the debt was silently forgotten. `adjudicate` already
-        // refuses to answer the same standing twice, so re-asking is cheap and
-        // correct.
-        let _ = fresh;
-
         let strikes = store.strikes(community.id(), &v.npub).map_err(vector_sdk::Error::Other)?;
         let total = ladder::total(&strikes, now, ctx.policy.ladder.decay_half_life_hours);
-        let armed_any = ctx.policy.arm.warn || ctx.policy.arm.delete || ctx.policy.arm.kick || ctx.policy.arm.ban;
-        let prior = prior_answer(store, community, &v.npub, armed_any, answer_horizon(&ctx.policy, now));
-        let Some(response) = ladder::next_step(&ctx.policy.ladder, total, prior.as_deref()) else { continue };
-
         handled.insert(v.npub.clone());
-        if enforce(bot, community, &ctx, store, wires, &pass, v, response, total).await? == Outcome::Halted {
+        if enforce(bot, community, &ctx, store, wires, &pass, v, total).await? == Outcome::Halted {
             halted = true;
             break;
         }
@@ -1155,16 +1138,9 @@ async fn sweep(
         for (npub, shield) in debt_subjects(&handled, &roster, owed, me) {
             let strikes = store.strikes(community.id(), &npub).map_err(vector_sdk::Error::Other)?;
             let total = ladder::total(&strikes, now, ctx.policy.ladder.decay_half_life_hours);
-            let armed_any = ctx.policy.arm.warn || ctx.policy.arm.delete || ctx.policy.arm.kick || ctx.policy.arm.ban;
-            let prior = prior_answer(store, community, &npub, armed_any, answer_horizon(&ctx.policy, now));
-            let Some(mut response) = ladder::next_step(&ctx.policy.ladder, total, prior.as_deref()) else { continue };
-            // Nothing to delete without citations, and recording a
-            // delete_and_warn would rank 2 and block a later real one.
-            if response == Response::DeleteAndWarn {
-                response = Response::Warn;
-            }
+
             let v = carried_verdict(&npub, shield, store.evidence(community.id(), &npub).unwrap_or_default());
-            if enforce(bot, community, &ctx, store, wires, &pass, &v, response, total).await? == Outcome::Halted {
+            if enforce(bot, community, &ctx, store, wires, &pass, &v, total).await? == Outcome::Halted {
                 halted = true;
                 break;
             }
@@ -1189,8 +1165,8 @@ async fn sweep(
         contain(bot, community, &ctx, store, &verdicts, now).await?;
     }
 
-    heartbeat(id, &verdicts, convicted, &ctx.powers);
-    Ok(())
+    heartbeat(id, &verdicts, convicted, Some(&ctx.powers));
+    Ok(true)
 }
 
 /// A raid answers to itself, not to the ladder — but it answers to the same
@@ -1264,7 +1240,10 @@ async fn contain(
     // everyone already handled — which for bans is a key rotation each time.
     // Claims are scoped to armed-ness, so a rehearsal never immunises a cohort
     // against a later real containment.
-    let scope = if touched { "live" } else { "dry" };
+    // Keyed on ARMED-ness alone, not on what the verb happened to be. Scoping a
+    // Report run as dry meant switching it to kick inside the TTL found every
+    // member already claimed and contained nobody.
+    let scope = if armed { "armed" } else { "dry" };
     let ttl = ctx.policy.raid.claim_ttl_secs.saturating_mul(1000);
     let mut fresh: Vec<String> = Vec::new();
     for npub in &suspects {
@@ -1387,17 +1366,6 @@ async fn contain(
     Ok(())
 }
 
-/// The strongest answer this member has already had, at this armed-ness.
-fn prior_answer(
-    store: &Arc<Store>,
-    community: &Community,
-    npub: &str,
-    armed: bool,
-    horizon: u64,
-) -> Option<String> {
-    store.strongest_response(community.id(), npub, !armed, horizon).ok().flatten()
-}
-
 /// How far back an answer still answers for anything.
 fn answer_horizon(policy: &CommunityPolicy, now: u64) -> u64 {
     now.saturating_sub(policy.ladder.decay_half_life_hours.saturating_mul(3_600_000).saturating_mul(32))
@@ -1417,7 +1385,6 @@ async fn enforce(
     wires: &Watches,
     pass: &Mutex<usize>,
     v: &Verdict,
-    response: Response,
     total: u32,
 ) -> vector_sdk::Result<Outcome> {
     let gate = enforce_lock(wires, community.id());
@@ -1429,18 +1396,28 @@ async fn enforce(
     let why = v.why();
     let who = short(&v.npub);
 
-    // The SAME armed-ness the sentence will be carried out under. Computing it
-    // differently here scoped the dedup lookup to the wrong `dry` space, so a
-    // vision rehearsal was deduped against real kicks.
     let from_vision = ctx.from_vision;
+    let horizon = answer_horizon(&ctx.policy, now);
+
+    // Pick the rung HERE, one place, asking each candidate about the space it
+    // would actually be recorded in.
+    //
+    // A caller that chose the rung had to guess an armed-ness for its lookup,
+    // and any `[arm]` block that was not uniform made that guess wrong: the
+    // ladder read one `dry` space and the dedup another, so it proposed a rung
+    // already answered in the other space and the whole ladder went silent.
+    let chosen = ladder::next_step(&ctx.policy.ladder, total, |r| {
+        let armed = adjudicate::armed_for(&ctx.policy, r, from_vision);
+        store.strongest_response(community.id(), &v.npub, !armed, horizon)
+    })
+    .map_err(vector_sdk::Error::Other)?;
+    // Every rung up to what they earned is already answered.
+    let Some(response) = chosen else { return Ok(Outcome::AlreadyAnswered) };
     let armed_class = adjudicate::armed_for(&ctx.policy, response, from_vision);
-    // Answers decay with the strikes they answered: `32` halvings is where a
-    // strike reaches zero, so beyond that there is nothing left to have
-    // answered for.
-    let horizon = now.saturating_sub(ctx.policy.ladder.decay_half_life_hours.saturating_mul(3_600_000).saturating_mul(32));
     let prior = store
         .strongest_response(community.id(), &v.npub, !armed_class, horizon)
         .map_err(vector_sdk::Error::Other)?;
+
     let facts = adjudicate::Facts {
         shield: &v.shield,
         prior: prior.as_deref(),
@@ -1451,28 +1428,29 @@ async fn enforce(
         acted_this_hour: store
             .actions_last_hour(community.id(), !armed_class, now)
             .map_err(vector_sdk::Error::Other)?,
+        // Distinct PEOPLE, because the ladder climbs: one offender now spends
+        // up to four rows, and a roster halt counting rows tripped on a single
+        // member in a small community and took raid containment down with it.
+        subjects_this_hour: store
+            .subjects_actioned_last_hour(community.id(), !armed_class, now)
+            .map_err(vector_sdk::Error::Other)?,
         roster: ctx.roster,
         is_me: v.npub == ctx.me,
         from_vision,
     };
-
-    // A target this sentence keeps failing against — gone, outranking us, no
-    // inbox relay to reach — must stop being retried every pass. Bounded rather
-    // than tombstoned, so a transient relay blip still gets another go.
-    if store
-        .failures(community.id(), &v.npub, response.name(), now.saturating_sub(3_600_000))
-        .map_err(vector_sdk::Error::Other)?
-        >= MAX_FAILURES_PER_HOUR
-    {
-        return Ok(Outcome::Failed);
-    }
 
     let (response, armed) = match adjudicate::adjudicate(&ctx.policy, ctx.powers, &facts, response) {
         Sentence::Spare { why: reason } => {
             println!("[{id}] QUEUED  {who} — {why} ({reason})");
             return Ok(Outcome::Spared);
         }
-        Sentence::Answered => return Ok(Outcome::AlreadyAnswered),
+        // Unreachable now the rung is chosen against the same lookup, kept as
+        // a belt — and it prints, because silence is one of the two states a
+        // wedged bot lives in.
+        Sentence::Answered => {
+            println!("[{id}] ANSWERED {who} — {} already given", response.name());
+            return Ok(Outcome::AlreadyAnswered);
+        }
         Sentence::Powerless { needs } => {
             println!("[{id}] CANNOT  {} {who} — this community grants Sentinel no {needs}", response.name());
             return Ok(Outcome::Powerless);
@@ -1491,7 +1469,6 @@ async fn enforce(
         Sentence::Carry { response, armed } => (response, armed),
     };
 
-    let mut effective = response;
     let name = response.name();
     println!("[{id}] {} {name} {who} — {total} strike(s) — {why}", if armed { "ENFORCE" } else { "WOULD  " });
 
@@ -1504,7 +1481,8 @@ async fn enforce(
                 // Capped: a member cited across fifty messages is one sentence,
                 // not fifty round trips inside one decision.
                 let mut hidden = std::collections::HashSet::new();
-                let mut all_hidden = true;
+                let mut failed_hides = 0usize;
+                let mut attempted = 0usize;
                 for msg_id in v
                     .findings
                     .iter()
@@ -1513,41 +1491,53 @@ async fn enforce(
                     .filter(|m| hidden.insert((*m).clone()))
                     .take(MAX_HIDES)
                 {
+                    attempted += 1;
                     if let Some(m) = bot.message(msg_id).await {
                         if let Err(e) = m.hide().await {
                             eprintln!("[{id}] hide {}: {e}", short(msg_id));
-                            all_hidden = false;
+                            failed_hides += 1;
                         }
                     } else {
-                        all_hidden = false;
+                        // Already hidden, deleted, or expired: the end state
+                        // this rung wanted. Counting it as a failure meant an
+                        // offender deleting their own post pinned the ladder.
                     }
                 }
-                let sent = bot.dm(&v.npub).send(&warn_text(&why)).await.map(|_| ());
-                // Their messages are still visible, so this was a warning.
-                // Recording the higher rung would mark them answered at it and
-                // block any later real delete.
-                if !all_hidden {
-                    effective = Response::Warn;
+                if attempted == 0 {
+                    // Proven findings can cite no message at all (tenure, join
+                    // burst), so this rung had nothing to delete. Say so; the
+                    // ladder still records the rung, or it re-proposes forever.
+                    println!("[{id}] nothing to hide for {who} — the warning is the whole sentence");
+                } else if failed_hides > 0 {
+                    eprintln!("[{id}] {failed_hides} of {attempted} message(s) could not be hidden");
                 }
-                sent
+                bot.dm(&v.npub).send(&warn_text(&why)).await.map(|_| ())
             }
             Response::Kick => community.member(v.npub.clone()).kick().await,
             Response::Ban => community.member(v.npub.clone()).ban().await,
         };
         if let Err(e) = outcome {
-            // Nothing happened, so no ladder row is written — the debt stands.
-            // But a permanently-failing target (gone, outranking us, a dead
-            // relay) would otherwise be retried every pass forever, and a
-            // partially-successful ban is a key rotation each time.
             eprintln!("[{id}] {name} {who} FAILED: {e}");
             let _ = store.log_action(community.id(), &v.npub, &format!("failed:{name}"), !armed, now, &why);
+            // After enough tries this rung is not going to land — gone,
+            // outranking us, no inbox relay. Advance the floor so the ladder can
+            // move PAST it: leaving it unanswered pinned the member below the
+            // rung forever, which turned "unreachable" into "untouchable".
+            let tries = store
+                .failures(community.id(), &v.npub, name, now.saturating_sub(3_600_000))
+                .map_err(vector_sdk::Error::Other)?;
+            if tries >= MAX_FAILURES_PER_HOUR {
+                println!("[{id}] GAVE UP {name} {who} after {tries} tries — moving past this rung");
+                let _ = store.log_action(community.id(), &v.npub, &format!("attempted:{name}"), !armed, now, &why);
+            }
             return Ok(Outcome::Failed);
         }
     }
 
-    store
-        .log_action(community.id(), &v.npub, effective.name(), !armed, now, &why)
-        .map_err(vector_sdk::Error::Other)?;
+    // The rung that was ADJUDICATED, always. Logging a lesser one made the
+    // ladder re-propose the same rung every pass — a warning DM every poll,
+    // forever, and nothing above it ever reachable.
+    store.log_action(community.id(), &v.npub, name, !armed, now, &why).map_err(vector_sdk::Error::Other)?;
     // The mod channel is an audit trail of what HAPPENED; a dry run announcing
     // every rehearsal fills it with things nobody did.
     if armed {
@@ -1622,7 +1612,7 @@ fn short(s: &str) -> &str {
 /// is exactly how a moderation tool stays broken for months. Every pass says
 /// what it read and how many people it weighed, so silence becomes a result
 /// rather than an absence of one.
-fn heartbeat(community: &str, verdicts: &Verdicts, found: usize, powers: &Powers) {
+fn heartbeat(community: &str, verdicts: &Verdicts, found: usize, powers: Option<&Powers>) {
     let cov = verdicts.coverage();
     let mut shields = (0, 0, 0);
     for v in verdicts.all() {
@@ -1651,7 +1641,7 @@ fn heartbeat(community: &str, verdicts: &Verdicts, found: usize, powers: &Powers
         shields.0,
         shields.1,
         shields.2,
-        powers.describe(),
+        powers.map(|p| p.describe()).unwrap_or_else(|| "powers not read this pass".into()),
     );
 }
 
