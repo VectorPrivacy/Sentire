@@ -22,10 +22,11 @@ CREATE TABLE IF NOT EXISTS strikes (
     PRIMARY KEY (community, subject, conviction_id)
 );
 CREATE TABLE IF NOT EXISTS classifications (
-    content_hash TEXT PRIMARY KEY,
-    verdict      TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
     model        TEXT NOT NULL,
-    at_ms        INTEGER NOT NULL
+    verdict      TEXT NOT NULL,
+    at_ms        INTEGER NOT NULL,
+    PRIMARY KEY (content_hash, model)
 );
 CREATE TABLE IF NOT EXISTS actions (
     community TEXT NOT NULL,
@@ -34,7 +35,10 @@ CREATE TABLE IF NOT EXISTS actions (
     dry       INTEGER NOT NULL,
     at_ms     INTEGER NOT NULL,
     evidence  TEXT NOT NULL DEFAULT ''
-);";
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_actions_claim ON actions(community, subject, response) WHERE response = 'raid:claim';
+CREATE INDEX IF NOT EXISTS idx_actions_subject ON actions(community, subject, at_ms);
+CREATE INDEX IF NOT EXISTS idx_actions_at ON actions(dry, at_ms);";
 
 /// The connection lives behind a mutex so one `Arc<Store>` serves both the
 /// sweep loop and the operator's slash commands. Every method locks briefly and
@@ -130,18 +134,45 @@ impl Store {
             .map_err(|e| e.to_string())
     }
 
-    /// The most severe response already taken (or rehearsed) against a member,
-    /// so one strike total does not warn on every poll forever.
-    pub fn last_response(&self, community: &str, subject: &str) -> Result<Option<String>, String> {
+    /// The strongest response already taken against a member, so one standing
+    /// is not re-sentenced on every poll.
+    ///
+    /// Scoped to `dry`, and that is load-bearing: a rehearsal must only dedup
+    /// rehearsals. Sharing one column meant a day of dry running left every
+    /// member marked as already answered, and arming the bot then did nothing
+    /// for anyone — the operator saw silence and read it as broken.
+    ///
+    /// STRONGEST, not latest: ordering by time let a later, lesser response
+    /// reopen a member to everything above it.
+    pub fn strongest_response(&self, community: &str, subject: &str, dry: bool) -> Result<Option<String>, String> {
         use rusqlite::OptionalExtension;
         self.lock()
             .query_row(
-                "SELECT response FROM actions WHERE community = ?1 AND subject = ?2 ORDER BY at_ms DESC LIMIT 1",
-                rusqlite::params![community, subject],
+                "SELECT response FROM actions \
+                 WHERE community = ?1 AND subject = ?2 AND dry = ?3 AND response IN ('warn','delete_and_warn','kick','ban') \
+                 ORDER BY CASE response WHEN 'ban' THEN 4 WHEN 'kick' THEN 3 WHEN 'delete_and_warn' THEN 2 ELSE 1 END DESC \
+                 LIMIT 1",
+                rusqlite::params![community, subject, dry as i64],
                 |r| r.get(0),
             )
             .optional()
             .map_err(|e| e.to_string())
+    }
+
+    /// Has this exact cohort already been contained? A raid stays detected for
+    /// as long as its evidence sits in the window, and without this every sweep
+    /// re-runs the containment — which for bans means repeated key rotations,
+    /// the precise stranding batching exists to avoid.
+    pub fn claim_cohort(&self, community: &str, fingerprint: &str, at_ms: u64) -> Result<bool, String> {
+        let n = self
+            .lock()
+            .execute(
+                "INSERT OR IGNORE INTO actions (community, subject, response, dry, at_ms, evidence)
+                 VALUES (?1, ?2, 'raid:claim', 0, ?3, 'cohort')",
+                rusqlite::params![community, fingerprint, at_ms as i64],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(n > 0)
     }
 
     /// What a model said about this blob last time, if anything.
@@ -174,11 +205,17 @@ impl Store {
     }
 
     /// The one command that undoes: clear a member's strikes.
+    /// Clears strikes AND the action history. Leaving the history behind meant a
+    /// pardoned member stayed immune to every response up to whatever they had
+    /// already received — forgiven on paper, unreachable in practice.
     pub fn pardon(&self, community: &str, subject: &str) -> Result<usize, String> {
-        self.lock()
+        let conn = self.lock();
+        let n = conn
             .execute("DELETE FROM strikes WHERE community = ?1 AND subject = ?2", rusqlite::params![community, subject])
-            .map(|n| n)
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        conn.execute("DELETE FROM actions WHERE community = ?1 AND subject = ?2", rusqlite::params![community, subject])
+            .map_err(|e| e.to_string())?;
+        Ok(n)
     }
 }
 
@@ -225,16 +262,57 @@ mod tests {
     }
 
     #[test]
-    fn pardon_clears_and_the_hourly_ceiling_counts_only_real_actions() {
+    fn pardon_clears_the_history_too_or_forgiveness_is_only_on_paper() {
         let s = mem();
         s.record("c", "npub1a", "x", 4, 0, "").unwrap();
+        s.log_action("c", "npub1a", "kick", false, 0, "").unwrap();
         assert_eq!(s.pardon("c", "npub1a").unwrap(), 1);
         assert!(s.strikes("c", "npub1a").unwrap().is_empty());
+        assert_eq!(
+            s.strongest_response("c", "npub1a", false).unwrap(),
+            None,
+            "a pardoned member who kept a 'kick' on file could only ever be banned next"
+        );
+    }
 
+    #[test]
+    fn the_hourly_ceiling_counts_only_real_actions() {
+        let s = mem();
         s.log_action("c", "npub1a", "warn", true, 1000, "").unwrap();
         s.log_action("c", "npub1a", "warn", false, 1000, "").unwrap();
         assert_eq!(s.actions_last_hour(2000).unwrap(), 1, "rehearsals never count against the ceiling");
         assert_eq!(s.actions_last_hour(3_700_000 + 1000).unwrap(), 0, "and the hour rolls off");
-        assert_eq!(s.last_response("c", "npub1a").unwrap().as_deref(), Some("warn"));
+    }
+
+    /// The trap this replaced: a day of dry running marked everyone as already
+    /// answered, so arming the bot did nothing for any of them.
+    #[test]
+    fn a_rehearsal_only_dedups_rehearsals() {
+        let s = mem();
+        s.log_action("c", "npub1a", "warn", true, 1000, "").unwrap();
+        assert_eq!(s.strongest_response("c", "npub1a", true).unwrap().as_deref(), Some("warn"));
+        assert_eq!(s.strongest_response("c", "npub1a", false).unwrap(), None, "arming starts clean");
+    }
+
+    /// Ordering by time let a later, lesser response reopen a member to
+    /// everything above it.
+    #[test]
+    fn the_strongest_response_wins_not_the_latest() {
+        let s = mem();
+        s.log_action("c", "npub1a", "kick", false, 1000, "").unwrap();
+        s.log_action("c", "npub1a", "warn", false, 2000, "").unwrap();
+        assert_eq!(s.strongest_response("c", "npub1a", false).unwrap().as_deref(), Some("kick"));
+    }
+
+    /// Raid rows share the actions table and must never be read as a ladder
+    /// response: an unarmed raid stamping 'kick' on every suspect would
+    /// immunise all of them against warn, delete and kick, permanently.
+    #[test]
+    fn a_raid_claim_is_not_a_ladder_response() {
+        let s = mem();
+        assert!(s.claim_cohort("c", "fingerprint1", 0).unwrap(), "the first claim wins");
+        assert!(!s.claim_cohort("c", "fingerprint1", 5000).unwrap(), "the same cohort is contained once");
+        assert!(s.claim_cohort("c", "fingerprint2", 0).unwrap(), "a different cohort is its own event");
+        assert_eq!(s.strongest_response("c", "fingerprint1", false).unwrap(), None);
     }
 }

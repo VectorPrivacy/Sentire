@@ -18,6 +18,7 @@ delete = false
 kick   = false
 ban    = false
 raid   = false
+vision = false                  # a model's opinion is inference; it gets its own switch
 
 [limits]
 max_actions_per_run  = 25

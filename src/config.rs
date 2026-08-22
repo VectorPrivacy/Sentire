@@ -23,12 +23,15 @@ pub enum Gravity {
 impl Gravity {
     /// Fallback when the operator never named a gravity for a rule: the
     /// engine severity, translated.
+    /// An UNRECOGNISED severity is the least punitive answer, not the worst
+    /// one. A renamed field or a missing value read as `""` and mapped to
+    /// Grave, which on the default ladder is an instant ban.
     pub fn from_severity(severity: &str) -> Gravity {
         match severity {
-            "notice" => Gravity::Note,
-            "minor" => Gravity::Minor,
+            "severe" => Gravity::Grave,
             "major" => Gravity::Serious,
-            _ => Gravity::Grave,
+            "minor" => Gravity::Minor,
+            _ => Gravity::Note,
         }
     }
 }
@@ -77,6 +80,10 @@ pub struct Arm {
     pub kick: bool,
     pub ban: bool,
     pub raid: bool,
+    /// A vision model's opinion is inference, and inference gets its own
+    /// switch. Riding the booleans an operator set for provable text rules
+    /// would let a classifier ban on evidence nobody can replay.
+    pub vision: bool,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -100,8 +107,9 @@ impl Default for Limits {
 pub struct Rules {
     pub window_hours: u64,
     pub window_messages: usize,
-    /// The built-in raid defaults keep running regardless; this exists so an
-    /// operator can see the knob rather than wonder.
+    /// Whether Sentinel acts on raid detection at all. The engine's built-in
+    /// cohort rules keep running either way — this decides whether containment
+    /// is consulted, so a config field that says `false` means it.
     pub raid_detection: bool,
     pub words: Vec<WordRule>,
     pub links: Vec<LinkRule>,
@@ -204,6 +212,27 @@ pub enum Response {
     Ban,
 }
 
+impl Response {
+    /// Severity order, as one number. Derived from the enum rather than a
+    /// hand-written string table: a table's catch-all was `0`, so a renamed or
+    /// added variant silently read as "nothing has happened yet".
+    pub fn rank(self) -> u8 {
+        self as u8 + 1
+    }
+
+    /// The rank of a stored response name. `None` maps to 0 — an unrecognised
+    /// row is not a prior action, which is the safe reading in both directions.
+    pub fn rank_of(name: &str) -> u8 {
+        match name {
+            "warn" => Response::Warn.rank(),
+            "delete_and_warn" => Response::DeleteAndWarn.rank(),
+            "kick" => Response::Kick.rank(),
+            "ban" => Response::Ban.rank(),
+            _ => 0,
+        }
+    }
+}
+
 impl Default for Ladder {
     fn default() -> Self {
         Ladder {
@@ -271,19 +300,22 @@ impl Default for VisionCfg {
 
 impl VisionCfg {
     /// Does this endpoint keep the bytes on this machine?
+    ///
+    /// Parsed properly, not split on punctuation: `http://127.0.0.1:8080@evil.com/v1`
+    /// has authority `127.0.0.1:8080@evil.com` and a HOST of `evil.com`. Reading
+    /// the leading text as the host would have judged that local and shipped
+    /// decrypted attachments off the machine with no warning printed.
     pub fn is_local(&self) -> bool {
-        let host = self
-            .base_url
-            .split("//")
-            .nth(1)
-            .unwrap_or(&self.base_url)
-            .split('/')
-            .next()
-            .unwrap_or_default()
-            .rsplit_once(':')
-            .map(|(h, _)| h)
-            .unwrap_or_else(|| self.base_url.split("//").nth(1).unwrap_or_default().split('/').next().unwrap_or_default());
-        matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
+        let after_scheme = self.base_url.split_once("//").map(|(_, r)| r).unwrap_or(&self.base_url);
+        let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or_default();
+        // Userinfo precedes the LAST '@'; the host is what follows it.
+        let hostport = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+        let host = if let Some(rest) = hostport.strip_prefix('[') {
+            rest.split_once(']').map(|(h, _)| h).unwrap_or(rest)
+        } else {
+            hostport.rsplit_once(':').map(|(h, _)| h).unwrap_or(hostport)
+        };
+        matches!(host.to_ascii_lowercase().as_str(), "127.0.0.1" | "localhost" | "::1")
     }
 }
 
@@ -362,6 +394,13 @@ impl Config {
         Ok(cfg)
     }
 
+    /// `validate` is private; this lets the binary's own tests drive the real
+    /// one rather than a copy of its rules.
+    #[cfg(test)]
+    pub fn validate_for_test(cfg: &Config) -> Result<(), String> {
+        cfg.validate()
+    }
+
     fn validate(&self) -> Result<(), String> {
         if !self.shields.respect_protected {
             return Err("shields.respect_protected = false: refusing to start. \
@@ -377,6 +416,13 @@ impl Config {
         }
         if self.ladder.steps.is_empty() {
             return Err("ladder.steps is empty: with no steps, no strike total ever answers to anything".into());
+        }
+        if self.ladder.steps[0].at == 0 {
+            return Err("ladder.steps starts at 0: that answers a total of zero, so every member is sentenced on sight".into());
+        }
+        let worths = [s.note, s.minor, s.serious, s.grave];
+        if worths.iter().any(|w| *w > 10_000) {
+            return Err("ladder.strikes over 10000: totals are summed, and absurd worths overflow rather than escalate".into());
         }
         for w in self.ladder.steps.windows(2) {
             if w[1].at <= w[0].at {
@@ -406,8 +452,13 @@ impl Config {
                 return Err("vision.enabled with no vision.labels: the model would be asked to judge nothing".into());
             }
             for l in &self.vision.labels {
-                if !(0.0..=1.0).contains(&l.threshold) {
-                    return Err(format!("vision label '{}' has threshold {} — must be 0.0..=1.0", l.name, l.threshold));
+                // Scores are clamped into 0.0..=1.0, so a 0.0 threshold is
+                // always met: that label would flag every image posted.
+                if !(l.threshold > 0.0 && l.threshold <= 1.0) {
+                    return Err(format!(
+                        "vision label '{}' has threshold {} — must be greater than 0.0 and at most 1.0",
+                        l.name, l.threshold
+                    ));
                 }
             }
             if !self.vision.is_local() && !self.vision.allow_remote {
@@ -431,6 +482,15 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// Is this community one Sentinel was told to watch? `["*"]` is every one.
+    ///
+    /// Scoping only the sweep meant an invite to a second community had
+    /// Sentinel enforcing its ladder there against whatever policies that
+    /// community happened to hold.
+    pub fn watches(&self, community_id: &str) -> bool {
+        self.bot.communities.iter().any(|w| w == "*" || w == community_id)
     }
 
     /// The gravity the operator assigned to a rule, if they named one.
@@ -473,6 +533,9 @@ mod tests {
             ("[raid]\nmax_batch = 0", "max_batch"),
             ("[raid]\nmax_batch = 900", "max_batch"),
             ("[raid]\ntripwire_accounts = 1", "tripwire_accounts"),
+            ("[[ladder.steps]]\nat = 0\nresponse = \"ban\"", "sentenced on sight"),
+            ("[ladder]\nstrikes = { note = 1, minor = 2, serious = 4, grave = 999999 }", "overflow"),
+            ("[vision]\nenabled = true\n[[vision.labels]]\nname = \"g\"\nthreshold = 0.0\ngravity = \"grave\"", "greater than 0.0"),
             ("[vision]\nenabled = true", "vision.labels"),
             ("[vision]\nenabled = true\nbase_url = \"https://api.example.com/v1\"\n[[vision.labels]]\nname = \"gore\"\nthreshold = 0.9\ngravity = \"grave\"", "allow_remote"),
             ("[vision]\nenabled = true\n[[vision.labels]]\nname = \"gore\"\nthreshold = 4.0\ngravity = \"grave\"", "threshold"),
@@ -493,6 +556,9 @@ mod tests {
         assert!(local("http://[::1]:8080/v1"));
         assert!(!local("https://api.openai.com/v1"));
         assert!(!local("http://192.168.1.50:8080/v1"), "a LAN box is still somebody else's machine");
+        assert!(!local("http://127.0.0.1:8080@evil.com/v1"), "userinfo must not pass for a host");
+        assert!(!local("http://127.0.0.1.evil.com/v1"), "a prefix is not the host");
+        assert!(local("http://LOCALHOST:8080/v1"), "case is not identity");
     }
 
     #[test]
@@ -500,6 +566,8 @@ mod tests {
         assert_eq!(Gravity::from_severity("notice"), Gravity::Note);
         assert_eq!(Gravity::from_severity("major"), Gravity::Serious);
         assert_eq!(Gravity::from_severity("severe"), Gravity::Grave);
+        assert_eq!(Gravity::from_severity(""), Gravity::Note, "an unknown severity must be the LEAST punitive");
+        assert_eq!(Gravity::from_severity("catastrophic"), Gravity::Note);
         let cfg = Config::default();
         assert_eq!(cfg.gravity_of("nonexistent"), None, "unnamed rules defer to severity");
     }

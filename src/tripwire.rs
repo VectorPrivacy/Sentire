@@ -12,7 +12,7 @@
 //! those separate is what stops a second, sloppier detector growing here beside
 //! the real one.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// One live arrival: who, and when.
 #[derive(Debug, Clone, Copy)]
@@ -31,6 +31,9 @@ pub struct Tripwire {
     /// and a sustained raid would otherwise ask for one per message.
     cooldown_ms: u64,
     pings: VecDeque<Ping>,
+    /// Distinct actors currently in the window, counted incrementally. Rebuilding
+    /// this per message was O(n log n) — worst exactly when a wave arrives.
+    live: HashMap<u64, usize>,
     last_trip_ms: u64,
     /// Members the engine has already vouched for, refreshed by every sweep.
     /// A raid is STRANGERS: ten regulars talking is the least raid-shaped thing
@@ -56,6 +59,7 @@ impl Tripwire {
             window_ms: window_secs.max(1) * 1000,
             cooldown_ms: cooldown_secs * 1000,
             pings: VecDeque::new(),
+            live: HashMap::new(),
             last_trip_ms: 0,
             known: HashSet::new(),
         }
@@ -72,20 +76,24 @@ impl Tripwire {
     /// A trusted member is not recorded at all: they cost nothing to ignore and
     /// they are the opposite of the signal being watched for.
     pub fn observe(&mut self, npub: &str, at_ms: u64) -> bool {
-        if self.known.contains(&identity(npub)) {
+        let who = identity(npub);
+        if self.known.contains(&who) {
             return false;
         }
         let cutoff = at_ms.saturating_sub(self.window_ms);
         while self.pings.front().is_some_and(|p| p.at_ms < cutoff) {
-            self.pings.pop_front();
+            let gone = self.pings.pop_front().expect("front was just checked");
+            if let Some(n) = self.live.get_mut(&gone.who) {
+                *n -= 1;
+                if *n == 0 {
+                    self.live.remove(&gone.who);
+                }
+            }
         }
-        let who = identity(npub);
         self.pings.push_back(Ping { who, at_ms });
+        *self.live.entry(who).or_insert(0) += 1;
 
-        let mut seen: Vec<u64> = self.pings.iter().map(|p| p.who).collect();
-        seen.sort_unstable();
-        seen.dedup();
-        if seen.len() < self.threshold {
+        if self.live.len() < self.threshold {
             return false;
         }
         // A sustained wave must not ask for one full evaluation per message.
@@ -174,6 +182,19 @@ mod tests {
             assert!(!t.observe("npub1regular0", i * 500 + 100));
         }
         assert!(t.observe("npub1raider4", 4000), "five strangers is still five strangers");
+    }
+
+    /// The distinct count is maintained incrementally, so it has to agree with
+    /// a recount after arbitrary churn.
+    #[test]
+    fn the_incremental_count_matches_a_recount() {
+        let mut t = Tripwire::new(1000, 10, 0);
+        for i in 0..500u64 {
+            t.observe(&format!("npub1a{}", i % 7), i * 100);
+        }
+        let recount: std::collections::HashSet<u64> = t.pings.iter().map(|p| p.who).collect();
+        assert_eq!(t.live.len(), recount.len(), "incremental count drifted from the truth");
+        assert!(t.live.values().all(|n| *n > 0), "a zeroed actor must be removed, not kept at zero");
     }
 
     #[test]

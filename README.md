@@ -12,10 +12,12 @@ what any of that is worth.
 
 ## Status
 
-Early. The text lane works end to end: rules compile from config, convictions become
-strikes, strikes decay, and the ladder decides a response. **Nothing is armed by default**,
-so it rehearses and prints instead of acting. The media lane and raid containment are not
-written yet.
+Early, but complete: live content screening, a periodic sweep, raid containment, and an
+optional media lane, all feeding one strike ladder. **Nothing is armed by default**, so it
+rehearses and prints instead of acting.
+
+Not yet run against a real raid. Every safety property below is unit-tested and none is
+field-tested.
 
 ## Running
 
@@ -74,8 +76,13 @@ a member escalates once, not twice.
 4. The running total meets the **ladder** and a response comes out: warn, delete and warn,
    kick, ban.
 
-Only *proven* convictions earn strikes. Inference is reported and never sentenced — with one
-deliberate exception.
+Only *proven* convictions earn strikes, on either clock. Inference is reported and never
+sentenced — except where an operator arms it explicitly (`[arm] raid`, `[arm] vision`), which
+is a decision made in writing rather than inherited from a switch meant for something else.
+
+Every sentence, from every lane, goes through one function that owns standing, ceilings and
+dedup in that order. A guard that lives in one of three callers is a guard two paths do not
+have.
 
 ## Raids skip the ladder
 
@@ -119,6 +126,9 @@ Inside a community, from any client that renders slash commands:
 - `/status` — what it is watching, and how much history it can actually see
 - `/why <member>` — their strike record, decayed, and the next step
 - `/pardon <member>` — clear it. Moderators only; the community's own roles decide.
+
+A pardon clears the action history as well as the strikes: leaving the history behind meant a
+forgiven member stayed immune to every response below the one they had already received.
 
 ## Proven vs unproven
 

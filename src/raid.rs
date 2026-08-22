@@ -11,7 +11,7 @@
 //! overriding that deliberately, for this case, in writing. It is false by
 //! default and the code below refuses to move without it.
 
-use vector_sdk::policy::Verdicts;
+use vector_sdk::policy::{Verdict, Verdicts};
 
 use crate::config::{Config, RaidResponse};
 
@@ -34,12 +34,26 @@ pub enum Containment {
 /// reason to reach for a mass action and the worst possible time to catch a
 /// regular in one.
 pub fn select(verdicts: &Verdicts, cfg: &Config, me: &str) -> Containment {
-    if !verdicts.raid_detected() {
+    select_from(verdicts.all(), verdicts.raid_detected(), cfg, me)
+}
+
+/// The rule itself, over anything verdict-shaped. Split out because `Verdicts`
+/// has no public constructor, and the alternative was tests exercising a
+/// hand-copied twin of this function — which would keep passing if the real one
+/// were deleted.
+pub fn select_from<'a>(
+    members: impl Iterator<Item = &'a Verdict>,
+    raid_detected: bool,
+    cfg: &Config,
+    me: &str,
+) -> Containment {
+    if !raid_detected {
         return Containment::Quiet;
     }
-    let roster = verdicts.all().count();
-    let suspects: Vec<String> = verdicts
-        .all()
+    let all: Vec<&Verdict> = members.collect();
+    let roster = all.len();
+    let suspects: Vec<String> = all
+        .iter()
         .filter(|v| v.npub != me)
         .filter(|v| !v.is_shielded())
         .filter(|v| v.confidence >= cfg.raid.min_confidence)
@@ -67,74 +81,60 @@ pub const BAN_CHUNK: usize = 100;
 mod tests {
     use super::*;
 
-    /// `Verdicts` has no public constructor — it is what the engine returns —
-    /// so the selection rules are tested through the same predicates the real
-    /// type exposes, against hand-built rows.
-    struct Row {
-        npub: String,
-        confidence: u32,
-        shield: String,
-    }
-
-    fn select_like(rows: &[Row], raid: bool, cfg: &Config, me: &str) -> Containment {
-        if !raid {
-            return Containment::Quiet;
-        }
-        let roster = rows.len();
-        let suspects: Vec<String> = rows
-            .iter()
-            .filter(|v| v.npub != me)
-            .filter(|v| v.shield == "none" || v.shield == "indeterminate")
-            .filter(|v| v.confidence >= cfg.raid.min_confidence)
-            .map(|v| v.npub.clone())
-            .collect();
-        if suspects.is_empty() {
-            return Containment::Quiet;
-        }
-        if roster > 0 && suspects.len() * 100 > cfg.limits.halt_if_over_pct as usize * roster {
-            return Containment::Halt { suspects: suspects.len(), roster };
-        }
-        if cfg.arm.raid {
-            Containment::Contain { suspects, response: cfg.raid.response }
-        } else {
-            Containment::WouldContain { suspects, response: cfg.raid.response }
+    fn verdict(npub: &str, confidence: u32, shield: &str) -> Verdict {
+        Verdict {
+            npub: npub.into(),
+            name: npub.into(),
+            confidence,
+            proven: 0,
+            band: "alert".into(),
+            shield: shield.into(),
+            reasons: vec![],
+            findings: vec![],
+            messages: 0,
+            tenure_secs: 0,
         }
     }
 
-    fn rows(n: usize, confidence: u32, shield: &str) -> Vec<Row> {
-        (0..n)
-            .map(|i| Row { npub: format!("npub1raider{i:03}"), confidence, shield: shield.into() })
-            .collect()
+    fn crowd(n: usize, confidence: u32, shield: &str) -> Vec<Verdict> {
+        (0..n).map(|i| verdict(&format!("npub1raider{i:03}"), confidence, shield)).collect()
+    }
+
+    fn pick(rows: &[Verdict], raid: bool, cfg: &Config, me: &str) -> Containment {
+        select_from(rows.iter(), raid, cfg, me)
+    }
+
+    fn permissive() -> Config {
+        let mut cfg = Config::default();
+        cfg.limits.halt_if_over_pct = 100;
+        cfg
     }
 
     #[test]
     fn no_cohort_is_no_raid_however_busy_the_room() {
-        let cfg = Config::default();
-        assert_eq!(select_like(&rows(50, 99, "none"), false, &cfg, "me"), Containment::Quiet);
+        assert_eq!(pick(&crowd(50, 99, "none"), false, &Config::default(), "me"), Containment::Quiet);
     }
 
     #[test]
     fn containment_is_rehearsed_until_it_is_armed() {
-        let mut cfg = Config::default();
-        cfg.limits.halt_if_over_pct = 100;
-        match select_like(&rows(10, 90, "none"), true, &cfg, "me") {
+        let mut cfg = permissive();
+        match pick(&crowd(10, 90, "none"), true, &cfg, "me") {
             Containment::WouldContain { suspects, .. } => assert_eq!(suspects.len(), 10),
             other => panic!("an unarmed Sentinel must only rehearse, got {other:?}"),
         }
         cfg.arm.raid = true;
-        assert!(matches!(select_like(&rows(10, 90, "none"), true, &cfg, "me"), Containment::Contain { .. }));
+        assert!(matches!(pick(&crowd(10, 90, "none"), true, &cfg, "me"), Containment::Contain { .. }));
     }
 
     /// The worst possible moment to catch a regular in a mass action.
     #[test]
     fn standing_survives_a_raid() {
-        let mut cfg = Config::default();
+        let mut cfg = permissive();
         cfg.arm.raid = true;
-        cfg.limits.halt_if_over_pct = 100;
-        let mut all = rows(5, 95, "none");
-        all.extend(rows(3, 95, "trusted"));
-        all.extend(rows(1, 95, "protected"));
-        match select_like(&all, true, &cfg, "me") {
+        let mut all = crowd(5, 95, "none");
+        all.extend(crowd(3, 95, "trusted"));
+        all.extend(crowd(1, 95, "protected"));
+        match pick(&all, true, &cfg, "me") {
             Containment::Contain { suspects, .. } => assert_eq!(suspects.len(), 5, "only the unshielded"),
             other => panic!("{other:?}"),
         }
@@ -144,31 +144,41 @@ mod tests {
     fn a_pass_that_would_empty_the_community_stops_and_asks() {
         let mut cfg = Config::default();
         cfg.arm.raid = true; // even armed
-        // 50 of 50 members over the bar, against a 10% ceiling.
         assert_eq!(
-            select_like(&rows(50, 99, "none"), true, &cfg, "me"),
+            pick(&crowd(50, 99, "none"), true, &cfg, "me"),
             Containment::Halt { suspects: 50, roster: 50 }
         );
     }
 
     #[test]
     fn a_quiet_cohort_below_the_bar_convicts_nobody() {
-        let mut cfg = Config::default();
+        let mut cfg = permissive();
         cfg.arm.raid = true;
-        // Detected, but every suspect sits under min_confidence.
-        assert_eq!(select_like(&rows(10, 40, "none"), true, &cfg, "me"), Containment::Quiet);
+        assert_eq!(pick(&crowd(10, 40, "none"), true, &cfg, "me"), Containment::Quiet);
     }
 
     #[test]
     fn sentinel_never_contains_itself() {
-        let mut cfg = Config::default();
+        let mut cfg = permissive();
         cfg.arm.raid = true;
-        cfg.limits.halt_if_over_pct = 100;
-        let mut all = rows(2, 95, "none");
-        all.push(Row { npub: "npub1sentinel".into(), confidence: 99, shield: "none".into() });
-        match select_like(&all, true, &cfg, "npub1sentinel") {
+        let mut all = crowd(2, 95, "none");
+        all.push(verdict("npub1sentinel", 99, "none"));
+        match pick(&all, true, &cfg, "npub1sentinel") {
             Containment::Contain { suspects, .. } => assert!(!suspects.iter().any(|s| s == "npub1sentinel")),
             other => panic!("{other:?}"),
+        }
+    }
+
+    /// `is_shielded()` is the SDK's own predicate, and `indeterminate` is
+    /// explicitly NOT standing — tenure could not be established, and such a
+    /// member is judged exactly as if unshielded.
+    #[test]
+    fn indeterminate_is_not_standing() {
+        let mut cfg = permissive();
+        cfg.arm.raid = true;
+        match pick(&crowd(4, 95, "indeterminate"), true, &cfg, "me") {
+            Containment::Contain { suspects, .. } => assert_eq!(suspects.len(), 4),
+            other => panic!("unknown tenure must not shield anyone, got {other:?}"),
         }
     }
 }

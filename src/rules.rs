@@ -67,7 +67,13 @@ pub async fn install(community: &Community, cfg: &Config) -> Result<&'static str
             community.policies().set(POLICY_ID, policy).await.map_err(|e| e.to_string())?;
             Ok("installed")
         }
-        None => Ok("no custom rules — built-in raid defaults only"),
+        None => {
+            // The config is the source of truth, so removing every rule has to
+            // remove the policy. Writing nothing left the last one installed
+            // and still convicting.
+            let _ = community.policies().delete(POLICY_ID).await;
+            Ok("no custom rules — built-in raid defaults only")
+        }
     }
 }
 

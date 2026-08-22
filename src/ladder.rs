@@ -23,7 +23,9 @@ pub fn total(strikes: &[Strike], now_ms: u64, half_life_hours: u64) -> u32 {
             let halvings = if half_life_ms == 0 { 0 } else { age / half_life_ms };
             if halvings >= 32 { 0 } else { s.worth >> halvings }
         })
-        .sum()
+        // Saturating: a total that wrapped would read as almost clean, which is
+        // silent UNDER-enforcement and the worse direction to fail in.
+        .fold(0u32, u32::saturating_add)
 }
 
 /// The highest step this total has reached, if any. Below the first step,
