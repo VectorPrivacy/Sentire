@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use vector_sdk::policy::Verdict;
+use vector_sdk::policy::{Verdict, Verdicts};
 use vector_sdk::{Community, VectorBot};
 
 /// The report is memoised for 90s inside vector-core, so anything faster than
@@ -53,16 +53,58 @@ async fn sweep(community: &Community) -> vector_sdk::Result<()> {
     // Proven and unproven are the axis, not a confidence level: a raid cohort
     // reads high confidence and zero proven. Both are printed, and the
     // distinction is what a later build will act on differently.
+    let mut found = 0;
     for v in verdicts.proven() {
         report(id, "PROVEN  ", v);
+        found += 1;
     }
     for v in verdicts.unproven() {
         report(id, "INFERRED", v);
+        found += 1;
     }
     if verdicts.raid_detected() {
         println!("[{id}] RAID SUSPECTED");
     }
+    heartbeat(id, &verdicts, found);
     Ok(())
+}
+
+/// What the sweep looked at, whether or not it found anything.
+///
+/// A quiet community and a broken bot print the same thing — nothing — and that
+/// is exactly how a moderation tool stays broken for months. Every pass says
+/// what it read and how many people it weighed, so silence becomes a result
+/// rather than an absence of one.
+fn heartbeat(community: &str, verdicts: &Verdicts, found: usize) {
+    let cov = verdicts.coverage();
+    let mut shields = (0, 0, 0);
+    for v in verdicts.all() {
+        match v.shield.as_str() {
+            "protected" => shields.0 += 1,
+            "trusted" => shields.1 += 1,
+            _ => shields.2 += 1,
+        }
+    }
+    let history = if cov.is_empty() {
+        // Not a clean community. An unread one.
+        "NO HISTORY — nothing was judged".to_string()
+    } else {
+        format!(
+            "{} msgs over {}h across {} channel(s){}{}",
+            cov.corpus,
+            cov.span_hours(),
+            cov.channels,
+            if cov.is_saturated() { ", WINDOW FULL (older history unread)" } else { "" },
+            if cov.complete { "" } else { ", partial" },
+        )
+    };
+    println!(
+        "[{community}] swept {} member(s) — {} protected, {} trusted, {} plain — {found} convicted — {history}",
+        verdicts.all().count(),
+        shields.0,
+        shields.1,
+        shields.2,
+    );
 }
 
 fn report(community: &str, kind: &str, v: &Verdict) {
