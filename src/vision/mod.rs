@@ -98,4 +98,21 @@ mod tests {
     fn an_unreachable_model_is_never_an_all_clear() {
         assert_ne!(Verdict::Unknown("timeout".into()), Verdict::Clean);
     }
+
+    /// A model that answers something OTHER than what it was asked has not
+    /// cleared anything. `{}` parsed, filtered to nothing, and read as clean —
+    /// then cached by content hash forever. A vision model is steerable by text
+    /// drawn inside the image it is looking at, so that is a one-shot bypass.
+    #[test]
+    fn an_answer_that_skips_the_question_is_not_a_clean_one() {
+        let asked = labels();
+        let complete = |seen: &[Label]| asked.iter().all(|a| seen.iter().any(|l| l.name == a.name));
+        assert!(!complete(&[]), "an empty answer covers nothing");
+        assert!(!complete(&[Label { name: "cats".into(), score: 0.9 }]), "nor does an off-topic one");
+        assert!(!complete(&[Label { name: "gore".into(), score: 0.0 }]), "nor a partial one");
+        assert!(complete(&[
+            Label { name: "gore".into(), score: 0.0 },
+            Label { name: "spam_graphic".into(), score: 0.0 },
+        ]));
+    }
 }

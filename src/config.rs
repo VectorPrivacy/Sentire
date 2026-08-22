@@ -573,6 +573,19 @@ impl Config {
 mod tests {
     use super::*;
 
+    /// `rank_of` reads a hand-maintained table; a variant missing from it ranks
+    /// 0, which means "nothing has happened yet" and re-sentences everyone.
+    #[test]
+    fn every_response_is_in_the_table_that_ranks_them() {
+        assert_eq!(Response::ALL.len(), 4);
+        for r in Response::ALL {
+            assert_eq!(Response::rank_of(r.name()), r.rank(), "{r:?} is missing from ALL");
+        }
+        let mut ranks: Vec<u8> = Response::ALL.iter().map(|r| r.rank()).collect();
+        ranks.dedup();
+        assert_eq!(ranks.len(), 4, "two responses share a rank");
+    }
+
     #[test]
     fn the_defaults_validate_and_are_dry() {
         let cfg = Config::default();

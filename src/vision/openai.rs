@@ -78,10 +78,20 @@ impl Vision for OpenAiVision {
             Err(e) => return Verdict::Unknown(format!("unreadable response: {e}")),
         };
         let text = value["choices"][0]["message"]["content"].as_str().unwrap_or_default();
-        match parse_labels(text) {
-            Some(labels) if labels.is_empty() => Verdict::Clean,
-            Some(labels) => Verdict::Flagged(labels),
-            None => Verdict::Unknown(format!("unparseable answer: {}", text.chars().take(120).collect::<String>())),
+        let Some(labels) = parse_labels(text) else {
+            return Verdict::Unknown(format!("unparseable answer: {}", text.chars().take(120).collect::<String>()));
+        };
+        // Every label asked for, or the answer is not an answer. `{}` satisfied
+        // "all keys parsed as numbers" and read as a full all-clear — cached by
+        // content hash forever, and a vision model is steerable by text drawn
+        // inside the image it is looking at.
+        if !self.cfg.labels.iter().all(|asked| labels.iter().any(|l| l.name == asked.name)) {
+            return Verdict::Unknown("the model did not answer every label asked".into());
+        }
+        if labels.iter().all(|l| l.score <= 0.0) {
+            Verdict::Clean
+        } else {
+            Verdict::Flagged(labels)
         }
     }
 }

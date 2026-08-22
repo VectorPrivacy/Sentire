@@ -65,6 +65,12 @@ impl Tripwire {
         }
     }
 
+    /// Give back a trip that led to no evaluation, so the cooldown is not spent
+    /// on a sweep that declined to run.
+    pub fn forget_last_trip(&mut self) {
+        self.last_trip_ms = 0;
+    }
+
     /// Replace the vouched-for set. Called after each evaluation, so the
     /// tripwire's idea of "regular" is the engine's, never its own guess.
     pub fn trust(&mut self, npubs: impl IntoIterator<Item = impl AsRef<str>>) {

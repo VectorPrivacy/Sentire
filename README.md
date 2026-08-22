@@ -75,8 +75,10 @@ a member escalates once, not twice.
    an offense from an echo of one.
 3. Strikes **decay by halves**. Two serious offenses in a week reach a kick; the same pair a
    week apart do not.
-4. The running total meets the **ladder** and a response comes out: warn, delete and warn,
-   kick, ban.
+4. The running total meets the **ladder**, and Sentinel answers with the next rung up from
+   whatever that member last received: warn, delete and warn, kick, ban. It climbs rather
+   than jumping, so every step is actually delivered — a member who accrued enough for a ban
+   while Sentinel was rehearsing still gets warned first.
 
 Only *proven* convictions earn strikes, on either clock. Inference is reported and never
 sentenced — except where an operator arms it explicitly (`[arm] raid`, `[arm] vision`), which

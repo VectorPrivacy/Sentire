@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS actions (
     at_ms     INTEGER NOT NULL,
     evidence  TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS notes (key TEXT PRIMARY KEY, note TEXT NOT NULL);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_actions_claim ON actions(community, subject, response) WHERE response = 'raid:claim';
 CREATE INDEX IF NOT EXISTS idx_actions_subject ON actions(community, subject, at_ms);
 CREATE INDEX IF NOT EXISTS idx_actions_at ON actions(dry, at_ms);
@@ -67,10 +68,22 @@ impl Store {
         if stored > SCHEMA_VERSION {
             return Err(format!("{path} was written by a newer Sentinel (schema {stored} > {SCHEMA_VERSION})"));
         }
-        if stored < 3 {
-            // Pre-3 databases have no tombstone column; adding it is enough,
-            // since anything pardoned under 2 was deleted outright.
-            let _ = conn.execute("ALTER TABLE strikes ADD COLUMN pardoned INTEGER NOT NULL DEFAULT 0", []);
+        // Asked of the schema, not inferred from a failed statement. The ALTER
+        // MUST fail on a fresh database, so swallowing its error also swallowed
+        // a busy lock or a full disk — and the version was written anyway, so
+        // the column stayed missing and every strikes() read errored forever.
+        let has_pardoned = {
+            let mut stmt = conn.prepare("PRAGMA table_info(strikes)").map_err(|e| e.to_string())?;
+            let cols = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .map_err(|e| e.to_string())?
+                .flatten()
+                .any(|c| c == "pardoned");
+            cols
+        };
+        if !has_pardoned {
+            conn.execute("ALTER TABLE strikes ADD COLUMN pardoned INTEGER NOT NULL DEFAULT 0", [])
+                .map_err(|e| format!("{path}: schema 3 migration failed: {e}"))?;
         }
         if stored < 2 {
             // Version 1 wrote bare "kick"/"ban" rows for UNARMED raid
@@ -155,7 +168,7 @@ impl Store {
         self.lock()
             .query_row(
                 "SELECT COUNT(*) FROM actions WHERE community = ?1 AND dry = ?3 AND at_ms >= ?2 \
-                 AND response NOT LIKE 'raid:%'",
+                 AND response NOT LIKE 'raid:%' AND response NOT LIKE 'failed:%'",
                 rusqlite::params![community, since, dry as i64],
                 |r| r.get::<_, i64>(0).map(|n| n as usize),
             )
@@ -206,15 +219,83 @@ impl Store {
         Ok(best)
     }
 
-    /// Members contained here in the last hour. Containment's own bound, since
-    /// `actions_last_hour` deliberately excludes `raid:%` rows.
-    pub fn raid_actions_last_hour(&self, community: &str, now_ms: u64) -> Result<usize, String> {
+    /// What this member's live strikes were for, worst-first-ish, capped. The
+    /// carried warning has no engine finding to quote, so without this it
+    /// reached the member as "a rule matched: carrying strikes".
+    pub fn evidence(&self, community: &str, subject: &str) -> Result<Vec<String>, String> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT evidence FROM strikes WHERE community = ?1 AND subject = ?2 \
+                 AND pardoned = 0 AND evidence != '' ORDER BY at_ms DESC LIMIT 3",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![community, subject], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        Ok(rows.flatten().collect())
+    }
+
+    /// Note the rulebook this community is being judged under, and forgive its
+    /// open window when it changes.
+    ///
+    /// The engine mints its window-rung conviction ids over the policy hash, so
+    /// an operator adding one pattern re-reports every conviction in the
+    /// evidence window under ids nothing has seen. Left alone those land again
+    /// at full worth stamped `now` — roughly doubling every total, half of it
+    /// with the decay clock reset — and step around every pardon tombstone.
+    /// Returns true when the rulebook changed.
+    pub fn note_policy(&self, community: &str, hash: &str) -> Result<bool, String> {
+        let mut guard = self.lock();
+        let conn = guard.transaction().map_err(|e| e.to_string())?;
+        let key = format!("policy:{community}");
+        let seen: Option<String> = {
+            use rusqlite::OptionalExtension;
+            conn.query_row("SELECT note FROM notes WHERE key = ?1", [&key], |r| r.get(0))
+                .optional()
+                .map_err(|e| e.to_string())?
+        };
+        let changed = seen.as_deref().is_some_and(|s| s != hash);
+        if changed {
+            conn.execute(
+                "UPDATE strikes SET pardoned = 1 WHERE community = ?1 AND pardoned = 0",
+                rusqlite::params![community],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        conn.execute("INSERT OR REPLACE INTO notes (key, note) VALUES (?1, ?2)", rusqlite::params![key, hash])
+            .map_err(|e| e.to_string())?;
+        conn.commit().map_err(|e| e.to_string())?;
+        Ok(changed)
+    }
+
+    /// How many times this exact sentence has failed against this member
+    /// recently. Read by `enforce` to back off: a target that can never be
+    /// actioned — gone, outranking us, no inbox relay — would otherwise be
+    /// retried on every pass forever.
+    pub fn failures(&self, community: &str, subject: &str, name: &str, since_ms: u64) -> Result<usize, String> {
+        self.lock()
+            .query_row(
+                "SELECT COUNT(*) FROM actions WHERE community = ?1 AND subject = ?2 \
+                 AND response = ?3 AND at_ms >= ?4",
+                rusqlite::params![community, subject, format!("failed:{name}"), since_ms as i64],
+                |r| r.get::<_, i64>(0).map(|n| n as usize),
+            )
+            .map_err(|e| e.to_string())
+    }
+
+    /// Members contained here in the last hour, at this armed-ness.
+    /// Containment's own bound, since `actions_last_hour` deliberately excludes
+    /// `raid:%` rows. Scoped by `dry` for the same reason the ladder's count is:
+    /// a rehearsal that never meets a ceiling shows the operator a run that
+    /// looks nothing like the armed one.
+    pub fn raid_actions_last_hour(&self, community: &str, dry: bool, now_ms: u64) -> Result<usize, String> {
         let since = now_ms.saturating_sub(3_600_000) as i64;
         self.lock()
             .query_row(
-                "SELECT COUNT(*) FROM actions WHERE community = ?1 AND dry = 0 AND at_ms >= ?2 \
+                "SELECT COUNT(*) FROM actions WHERE community = ?1 AND dry = ?3 AND at_ms >= ?2 \
                  AND response LIKE 'raid:%' AND response != 'raid:claim'",
-                rusqlite::params![community, since],
+                rusqlite::params![community, since, dry as i64],
                 |r| r.get::<_, i64>(0).map(|n| n as usize),
             )
             .map_err(|e| e.to_string())
@@ -281,7 +362,10 @@ impl Store {
     pub fn subjects_with_strikes(&self, community: &str, since_ms: u64) -> Result<Vec<String>, String> {
         let conn = self.lock();
         let mut stmt = conn
-            .prepare("SELECT DISTINCT subject FROM strikes WHERE community = ?1 AND at_ms >= ?2")
+            .prepare(
+                "SELECT subject FROM strikes WHERE community = ?1 AND at_ms >= ?2 AND pardoned = 0 \
+                 GROUP BY subject ORDER BY MIN(at_ms)",
+            )
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map(rusqlite::params![community, since_ms as i64], |r| r.get::<_, String>(0))
@@ -320,7 +404,10 @@ impl Store {
     /// pardoned member stayed immune to every response up to whatever they had
     /// already received — forgiven on paper, unreachable in practice.
     pub fn pardon(&self, community: &str, subject: &str) -> Result<usize, String> {
-        let conn = self.lock();
+        let mut guard = self.lock();
+        // One unit: a half-applied pardon forgives on paper and leaves the
+        // member immune to everything below what they already received.
+        let conn = guard.transaction().map_err(|e| e.to_string())?;
         // TOMBSTONED, not deleted. A conviction id is stable for as long as its
         // evidence sits in the engine's window, so deleting the row let the very
         // next sweep re-insert it — stamped at `now`, which made the strikes
@@ -343,6 +430,7 @@ impl Store {
             rusqlite::params![community, format!("live:{subject}"), format!("dry:{subject}")],
         )
         .map_err(|e| e.to_string())?;
+        conn.commit().map_err(|e| e.to_string())?;
         Ok(n)
     }
 }
@@ -424,9 +512,15 @@ mod tests {
         assert_eq!(s.actions_last_hour("c", false, 2000).unwrap(), 1, "another community's wave does not starve this one");
         s.log_action("c", "npub1c", "raid:kick", false, 1000, "").unwrap();
         assert_eq!(s.actions_last_hour("c", false, 2000).unwrap(), 1, "raid rows answer to their own bound");
-        assert_eq!(s.raid_actions_last_hour("c", 2000).unwrap(), 1, "and that bound counts them");
+        assert_eq!(s.raid_actions_last_hour("c", false, 2000).unwrap(), 1, "and that bound counts them");
+        // A failure is not an action taken. Counting it let four undeliverable
+        // warnings spend the whole community's hourly budget.
+        s.log_action("c", "npub1e", "failed:warn", false, 1000, "").unwrap();
+        assert_eq!(s.actions_last_hour("c", false, 2000).unwrap(), 1, "a failure spends no budget");
+        assert_eq!(s.failures("c", "npub1e", "warn", 0).unwrap(), 1, "but it is counted for backoff");
+        assert_eq!(s.failures("c", "npub1e", "kick", 0).unwrap(), 0, "per response");
         s.claim_cohort("c", "live:npub1d", 1000, 10_000).unwrap();
-        assert_eq!(s.raid_actions_last_hour("c", 2000).unwrap(), 1, "a claim is not a containment");
+        assert_eq!(s.raid_actions_last_hour("c", false, 2000).unwrap(), 1, "a claim is not a containment");
     }
 
     /// The trap this replaced: a day of dry running marked everyone as already
@@ -464,6 +558,21 @@ mod tests {
         let mut who = s.subjects_with_strikes("c", 5_000).unwrap();
         who.sort();
         assert_eq!(who, vec!["npub1a"], "distinct, in this community, inside the horizon");
+    }
+
+    /// Editing the rulebook re-keys every conviction the engine reports, so
+    /// leaving the old strikes standing doubled every total AND stepped around
+    /// every pardon.
+    #[test]
+    fn a_rulebook_change_forgives_the_window_rather_than_doubling_it() {
+        let s = mem();
+        s.record("c", "npub1a", "x", 4, 0, "").unwrap();
+        assert!(!s.note_policy("c", "hash1").unwrap(), "the first sight of a rulebook changes nothing");
+        assert_eq!(s.strikes("c", "npub1a").unwrap().len(), 1);
+        assert!(!s.note_policy("c", "hash1").unwrap(), "and neither does seeing it again");
+
+        assert!(s.note_policy("c", "hash2").unwrap(), "a different rulebook is a change");
+        assert!(s.strikes("c", "npub1a").unwrap().is_empty(), "its window is forgiven, not re-charged");
     }
 
     #[test]

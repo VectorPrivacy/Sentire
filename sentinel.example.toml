@@ -149,8 +149,8 @@ respect_protected = true        # the owner and moderators are never Sentinel's 
 # Overrides fold FIELD by field, so naming one thing leaves the rest of your
 # settings alone:
 #
-# [community."fe4abeb3…".limits]
+# [community."fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea".limits]
 # halt_if_over_pct = 20         # your other limits are untouched
 #
-# [community."fe4abeb3…".ladder]
+# [community."fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea".ladder]
 # decay_half_life_hours = 72    # your steps and strike worths are untouched

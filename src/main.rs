@@ -198,7 +198,7 @@ async fn main() -> vector_sdk::Result<()> {
     let mut installed_at_boot: std::collections::HashSet<String> = std::collections::HashSet::new();
     for c in &communities {
         let powers = powers_of(c).await;
-        match rules::install(c, &cfg).await {
+        match rules::install(c, &cfg, &store).await {
             Ok(what) => {
                 installed_at_boot.insert(c.id().to_string());
                 println!("watching {} — {what} — {}", short(c.id()), powers.describe());
@@ -239,7 +239,7 @@ async fn main() -> vector_sdk::Result<()> {
                     // no rulebook forever, printing a healthy heartbeat.
                     if !installed.contains(c.id()) {
                         let powers = powers_of(&c).await;
-                        match rules::install(&c, &cfg).await {
+                        match rules::install(&c, &cfg, &store).await {
                             Ok(what) => {
                                 installed.insert(c.id().to_string());
                                 println!("watching {} — {what} — {}", short(c.id()), powers.describe());
@@ -255,15 +255,23 @@ async fn main() -> vector_sdk::Result<()> {
                 // keeps the LONGEST memory any of them asked for. Pruning on the
                 // default forgave a long-memory community early and deleted the
                 // record of what had already been done there.
-                let widest = cfg
-                    .community
-                    .values()
-                    .filter_map(|o| o.ladder.as_ref().and_then(|l| l.decay_half_life_hours))
-                    .chain(std::iter::once(cfg.ladder.decay_half_life_hours))
+                // A tombstone only works while it outlives the EVIDENCE window,
+                // and a claim only while it outlives its TTL. Pruning on the
+                // half-life alone deleted a pardon 32 hours after it was given,
+                // and the engine promptly re-reported the conviction.
+                let ids: Vec<String> = cfg.community.keys().cloned().chain(std::iter::once(String::new())).collect();
+                let keep_ms = ids
+                    .iter()
+                    .map(|id| {
+                        let p = cfg.for_community(id);
+                        let decay = p.ladder.decay_half_life_hours.saturating_mul(3_600_000).saturating_mul(32);
+                        let window = p.rules.window_hours.saturating_mul(3_600_000);
+                        let claims = p.raid.claim_ttl_secs.saturating_mul(1000);
+                        decay.max(window).max(claims)
+                    })
                     .max()
-                    .unwrap_or(cfg.ladder.decay_half_life_hours);
-                let horizon =
-                    now_ms().saturating_sub(widest.saturating_mul(3_600_000).saturating_mul(32));
+                    .unwrap_or(0);
+                let horizon = now_ms().saturating_sub(keep_ms);
                 if let Err(e) = store.prune(horizon) {
                     eprintln!("prune: {e}");
                 }
@@ -354,6 +362,13 @@ async fn trip(
     if !tripped {
         return;
     }
+    if sweep_in_flight(wires, community.id()) {
+        // The evaluation this would ask for is already happening. Give the
+        // trip back rather than consuming the cooldown on a sweep that returns
+        // immediately and re-evaluates nothing.
+        untrip(wires, community.id());
+        return;
+    }
     let r = cfg.for_community(&cid).raid;
     println!(
         "[{}] TRIPWIRE — {} distinct accounts inside {}s, evaluating now",
@@ -428,7 +443,7 @@ async fn screen(
         // offense re-read from the corpus are one event, and the sweep skips
         // members whose standing has already been answered.
         // The same id the sweep mints, so whichever clock arrives first wins.
-        let conviction = conviction_id(&f.policy_hash, &f.rule_id, &msg.message.id);
+        let conviction = conviction_id(&f.rule_id, &msg.message.id);
         fresh |= store
             .record(community.id(), &author, &conviction, worth, now, &evidence)
             .map_err(vector_sdk::Error::Other)?;
@@ -445,9 +460,11 @@ async fn screen(
     let strikes = store.strikes(community.id(), &author).map_err(vector_sdk::Error::Other)?;
     let total = ladder::total(&strikes, now, policy.ladder.decay_half_life_hours);
     let ctx = live_ctx(cfg, &community, watches, me, false).await;
-    if let Some(response) = ladder::decide(&ctx.policy.ladder, total) {
+    let armed_any = ctx.policy.arm.warn || ctx.policy.arm.delete || ctx.policy.arm.kick || ctx.policy.arm.ban;
+    let prior = prior_answer(store, &community, &author, armed_any, answer_horizon(&ctx.policy, now));
+    if let Some(response) = ladder::next_step(&ctx.policy.ladder, total, prior.as_deref()) {
         let v = live_verdict(&author, shield, &evidence, msg.message.id.clone(), &findings);
-        enforce(bot, &community, &ctx, store, watches, &Mutex::new(0), &v, response, total, now).await?;
+        enforce(bot, &community, &ctx, store, watches, &Mutex::new(0), &v, response, total).await?;
     }
     Ok(())
 }
@@ -472,8 +489,14 @@ async fn powers_of(community: &Community) -> Powers {
 }
 
 /// One offense, one id, whichever clock reaches it first.
-fn conviction_id(policy_hash: &str, rule_id: &str, message_id: &str) -> String {
-    format!("msg:{policy_hash}:{rule_id}:{message_id}")
+fn conviction_id(rule_id: &str, message_id: &str) -> String {
+    // Deliberately WITHOUT the policy hash. The rule and the message identify
+    // the offense; the rulebook version does not. Including it meant editing
+    // one pattern re-keyed every conviction in the open evidence window — so
+    // the strikes landed again at full worth stamped `now`, roughly doubling
+    // every total, and every pardon tombstone pointed at an id nothing would
+    // mint again.
+    format!("msg:{rule_id}:{message_id}")
 }
 
 /// The roster as the last sweep counted it, so a live action is bound by the
@@ -525,6 +548,21 @@ fn debt_subjects(
         .collect()
 }
 
+/// Is a sweep already running here?
+fn sweep_in_flight(watches: &Watches, community: &str) -> bool {
+    watches.lock().unwrap_or_else(|e| e.into_inner()).get(community).is_some_and(|w| w.sweeping)
+}
+
+/// Return a spent trip, so the cooldown is not burnt on an evaluation that
+/// never happened.
+fn untrip(watches: &Watches, community: &str) {
+    if let Some(w) = watches.lock().unwrap_or_else(|e| e.into_inner()).get_mut(community) {
+        if let Some(t) = w.tripwire.as_mut() {
+            t.forget_last_trip();
+        }
+    }
+}
+
 /// The roster as the last sweep read it: npub to standing. Empty when no sweep
 /// has completed, which `debt_subjects` treats as "nobody is ours to sentence".
 fn roster_of_community(watches: &Watches, community: &str) -> std::collections::HashMap<String, String> {
@@ -539,7 +577,7 @@ fn roster_of_community(watches: &Watches, community: &str) -> std::collections::
 
 /// A member the store owes for, with no engine finding of their own — the
 /// ladder is the entire case.
-fn carried_verdict(npub: &str, shield: String) -> Verdict {
+fn carried_verdict(npub: &str, shield: String, evidence: Vec<String>) -> Verdict {
     Verdict {
         npub: npub.to_string(),
         name: short(npub).to_string(),
@@ -547,7 +585,9 @@ fn carried_verdict(npub: &str, shield: String) -> Verdict {
         proven: 0,
         band: "alert".into(),
         shield,
-        reasons: vec!["carrying strikes from an earlier finding".into()],
+        // Named, not "carrying strikes from an earlier finding" — that reached
+        // the member verbatim as the reason a rule matched them.
+        reasons: if evidence.is_empty() { vec!["earlier findings".into()] } else { evidence },
         findings: vec![],
         messages: 0,
         tenure_secs: 0,
@@ -692,12 +732,15 @@ async fn watch_media(
         };
         // The declared size was the sender's word too.
         if bytes.len() as u64 > cfg.vision.max_bytes {
-            println!("[media] {} is {} bytes, over the limit — queued, not cleared", short(&att.id), bytes.len());
+            unclassified(bot, &community, cfg, store, watches, me, now, &att.id, "over the size limit").await;
             continue;
         }
         // MIME from the bytes, never from a name the uploader chose.
         let actual = vector_sdk::vector_core::crypto::mime_from_magic_bytes(&bytes);
         if !cfg.vision.mimes.iter().any(|m| m == actual) {
+            // The name said one thing and the bytes another. Dropping that in
+            // silence is the same hole as a timeout reading as clean.
+            unclassified(bot, &community, cfg, store, watches, me, now, &att.id, "not a type I can judge").await;
             continue;
         }
         let content_hash = vector_sdk::vector_core::crypto::sha256_hex(&bytes);
@@ -766,9 +809,11 @@ async fn watch_media(
                 // the community gate must not each pin megabytes.
                 drop(bytes);
                 let ctx = live_ctx(cfg, &community, watches, me, true).await;
-                if let Some(response) = ladder::decide(&ctx.policy.ladder, total) {
+                let armed_any = ctx.policy.arm.vision;
+                let prior = prior_answer(store, &community, &author, armed_any, answer_horizon(&ctx.policy, now));
+                if let Some(response) = ladder::next_step(&ctx.policy.ladder, total, prior.as_deref()) {
                     let v = synthetic_verdict(&author, shield.clone(), &evidence, msg.message.id.clone());
-                    enforce(bot, &community, &ctx, store, watches, &Mutex::new(0), &v, response, total, now).await?;
+                    enforce(bot, &community, &ctx, store, watches, &Mutex::new(0), &v, response, total).await?;
                 }
             }
         }
@@ -910,13 +955,14 @@ fn operator_surface(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<Store>) {
     bot.command("pardon", "Clear someone's strikes with Sentinel")
         .user("member", "Whom to forgive", true)
         .run({
-            let store = store.clone();
+            let (store, cfg) = (store.clone(), cfg.clone());
             move |ctx| {
-                let store = store.clone();
+                let (store, cfg) = (store.clone(), cfg.clone());
                 async move {
-                    let (Some(community), Some(who)) = (ctx.msg.community(), ctx.str("member").map(str::to_string))
+                    let (Some(community), Some(who)) =
+                        (ctx.msg.community().filter(|c| cfg.watches(c.id())), ctx.str("member").map(str::to_string))
                     else {
-                        let _ = ctx.reply("Ask me this inside a community, naming a member.").await;
+                        let _ = ctx.reply("I am not watching this community.").await;
                         return;
                     };
                     // The community's own roles decide who may forgive.
@@ -972,6 +1018,9 @@ async fn sweep(
     // latch `known` on nothing, which turns every standing lookup into "absent"
     // and every percentage ceiling into no ceiling at all.
     if verdicts.all().next().is_none() {
+        // The coverage line is the whole reason a quiet pass is legible, and it
+        // is most needed on the pass that explains itself least.
+        heartbeat(short(community.id()), &verdicts, 0, &Powers::default());
         println!("[{}] roster read returned no members — holding this pass", short(community.id()));
         return Ok(());
     }
@@ -1019,6 +1068,9 @@ async fn sweep(
         // path that failed to read their standing.
         if v.shield == "protected" || (v.shield == "trusted" && ctx.policy.shields.respect_trusted) {
             println!("[{id}] QUEUED  {} — {} ({})", short(&v.npub), v.why(), v.shield);
+            // Handled: without this their older strikes keep them in the debt
+            // loop, which names a moderator in the log every single pass.
+            handled.insert(v.npub.clone());
             continue;
         }
 
@@ -1035,7 +1087,10 @@ async fn sweep(
         let charged_per_message: std::collections::HashSet<&str> = v
             .findings
             .iter()
-            .filter(|f| f.stateless && f.is_proven() && !f.messages.is_empty())
+            // `messages` may be shorter than `citation_count`, and then the
+            // per-message charges did NOT cover the evidence — so suppressing
+            // the window rung charged the worst offenders the least.
+            .filter(|f| f.stateless && f.is_proven() && !f.messages.is_empty() && f.citation_count as usize <= f.messages.len())
             .map(|f| f.rule_id.as_str())
             .collect();
         let mut fresh = false;
@@ -1056,7 +1111,7 @@ async fn sweep(
                 // posted while Sentinel was down was never charged at all.
                 for mid in &f.messages {
                     fresh |= store
-                        .record(community.id(), &v.npub, &conviction_id(&f.policy_hash, &f.rule_id, mid), worth, now, &evidence)
+                        .record(community.id(), &v.npub, &conviction_id(&f.rule_id, mid), worth, now, &evidence)
                         .map_err(vector_sdk::Error::Other)?;
                 }
                 continue;
@@ -1075,10 +1130,12 @@ async fn sweep(
 
         let strikes = store.strikes(community.id(), &v.npub).map_err(vector_sdk::Error::Other)?;
         let total = ladder::total(&strikes, now, ctx.policy.ladder.decay_half_life_hours);
-        let Some(response) = ladder::decide(&ctx.policy.ladder, total) else { continue };
+        let armed_any = ctx.policy.arm.warn || ctx.policy.arm.delete || ctx.policy.arm.kick || ctx.policy.arm.ban;
+        let prior = prior_answer(store, community, &v.npub, armed_any, answer_horizon(&ctx.policy, now));
+        let Some(response) = ladder::next_step(&ctx.policy.ladder, total, prior.as_deref()) else { continue };
 
         handled.insert(v.npub.clone());
-        if enforce(bot, community, &ctx, store, wires, &pass, v, response, total, now).await? == Outcome::Halted {
+        if enforce(bot, community, &ctx, store, wires, &pass, v, response, total).await? == Outcome::Halted {
             halted = true;
             break;
         }
@@ -1098,14 +1155,16 @@ async fn sweep(
         for (npub, shield) in debt_subjects(&handled, &roster, owed, me) {
             let strikes = store.strikes(community.id(), &npub).map_err(vector_sdk::Error::Other)?;
             let total = ladder::total(&strikes, now, ctx.policy.ladder.decay_half_life_hours);
-            let Some(mut response) = ladder::decide(&ctx.policy.ladder, total) else { continue };
+            let armed_any = ctx.policy.arm.warn || ctx.policy.arm.delete || ctx.policy.arm.kick || ctx.policy.arm.ban;
+            let prior = prior_answer(store, community, &npub, armed_any, answer_horizon(&ctx.policy, now));
+            let Some(mut response) = ladder::next_step(&ctx.policy.ladder, total, prior.as_deref()) else { continue };
             // Nothing to delete without citations, and recording a
             // delete_and_warn would rank 2 and block a later real one.
             if response == Response::DeleteAndWarn {
                 response = Response::Warn;
             }
-            let v = carried_verdict(&npub, shield);
-            if enforce(bot, community, &ctx, store, wires, &pass, &v, response, total, now).await? == Outcome::Halted {
+            let v = carried_verdict(&npub, shield, store.evidence(community.id(), &npub).unwrap_or_default());
+            if enforce(bot, community, &ctx, store, wires, &pass, &v, response, total).await? == Outcome::Halted {
                 halted = true;
                 break;
             }
@@ -1189,39 +1248,23 @@ async fn contain(
         return Ok(());
     }
 
+    // Report touches nobody, so it claims in the dry space: claiming under
+    // `live:` meant switching the response to kick inside the TTL found every
+    // member already claimed and contained nobody, ever.
+    let touched = armed && response != RaidResponse::Report;
     // A ceiling that spans TIME, not one pass. `raid::select` halts only when a
     // SINGLE pass is over the bar, so a sustained false positive contained 10%
     // every two minutes and emptied the community in twenty — without the guard
     // built to prevent exactly that ever firing.
-    let spent = store.raid_actions_last_hour(community.id(), now).map_err(vector_sdk::Error::Other)?;
-    if let Some(ceiling) = adjudicate::roster_ceiling(&ctx.policy, ctx.roster) {
-        if spent + suspects.len() > ceiling {
-            let line = format!(
-                "RAID HALT — {} contained here in the last hour, {} more over the bar, past what {}% of {} members allows. \
-                 A person decides from here.",
-                spent,
-                suspects.len(),
-                ctx.policy.limits.halt_if_over_pct,
-                ctx.roster
-            );
-            println!("[{id}] {line}");
-            let ttl = ctx.policy.raid.claim_ttl_secs.saturating_mul(1000);
-            if store
-                .claim_cohort(community.id(), &format!("halt:{}", now / 3_600_000), now, ttl)
-                .map_err(vector_sdk::Error::Other)?
-            {
-                announce(bot, community, ctx, &line).await;
-            }
-            return Ok(());
-        }
-    }
-
+    let spent = store
+        .raid_actions_last_hour(community.id(), !touched, now)
+        .map_err(vector_sdk::Error::Other)?;
     // Claimed PER MEMBER, not per cohort. A wave arriving over many sweeps
     // grows the set every pass, so a whole-set fingerprint re-contained
     // everyone already handled — which for bans is a key rotation each time.
     // Claims are scoped to armed-ness, so a rehearsal never immunises a cohort
     // against a later real containment.
-    let scope = if armed { "live" } else { "dry" };
+    let scope = if touched { "live" } else { "dry" };
     let ttl = ctx.policy.raid.claim_ttl_secs.saturating_mul(1000);
     let mut fresh: Vec<String> = Vec::new();
     for npub in &suspects {
@@ -1234,6 +1277,34 @@ async fn contain(
     }
     if fresh.is_empty() {
         return Ok(());
+    }
+
+    // Measured against what will actually be acted on, after the claims — and
+    // across the HOUR. `raid::select` halts only on a single pass being over the
+    // bar, so a sustained false positive contained a tenth every two minutes and
+    // emptied a community in twenty without the guard ever firing.
+    if let Some(ceiling) = adjudicate::roster_ceiling(&ctx.policy, ctx.roster) {
+        if spent + fresh.len() > ceiling {
+            let line = format!(
+                "RAID HALT — {spent} contained here in the last hour, {} more over the bar, past what {}% of {} members allows. \
+                 A person decides from here.",
+                fresh.len(),
+                ctx.policy.limits.halt_if_over_pct,
+                ctx.roster
+            );
+            println!("[{id}] {line}");
+            for npub in &fresh {
+                let _ = store.release_cohort(community.id(), &format!("{scope}:{npub}"));
+            }
+            let ttl = ctx.policy.raid.claim_ttl_secs.saturating_mul(1000);
+            if store
+                .claim_cohort(community.id(), &format!("halt:{}", now / 3_600_000), now, ttl)
+                .map_err(vector_sdk::Error::Other)?
+            {
+                announce(bot, community, ctx, &line).await;
+            }
+            return Ok(());
+        }
     }
 
     let verb = response.name();
@@ -1305,7 +1376,6 @@ async fn contain(
     // Prefixed, so a raid row is never read as a ladder response. An unarmed
     // raid stamping a bare "kick" on every suspect immunised all of them
     // against warn, delete and kick — permanently, on evidence nobody acted on.
-    let touched = armed && response != RaidResponse::Report;
     for npub in &done {
         store
             .log_action(community.id(), npub, &format!("raid:{verb}"), !touched, now, "raid cohort")
@@ -1315,6 +1385,22 @@ async fn contain(
         announce(bot, community, ctx, &line).await;
     }
     Ok(())
+}
+
+/// The strongest answer this member has already had, at this armed-ness.
+fn prior_answer(
+    store: &Arc<Store>,
+    community: &Community,
+    npub: &str,
+    armed: bool,
+    horizon: u64,
+) -> Option<String> {
+    store.strongest_response(community.id(), npub, !armed, horizon).ok().flatten()
+}
+
+/// How far back an answer still answers for anything.
+fn answer_horizon(policy: &CommunityPolicy, now: u64) -> u64 {
+    now.saturating_sub(policy.ladder.decay_half_life_hours.saturating_mul(3_600_000).saturating_mul(32))
 }
 
 /// Carry out (or rehearse) whatever [`adjudicate`] decided.
@@ -1333,7 +1419,6 @@ async fn enforce(
     v: &Verdict,
     response: Response,
     total: u32,
-    _caller_now: u64,
 ) -> vector_sdk::Result<Outcome> {
     let gate = enforce_lock(wires, community.id());
     let _serial = gate.lock().await;
@@ -1371,6 +1456,17 @@ async fn enforce(
         from_vision,
     };
 
+    // A target this sentence keeps failing against — gone, outranking us, no
+    // inbox relay to reach — must stop being retried every pass. Bounded rather
+    // than tombstoned, so a transient relay blip still gets another go.
+    if store
+        .failures(community.id(), &v.npub, response.name(), now.saturating_sub(3_600_000))
+        .map_err(vector_sdk::Error::Other)?
+        >= MAX_FAILURES_PER_HOUR
+    {
+        return Ok(Outcome::Failed);
+    }
+
     let (response, armed) = match adjudicate::adjudicate(&ctx.policy, ctx.powers, &facts, response) {
         Sentence::Spare { why: reason } => {
             println!("[{id}] QUEUED  {who} — {why} ({reason})");
@@ -1395,6 +1491,7 @@ async fn enforce(
         Sentence::Carry { response, armed } => (response, armed),
     };
 
+    let mut effective = response;
     let name = response.name();
     println!("[{id}] {} {name} {who} — {total} strike(s) — {why}", if armed { "ENFORCE" } else { "WOULD  " });
 
@@ -1407,6 +1504,7 @@ async fn enforce(
                 // Capped: a member cited across fifty messages is one sentence,
                 // not fifty round trips inside one decision.
                 let mut hidden = std::collections::HashSet::new();
+                let mut all_hidden = true;
                 for msg_id in v
                     .findings
                     .iter()
@@ -1418,10 +1516,20 @@ async fn enforce(
                     if let Some(m) = bot.message(msg_id).await {
                         if let Err(e) = m.hide().await {
                             eprintln!("[{id}] hide {}: {e}", short(msg_id));
+                            all_hidden = false;
                         }
+                    } else {
+                        all_hidden = false;
                     }
                 }
-                bot.dm(&v.npub).send(&warn_text(&why)).await.map(|_| ())
+                let sent = bot.dm(&v.npub).send(&warn_text(&why)).await.map(|_| ());
+                // Their messages are still visible, so this was a warning.
+                // Recording the higher rung would mark them answered at it and
+                // block any later real delete.
+                if !all_hidden {
+                    effective = Response::Warn;
+                }
+                sent
             }
             Response::Kick => community.member(v.npub.clone()).kick().await,
             Response::Ban => community.member(v.npub.clone()).ban().await,
@@ -1437,7 +1545,9 @@ async fn enforce(
         }
     }
 
-    store.log_action(community.id(), &v.npub, name, !armed, now, &why).map_err(vector_sdk::Error::Other)?;
+    store
+        .log_action(community.id(), &v.npub, effective.name(), !armed, now, &why)
+        .map_err(vector_sdk::Error::Other)?;
     // The mod channel is an audit trail of what HAPPENED; a dry run announcing
     // every rehearsal fills it with things nobody did.
     if armed {
@@ -1449,6 +1559,11 @@ async fn enforce(
 
 /// A member cited across many messages is still one sentence.
 const MAX_HIDES: usize = 10;
+
+/// Attempts of one sentence against one member per hour before Sentinel stops
+/// trying. Enough that a relay blip retries, few enough that a permanently
+/// unreachable target is not a per-pass publish forever.
+const MAX_FAILURES_PER_HOUR: usize = 3;
 
 /// One community, as this pass sees it: its own rulebook, its own powers, its
 /// own roster. Nothing about judging one community may leak into another.
@@ -1611,10 +1726,12 @@ mod tests {
     /// offense during downtime is charged by nobody.
     #[test]
     fn one_offense_has_one_id_whichever_clock_reaches_it() {
-        let a = conviction_id("policy1", "slurs", "msg1");
-        assert_eq!(a, conviction_id("policy1", "slurs", "msg1"));
-        assert_ne!(a, conviction_id("policy1", "slurs", "msg2"), "a second message is a second offense");
-        assert_ne!(a, conviction_id("policy1", "links", "msg1"), "a different rule is a different offense");
-        assert_ne!(a, conviction_id("policy2", "slurs", "msg1"), "and a different law is too");
+        let a = conviction_id("slurs", "msg1");
+        assert_eq!(a, conviction_id("slurs", "msg1"));
+        assert_ne!(a, conviction_id("slurs", "msg2"), "a second message is a second offense");
+        assert_ne!(a, conviction_id("links", "msg1"), "a different rule is a different offense");
+        // NOT keyed on the rulebook version: editing one pattern re-charged the
+        // whole open window at full worth and stepped around every pardon.
+        assert!(!a.contains("policy"), "the rulebook version is not part of the offense");
     }
 }

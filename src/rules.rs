@@ -12,6 +12,16 @@ use crate::policy::CommunityPolicy;
 /// re-running the compile replaces it rather than stacking copies.
 pub const POLICY_ID: &str = "sentinel";
 
+/// FNV-1a over the compiled document. Only needs to notice a change.
+fn fnv(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
 fn seriousness(g: Gravity) -> Seriousness {
     match g {
         Gravity::Note => Seriousness::Notice,
@@ -62,14 +72,24 @@ pub fn compile(cfg: &CommunityPolicy) -> Option<Policy> {
 }
 
 /// Install the compiled rulebook into one community's local policy store.
-pub async fn install(community: &Community, cfg: &crate::config::Config) -> Result<&'static str, String> {
+pub async fn install(
+    community: &Community,
+    cfg: &crate::config::Config,
+    store: &crate::store::Store,
+) -> Result<&'static str, String> {
     // The COMMUNITY's rulebook, not the defaults. Installing the top-level one
     // everywhere meant a community's own `[rules]` override changed how
     // findings were scored while the engine went on matching somebody else's
     // rule ids — so every gravity lookup missed and quietly downgraded.
     match compile(&cfg.for_community(community.id())) {
         Some(policy) => {
+            let bytes = policy.clone().build().map_err(|e| e.to_string())?;
             community.policies().set(POLICY_ID, policy).await.map_err(|e| e.to_string())?;
+            // The engine keys its window-rung convictions on the policy hash, so
+            // a changed rulebook re-reports the whole window under fresh ids.
+            if store.note_policy(community.id(), &format!("{:016x}", fnv(&bytes)))? {
+                return Ok("rulebook changed — its open window forgiven");
+            }
             Ok("installed")
         }
         None => {

@@ -34,10 +34,50 @@ pub fn decide(ladder: &Ladder, total: u32) -> Option<Response> {
     ladder.steps.iter().rev().find(|s| total >= s.at).map(|s| s.response)
 }
 
+/// The NEXT rung to answer with, given what this member has already received.
+///
+/// A ladder that jumps straight to the rung a total has reached is not a
+/// ladder: someone who accrued twelve points before Sentinel was armed would be
+/// banned without ever having been warned, and the same is true of anyone whose
+/// first observed offense is a grave one. Climbing one rung per answer means
+/// every step is actually delivered, and a total that keeps rising keeps
+/// climbing.
+pub fn next_step(ladder: &Ladder, total: u32, already: Option<&str>) -> Option<Response> {
+    let reached = decide(ladder, total)?;
+    let floor = already.map(Response::rank_of).unwrap_or(0);
+    ladder
+        .steps
+        .iter()
+        .map(|s| s.response)
+        .filter(|r| r.rank() > floor && r.rank() <= reached.rank())
+        .min_by_key(|r| r.rank())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{Config, Gravity};
+
+    /// Arming after a rehearsal used to fire the whole backlog at the top rung,
+    /// so a member accumulated to Ban was banned without ever being warned.
+    #[test]
+    fn the_ladder_is_climbed_one_rung_at_a_time() {
+        let l = ladder();
+        // Twelve points reaches Ban, but the first answer is still a warning.
+        assert_eq!(next_step(&l, 12, None), Some(Response::Warn));
+        assert_eq!(next_step(&l, 12, Some("warn")), Some(Response::DeleteAndWarn));
+        assert_eq!(next_step(&l, 12, Some("delete_and_warn")), Some(Response::Kick));
+        assert_eq!(next_step(&l, 12, Some("kick")), Some(Response::Ban));
+        assert_eq!(next_step(&l, 12, Some("ban")), None, "nothing above the top");
+
+        // And it never climbs past what the total has actually earned.
+        assert_eq!(next_step(&l, 4, Some("warn")), Some(Response::DeleteAndWarn));
+        assert_eq!(next_step(&l, 4, Some("delete_and_warn")), None, "four points is not a kick");
+        assert_eq!(next_step(&l, 0, None), None, "and a clean member answers to nothing");
+
+        // An unrecognised prior ranks 0, so it never blocks the first rung.
+        assert_eq!(next_step(&l, 12, Some("raid:kick")), Some(Response::Warn));
+    }
 
     fn ladder() -> Ladder {
         Config::default().ladder
