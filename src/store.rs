@@ -1,6 +1,8 @@
-//! What Sentinel remembers: strikes and actions, in one SQLite file beside the
-//! config. This process runs unattended for months, so the schema is versioned
-//! from day one.
+//! What Sentinel remembers: strikes and the actions it took. One SQLite file
+//! beside the config.
+//!
+//! ONE ledger for rehearsals and real actions alike. Arming a class wipes the
+//! community's slate, so no read ever has to ask which space a row is in.
 
 use std::sync::Mutex;
 
@@ -8,10 +10,11 @@ use rusqlite::Connection;
 
 use crate::ladder::Strike;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 1;
 
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS armed (community TEXT PRIMARY KEY, classes TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS strikes (
     community     TEXT NOT NULL,
     subject       TEXT NOT NULL,
@@ -19,9 +22,14 @@ CREATE TABLE IF NOT EXISTS strikes (
     worth         INTEGER NOT NULL,
     at_ms         INTEGER NOT NULL,
     evidence      TEXT NOT NULL DEFAULT '',
-    pardoned      INTEGER NOT NULL DEFAULT 0,
-    policy        TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (community, subject, conviction_id)
+);
+CREATE TABLE IF NOT EXISTS actions (
+    community TEXT NOT NULL,
+    subject   TEXT NOT NULL,
+    response  TEXT NOT NULL,
+    at_ms     INTEGER NOT NULL,
+    evidence  TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS classifications (
     content_hash TEXT NOT NULL,
@@ -30,24 +38,10 @@ CREATE TABLE IF NOT EXISTS classifications (
     at_ms        INTEGER NOT NULL,
     PRIMARY KEY (content_hash, model)
 );
-CREATE TABLE IF NOT EXISTS actions (
-    community TEXT NOT NULL,
-    subject   TEXT NOT NULL,
-    response  TEXT NOT NULL,
-    dry       INTEGER NOT NULL,
-    at_ms     INTEGER NOT NULL,
-    evidence  TEXT NOT NULL DEFAULT ''
-);
-CREATE TABLE IF NOT EXISTS notes (key TEXT PRIMARY KEY, note TEXT NOT NULL);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_actions_claim ON actions(community, subject, response) WHERE response = 'raid:claim';
+CREATE INDEX IF NOT EXISTS idx_strikes_live ON strikes(community, at_ms);
 CREATE INDEX IF NOT EXISTS idx_actions_subject ON actions(community, subject, at_ms);
-CREATE INDEX IF NOT EXISTS idx_actions_at ON actions(dry, at_ms);
-CREATE INDEX IF NOT EXISTS idx_actions_hour ON actions(community, dry, at_ms);
-CREATE INDEX IF NOT EXISTS idx_strikes_live ON strikes(community, at_ms);";
+CREATE INDEX IF NOT EXISTS idx_actions_hour ON actions(community, at_ms);";
 
-/// The connection lives behind a mutex so one `Arc<Store>` serves both the
-/// sweep loop and the operator's slash commands. Every method locks briefly and
-/// never across an await.
 pub struct Store {
     conn: Mutex<Connection>,
 }
@@ -61,78 +55,21 @@ impl Store {
         let conn = Connection::open(path).map_err(|e| format!("{path}: {e}"))?;
         conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
         let stored: i64 = conn
-            // An unreadable meta row is the OLDEST version, not the newest:
-            // failing open here skipped the migration entirely and left v1's
-            // raid rows in place, immunising everyone they touched.
             .query_row("SELECT value FROM meta WHERE key = 'schema'", [], |r| r.get(0))
-            .unwrap_or(1);
+            .unwrap_or(SCHEMA_VERSION);
         if stored > SCHEMA_VERSION {
             return Err(format!("{path} was written by a newer Sentinel (schema {stored} > {SCHEMA_VERSION})"));
-        }
-        // Asked of the schema, not inferred from a failed statement. The ALTER
-        // MUST fail on a fresh database, so swallowing its error also swallowed
-        // a busy lock or a full disk — and the version was written anyway, so
-        // the column stayed missing and every strikes() read errored forever.
-        let has_pardoned = {
-            let mut stmt = conn.prepare("PRAGMA table_info(strikes)").map_err(|e| e.to_string())?;
-            let cols = stmt
-                .query_map([], |r| r.get::<_, String>(1))
-                .map_err(|e| e.to_string())?
-                .flatten()
-                .any(|c| c == "pardoned");
-            cols
-        };
-        if !has_pardoned {
-            conn.execute("ALTER TABLE strikes ADD COLUMN pardoned INTEGER NOT NULL DEFAULT 0", [])
-                .map_err(|e| format!("{path}: schema 3 migration failed: {e}"))?;
-        }
-        let has_policy = {
-            let mut stmt = conn.prepare("PRAGMA table_info(strikes)").map_err(|e| e.to_string())?;
-            let found = stmt
-                .query_map([], |r| r.get::<_, String>(1))
-                .map_err(|e| e.to_string())?
-                .flatten()
-                .any(|c| c == "policy");
-            found
-        };
-        if !has_policy {
-            // Existing rows keep '' and are never retired: an upgrade must not
-            // forgive a community's history as a side effect of shipping.
-            conn.execute("ALTER TABLE strikes ADD COLUMN policy TEXT NOT NULL DEFAULT ''", [])
-                .map_err(|e| format!("{path}: schema 4 migration failed: {e}"))?;
-        }
-        if stored < 5 {
-            // Sentinel's own ids carry no rulebook by construction, and earlier
-            // builds stamped them anyway. An amnesty would erase them for good,
-            // since the id is identical next pass and the insert is ignored.
-            conn.execute(
-                "UPDATE strikes SET policy = '' WHERE conviction_id LIKE 'msg:%' OR conviction_id LIKE 'vision:%'",
-                [],
-            )
-            .map_err(|e| format!("{path}: schema 5 migration failed: {e}"))?;
-        }
-        if stored < 4 {
-            // The claim key space changed from live: to armed:; leave nothing
-            // that only the old reader understood.
-            conn.execute("DELETE FROM actions WHERE response = 'raid:claim' AND subject LIKE 'live:%'", [])
-                .map_err(|e| e.to_string())?;
-        }
-        if stored < 2 {
-            // Version 1 wrote bare "kick"/"ban" rows for UNARMED raid
-            // containment. Those read as ladder responses, so every suspect of
-            // a rehearsed raid is immune to warn, delete and kick — forever,
-            // on evidence nobody acted on.
-            conn.execute("DELETE FROM actions WHERE evidence = 'raid cohort' AND response NOT LIKE 'raid:%'", [])
-                .map_err(|e| e.to_string())?;
         }
         conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema', ?1)", [SCHEMA_VERSION])
             .map_err(|e| e.to_string())?;
         Ok(Store { conn: Mutex::new(conn) })
     }
 
-    /// Record one conviction. Returns whether it was NEW — verdicts are
-    /// cumulative, re-reporting every standing conviction on every poll, so the
-    /// conviction id is the line between an offense and an echo of one.
+    /// Record one conviction. True when it was NEW.
+    ///
+    /// Verdicts are cumulative — every poll re-reports every standing
+    /// conviction — so the conviction id is the line between an offense and an
+    /// echo of one.
     pub fn record(
         &self,
         community: &str,
@@ -141,136 +78,38 @@ impl Store {
         worth: u32,
         at_ms: u64,
         evidence: &str,
-        policy: &str,
     ) -> Result<bool, String> {
         let n = self
             .lock()
             .execute(
-                "INSERT OR IGNORE INTO strikes (community, subject, conviction_id, worth, at_ms, evidence, policy)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![community, subject, conviction_id, worth, at_ms as i64, evidence, policy],
+                "INSERT OR IGNORE INTO strikes (community, subject, conviction_id, worth, at_ms, evidence)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![community, subject, conviction_id, worth, at_ms as i64, evidence],
             )
             .map_err(|e| e.to_string())?;
         Ok(n > 0)
     }
 
-    /// Every strike a member carries here, for the ladder to decay and sum.
     pub fn strikes(&self, community: &str, subject: &str) -> Result<Vec<Strike>, String> {
         let conn = self.lock();
         let mut stmt = conn
-            .prepare(
-                "SELECT worth, at_ms, conviction_id LIKE 'vision:%' FROM strikes \
-                 WHERE community = ?1 AND subject = ?2 AND pardoned = 0",
-            )
+            .prepare("SELECT worth, at_ms FROM strikes WHERE community = ?1 AND subject = ?2")
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map(rusqlite::params![community, subject], |r| {
-                Ok(Strike {
-                    worth: r.get::<_, i64>(0)? as u32,
-                    at_ms: r.get::<_, i64>(1)? as u64,
-                    // The id already says where it came from; a second column
-                    // would be a second thing to keep in step.
-                    from_vision: r.get::<_, i64>(2)? == 1,
-                })
+                Ok(Strike { worth: r.get::<_, i64>(0)? as u32, at_ms: r.get::<_, i64>(1)? as u64 })
             })
             .map_err(|e| e.to_string())?;
         rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
     }
 
-    /// The audit trail, and the input to the per-hour ceiling.
-    pub fn log_action(
-        &self,
-        community: &str,
-        subject: &str,
-        response: &str,
-        dry: bool,
-        at_ms: u64,
-        evidence: &str,
-    ) -> Result<(), String> {
-        self.lock()
-            .execute(
-                "INSERT INTO actions (community, subject, response, dry, at_ms, evidence)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![community, subject, response, dry as i64, at_ms as i64, evidence],
-            )
-            .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
-    /// Ladder actions in this community in the last hour, at this armed-ness.
-    ///
-    /// Per community, deliberately: a wave in one room must not starve the
-    /// ceiling everywhere else Sentinel works. Raid rows are excluded — they
-    /// carry a `raid:` prefix and answer to their own bound. Scoped by `dry`
-    /// so a rehearsal exercises the ceilings too: counting only real actions
-    /// meant a dry run never hit one, and arming changed behaviour the
-    /// rehearsal had never shown.
-    pub fn actions_last_hour(&self, community: &str, dry: bool, now_ms: u64) -> Result<usize, String> {
-        let since = now_ms.saturating_sub(3_600_000) as i64;
-        self.lock()
-            .query_row(
-                "SELECT COUNT(*) FROM actions WHERE community = ?1 AND dry = ?3 AND at_ms >= ?2 \
-                 AND response NOT LIKE 'raid:%' AND response NOT LIKE 'failed:%' \
-                 AND response NOT LIKE 'attempted:%'",
-                rusqlite::params![community, since, dry as i64],
-                |r| r.get::<_, i64>(0).map(|n| n as usize),
-            )
-            .map_err(|e| e.to_string())
-    }
-
-    /// The strongest response already taken against a member, so one standing
-    /// is not re-sentenced on every poll.
-    ///
-    /// Scoped to `dry`, and that is load-bearing: a rehearsal must only dedup
-    /// rehearsals. Sharing one column meant a day of dry running left every
-    /// member marked as already answered, and arming the bot then did nothing
-    /// for anyone — the operator saw silence and read it as broken.
-    ///
-    /// STRONGEST, not latest: ordering by time let a later, lesser response
-    /// reopen a member to everything above it.
-    ///
-    /// Bounded by `since_ms`, because a response older than the strikes it
-    /// answered is not an answer to anything. Unbounded, one warning made a
-    /// member permanently un-warnable and the ladder became lifetime-monotonic
-    /// despite the half-life the config advertises.
-    pub fn strongest_response(
-        &self,
-        community: &str,
-        subject: &str,
-        dry: bool,
-        since_ms: u64,
-    ) -> Result<Option<String>, String> {
-        // Read every response on file and rank them in Rust. A second severity
-        // table in SQL would drift from `Response` the first time a variant is
-        // renamed, and the drift reads as "no prior action" — re-sentencing
-        // everyone from scratch.
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare(
-                "SELECT response FROM actions WHERE community = ?1 AND subject = ?2 AND dry = ?3 AND at_ms >= ?4",
-            )
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map(rusqlite::params![community, subject, dry as i64, since_ms as i64], |r| r.get::<_, String>(0))
-            .map_err(|e| e.to_string())?;
-        let mut best: Option<String> = None;
-        for name in rows.flatten() {
-            if crate::config::Response::rank_of(&name) > best.as_deref().map(crate::config::Response::rank_of).unwrap_or(0) {
-                best = Some(name);
-            }
-        }
-        Ok(best)
-    }
-
-    /// What this member's live strikes were for, worst-first-ish, capped. The
-    /// carried warning has no engine finding to quote, so without this it
-    /// reached the member as "a rule matched: carrying strikes".
+    /// What this member's strikes were for, newest first, capped.
     pub fn evidence(&self, community: &str, subject: &str) -> Result<Vec<String>, String> {
         let conn = self.lock();
         let mut stmt = conn
             .prepare(
                 "SELECT evidence, MAX(at_ms) AS t FROM strikes WHERE community = ?1 AND subject = ?2 \
-                 AND pardoned = 0 AND evidence != '' GROUP BY evidence ORDER BY t DESC LIMIT 3",
+                 AND evidence != '' GROUP BY evidence ORDER BY t DESC LIMIT 3",
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
@@ -279,172 +118,138 @@ impl Store {
         Ok(rows.flatten().collect())
     }
 
-    /// Forgive strikes minted under a rulebook that is no longer in force.
-    ///
-    /// Only rows STAMPED with a rulebook are candidates. Sentinel's own ids
-    /// (`msg:`, `vision:`) carry no policy hash by construction, so they are
-    /// stamped `''` and never retired — tombstoning them erased the media
-    /// lane's and live screen's history permanently, since the id is identical
-    /// next pass and INSERT OR IGNORE hits the tombstone forever.
-    ///
-    /// The engine keys its window-scoped conviction ids on the policy hash, so
-    /// an operator adding one pattern re-reports those convictions under ids
-    /// nothing has seen: left alone they land again at full worth stamped
-    /// `now`, roughly doubling the total with half its decay clock reset.
-    ///
-    /// Pardons by the hash STAMPED on each row rather than by guessing from the
-    /// id shape. Guessing meant Sentinel's own stable ids survived while the
-    /// whole community's ladder floor was deleted alongside them — so every
-    /// member with word or media strikes kept their total, lost every answer
-    /// already given, and was walked up the ladder again from a warning.
-    ///
-    /// Returns how many were forgiven.
-    /// Adopt the current rulebook for rows written before the stamp existed.
-    ///
-    /// One-shot, per community. Leaving them `''` forever meant the FIRST edit
-    /// after this release double-charged exactly the cohort the amnesty exists
-    /// for — they would never be retired, and the engine would re-report them
-    /// under fresh ids alongside.
-    pub fn adopt_unstamped(&self, community: &str, current: &str) -> Result<usize, String> {
+    pub fn log_action(
+        &self,
+        community: &str,
+        subject: &str,
+        response: &str,
+        at_ms: u64,
+        evidence: &str,
+    ) -> Result<(), String> {
         self.lock()
             .execute(
-                "UPDATE strikes SET policy = ?2 WHERE community = ?1 AND policy = '' \
-                 AND conviction_id NOT LIKE 'msg:%' AND conviction_id NOT LIKE 'vision:%'",
-                rusqlite::params![community, current],
+                "INSERT INTO actions (community, subject, response, at_ms, evidence) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![community, subject, response, at_ms as i64, evidence],
             )
+            .map(|_| ())
             .map_err(|e| e.to_string())
     }
 
-    pub fn retire_policy(&self, community: &str, current: &str) -> Result<usize, String> {
-        let mut guard = self.lock();
-        let conn = guard.transaction().map_err(|e| e.to_string())?;
-        // DELETED, not tombstoned. These ids embed the policy hash, so they can
-        // never recur under the current rulebook — and a tombstone made the
-        // amnesty one-way: A -> B -> A left everyone permanently at zero,
-        // because A's convictions came back under ids already marked pardoned.
-        // (`pardon` still tombstones; ITS ids are stable and do recur.)
-        let n = conn
-            .execute(
-                "DELETE FROM strikes WHERE community = ?1 AND policy != '' AND policy != ?2",
-                rusqlite::params![community, current],
-            )
+    /// The strongest response this member has already had.
+    ///
+    /// Strongest, not latest: ordering by time let a later, lesser response
+    /// reopen them to everything above it. Ranking happens in Rust so the
+    /// severity order lives in exactly one place.
+    pub fn strongest_response(&self, community: &str, subject: &str) -> Result<Option<String>, String> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT response FROM actions WHERE community = ?1 AND subject = ?2")
             .map_err(|e| e.to_string())?;
-        conn.commit().map_err(|e| e.to_string())?;
-        Ok(n)
+        let rows = stmt
+            .query_map(rusqlite::params![community, subject], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        let mut best: Option<String> = None;
+        for name in rows.flatten() {
+            if crate::config::Response::rank_of(&name)
+                > best.as_deref().map(crate::config::Response::rank_of).unwrap_or(0)
+            {
+                best = Some(name);
+            }
+        }
+        Ok(best)
     }
 
-    /// Distinct PEOPLE actioned here in the last hour. The roster halt bounds
-    /// how much of a community may be touched, and the ladder climbs — so
-    /// counting rows let one member's four rungs trip a guard sized for four
-    /// members.
+    /// Distinct people actioned here in the last hour, excluding one.
+    ///
+    /// People, not rows: the ladder climbs, so one member spends several rows
+    /// and a row count tripped a guard sized for several members. Excluding the
+    /// subject lets someone already inside the bound still be escalated.
     pub fn subjects_actioned_last_hour(
         &self,
         community: &str,
-        dry: bool,
         now_ms: u64,
         except: &str,
     ) -> Result<usize, String> {
         let since = now_ms.saturating_sub(3_600_000) as i64;
         self.lock()
             .query_row(
-                "SELECT COUNT(DISTINCT subject) FROM actions WHERE community = ?1 AND dry = ?3 \
-                 AND at_ms >= ?2 AND subject != ?4 AND response NOT LIKE 'raid:%' \
-                 AND response NOT LIKE 'failed:%' AND response NOT LIKE 'attempted:%'",
-                rusqlite::params![community, since, dry as i64, except],
+                "SELECT COUNT(DISTINCT subject) FROM actions WHERE community = ?1 AND at_ms >= ?2 \
+                 AND subject != ?3 AND response NOT LIKE 'raid:%'",
+                rusqlite::params![community, since, except],
                 |r| r.get::<_, i64>(0).map(|n| n as usize),
             )
             .map_err(|e| e.to_string())
     }
 
-    /// How many times this exact sentence has failed against this member
-    /// recently. Read by `enforce` to back off: a target that can never be
-    /// actioned — gone, outranking us, no inbox relay — would otherwise be
-    /// retried on every pass forever.
-    pub fn failure_span(
-        &self,
-        community: &str,
-        subject: &str,
-        name: &str,
-        since_ms: u64,
-    ) -> Result<(usize, Option<u64>, Option<u64>), String> {
-        self.lock()
-            .query_row(
-                "SELECT COUNT(*), MIN(at_ms), MAX(at_ms) FROM actions WHERE community = ?1 AND subject = ?2 \
-                 AND response = ?3 AND at_ms >= ?4",
-                rusqlite::params![community, subject, format!("failed:{name}"), since_ms as i64],
-                |r| {
-                    Ok((
-                        r.get::<_, i64>(0)? as usize,
-                        r.get::<_, Option<i64>>(1)?.map(|v| v as u64),
-                        r.get::<_, Option<i64>>(2)?.map(|v| v as u64),
-                    ))
-                },
-            )
-            .map_err(|e| e.to_string())
-    }
-
-    /// Has anything Sentinel sent this member ever actually landed? A rung it
-    /// could never deliver must not, by giving up, unlock a removal against
-    /// somebody who has never been reachable at all.
-    pub fn has_delivered(&self, community: &str, subject: &str, since_ms: u64) -> Result<bool, String> {
-        self.lock()
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM actions WHERE community = ?1 AND subject = ?2 \
-                 AND dry = 0 AND at_ms >= ?3 AND response NOT LIKE 'failed:%' \
-                 AND response NOT LIKE 'attempted:%' AND response NOT LIKE 'raid:%')",
-                rusqlite::params![community, subject, since_ms as i64],
-                |r| r.get::<_, i64>(0).map(|n| n == 1),
-            )
-            .map_err(|e| e.to_string())
-    }
-
-    /// Members contained here in the last hour, at this armed-ness.
-    /// Containment's own bound, since `actions_last_hour` deliberately excludes
-    /// `raid:%` rows. Scoped by `dry` for the same reason the ladder's count is:
-    /// a rehearsal that never meets a ceiling shows the operator a run that
-    /// looks nothing like the armed one.
-    pub fn raid_actions_last_hour(&self, community: &str, dry: bool, now_ms: u64) -> Result<usize, String> {
+    pub fn actions_last_hour(&self, community: &str, now_ms: u64) -> Result<usize, String> {
         let since = now_ms.saturating_sub(3_600_000) as i64;
         self.lock()
             .query_row(
-                "SELECT COUNT(*) FROM actions WHERE community = ?1 AND dry = ?3 AND at_ms >= ?2 \
-                 AND response LIKE 'raid:%' AND response != 'raid:claim'",
-                rusqlite::params![community, since, dry as i64],
+                "SELECT COUNT(*) FROM actions WHERE community = ?1 AND at_ms >= ?2 AND response NOT LIKE 'raid:%'",
+                rusqlite::params![community, since],
                 |r| r.get::<_, i64>(0).map(|n| n as usize),
             )
             .map_err(|e| e.to_string())
     }
 
-    /// Has this member already been contained in this wave? A raid stays
-    /// detected for as long as its evidence sits in the window, and without
-    /// this every sweep re-contains — which for bans means repeated key
-    /// rotations, the precise stranding batching exists to avoid.
-    pub fn claim_cohort(&self, community: &str, fingerprint: &str, at_ms: u64, ttl_ms: u64) -> Result<bool, String> {
+    /// Everyone carrying a strike here. The sweep's own population is whatever
+    /// the engine reported, which never includes a media-only offender.
+    pub fn subjects_with_strikes(&self, community: &str) -> Result<Vec<String>, String> {
         let conn = self.lock();
-        // A claim binds for `ttl_ms` and no longer. Permanent claims meant the
-        // same accounts raiding next week were silently not contained — no
-        // action, no log, nothing for an operator to see.
-        conn.execute(
-            "DELETE FROM actions WHERE community = ?1 AND subject = ?2 AND response = 'raid:claim' AND at_ms < ?3",
-            rusqlite::params![community, fingerprint, at_ms.saturating_sub(ttl_ms) as i64],
-        )
-        .map_err(|e| e.to_string())?;
-        let n = conn
-            .execute(
-                "INSERT OR IGNORE INTO actions (community, subject, response, dry, at_ms, evidence)
-                 VALUES (?1, ?2, 'raid:claim', 0, ?3, 'cohort')",
-                rusqlite::params![community, fingerprint, at_ms as i64],
+        let mut stmt = conn
+            .prepare(
+                "SELECT subject FROM strikes WHERE community = ?1 GROUP BY subject ORDER BY MIN(at_ms)",
             )
             .map_err(|e| e.to_string())?;
-        Ok(n > 0)
+        let rows = stmt
+            .query_map(rusqlite::params![community], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        Ok(rows.flatten().collect())
     }
 
-    /// What a model said about this blob last time, if anything.
+    /// Has this member already been contained in this wave?
     ///
-    /// Keyed on the PLAINTEXT hash, so forty accounts posting one image cost a
-    /// single classification. The bytes themselves are never stored: a
-    /// moderation bot that fills a disk with the material it was hired to
-    /// remove is a liability.
+    /// A raid stays detected while its evidence sits in the window, so without
+    /// this every sweep re-contains — which for bans is a key rotation each
+    /// time. Expires, so next week's raid by the same accounts is a new event.
+    pub fn claim(&self, community: &str, key: &str, at_ms: u64, ttl_ms: u64) -> Result<bool, String> {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM actions WHERE community = ?1 AND subject = ?2 AND response = 'raid:claim' AND at_ms < ?3",
+            rusqlite::params![community, key, at_ms.saturating_sub(ttl_ms) as i64],
+        )
+        .map_err(|e| e.to_string())?;
+        let held: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM actions WHERE community = ?1 AND subject = ?2 AND response = 'raid:claim'",
+                rusqlite::params![community, key],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if held > 0 {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT INTO actions (community, subject, response, at_ms, evidence) VALUES (?1, ?2, 'raid:claim', ?3, '')",
+            rusqlite::params![community, key, at_ms as i64],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+
+    /// Give a claim back, so a containment that did nothing can be retried.
+    pub fn release(&self, community: &str, key: &str) -> Result<(), String> {
+        self.lock()
+            .execute(
+                "DELETE FROM actions WHERE community = ?1 AND subject = ?2 AND response = 'raid:claim'",
+                rusqlite::params![community, key],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// What a model said about this blob. Keyed on the plaintext hash, so forty
+    /// accounts posting one image cost a single call.
     pub fn cached_verdict(&self, content_hash: &str, model: &str) -> Option<String> {
         use rusqlite::OptionalExtension;
         self.lock()
@@ -461,36 +266,70 @@ impl Store {
     pub fn cache_verdict(&self, content_hash: &str, model: &str, verdict: &str, at_ms: u64) -> Result<(), String> {
         self.lock()
             .execute(
-                "INSERT OR REPLACE INTO classifications (content_hash, verdict, model, at_ms) VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![content_hash, verdict, model, at_ms as i64],
+                "INSERT OR REPLACE INTO classifications (content_hash, model, verdict, at_ms) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![content_hash, model, verdict, at_ms as i64],
             )
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
 
-    /// The one command that undoes: clear a member's strikes.
-    /// Everyone carrying a live strike here. The sweep's population is the
-    /// engine's convictions, which never include a vision-only offender or a
-    /// member whose live-lane strikes never lifted their engine score — so a
-    /// sentence those lanes could not carry out had nothing to retry it.
-    pub fn subjects_with_strikes(&self, community: &str, since_ms: u64) -> Result<Vec<String>, String> {
+    /// Note what is armed here, and wipe the slate when it changes.
+    ///
+    /// This is the whole reason there is one ledger. A rehearsal writes nothing
+    /// and arming starts clean, so nobody carries a backlog of sentences that
+    /// were never delivered into the run that would deliver them.
+    ///
+    /// True when the arming changed.
+    pub fn note_armed(&self, community: &str, classes: &str) -> Result<bool, String> {
+        use rusqlite::OptionalExtension;
         let conn = self.lock();
-        let mut stmt = conn
-            .prepare(
-                "SELECT subject FROM strikes WHERE community = ?1 AND at_ms >= ?2 AND pardoned = 0 \
-                 GROUP BY subject ORDER BY MIN(at_ms)",
-            )
+        let seen: Option<String> = conn
+            .query_row("SELECT classes FROM armed WHERE community = ?1", [community], |r| r.get(0))
+            .optional()
             .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map(rusqlite::params![community, since_ms as i64], |r| r.get::<_, String>(0))
+        let changed = seen.as_deref().is_some_and(|s| s != classes);
+        conn.execute(
+            "INSERT OR REPLACE INTO armed (community, classes) VALUES (?1, ?2)",
+            rusqlite::params![community, classes],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(changed)
+    }
+
+    /// Forget everything this community knows about its members.
+    ///
+    /// This is what arming does, and it is why there is only one ledger: a
+    /// rehearsal must not silence the run that follows it, and wiping is a
+    /// simpler answer than keeping two of everything.
+    pub fn forget(&self, community: &str) -> Result<(), String> {
+        let conn = self.lock();
+        conn.execute("DELETE FROM strikes WHERE community = ?1", [community]).map_err(|e| e.to_string())?;
+        conn.execute("DELETE FROM actions WHERE community = ?1", [community]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Clear one member's record. The undo an operator needs when Sentinel is
+    /// wrong about somebody.
+    pub fn pardon(&self, community: &str, subject: &str) -> Result<usize, String> {
+        let conn = self.lock();
+        let n = conn
+            .execute("DELETE FROM strikes WHERE community = ?1 AND subject = ?2", rusqlite::params![community, subject])
             .map_err(|e| e.to_string())?;
-        Ok(rows.flatten().collect())
+        conn.execute("DELETE FROM actions WHERE community = ?1 AND subject = ?2", rusqlite::params![community, subject])
+            .map_err(|e| e.to_string())?;
+        // A claim keys on a scoped form of the npub, so a bare match leaves it
+        // behind — and a pardoned member who keeps one can never be contained.
+        conn.execute(
+            "DELETE FROM actions WHERE community = ?1 AND response = 'raid:claim' \
+             AND (subject = ?2 OR subject LIKE '%:' || ?2)",
+            rusqlite::params![community, subject],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(n)
     }
 
     /// Drop what can no longer matter. A strike past 32 halvings is worth zero
-    /// and still costs a row in every total; an action older than that answered
-    /// for strikes that no longer exist. Unattended for months, this is the
-    /// difference between a working database and a growing one.
+    /// and still costs a row in every total.
     pub fn prune(&self, before_ms: u64) -> Result<usize, String> {
         let conn = self.lock();
         let a = conn
@@ -500,57 +339,6 @@ impl Store {
             .execute("DELETE FROM actions WHERE at_ms < ?1", [before_ms as i64])
             .map_err(|e| e.to_string())?;
         Ok(a + b)
-    }
-
-    /// Give a claim back, so a containment that did nothing can be retried
-    /// rather than marking those members handled forever.
-    pub fn release_cohort(&self, community: &str, fingerprint: &str) -> Result<(), String> {
-        self.lock()
-            .execute(
-                "DELETE FROM actions WHERE community = ?1 AND subject = ?2 AND response = 'raid:claim'",
-                rusqlite::params![community, fingerprint],
-            )
-            .map(|_| ())
-            .map_err(|e| e.to_string())
-    }
-
-    /// Clears strikes AND the action history. Leaving the history behind meant a
-    /// pardoned member stayed immune to every response up to whatever they had
-    /// already received — forgiven on paper, unreachable in practice.
-    pub fn pardon(&self, community: &str, subject: &str) -> Result<usize, String> {
-        let mut guard = self.lock();
-        // One unit: a half-applied pardon forgives on paper and leaves the
-        // member immune to everything below what they already received.
-        let conn = guard.transaction().map_err(|e| e.to_string())?;
-        // TOMBSTONED, not deleted. A conviction id is stable for as long as its
-        // evidence sits in the engine's window, so deleting the row let the very
-        // next sweep re-insert it — stamped at `now`, which made the strikes
-        // YOUNGER and the decayed total HIGHER than before the pardon. The one
-        // control an operator needs when a bot misbehaves lasted one poll and
-        // came back stronger.
-        let n = conn
-            .execute(
-                "UPDATE strikes SET pardoned = 1 WHERE community = ?1 AND subject = ?2 AND pardoned = 0",
-                rusqlite::params![community, subject],
-            )
-            .map_err(|e| e.to_string())?;
-        conn.execute("DELETE FROM actions WHERE community = ?1 AND subject = ?2", rusqlite::params![community, subject])
-            .map_err(|e| e.to_string())?;
-        // Claims key on a scoped form of the npub, so a bare subject match
-        // leaves them behind — and a pardoned member who keeps a raid claim can
-        // never be contained again.
-        conn.execute(
-            // Any scope, however it was keyed. Hardcoded prefixes went stale
-            // twice: a claim nothing could clear meant a pardoned member could
-            // never be contained again inside the TTL. npubs are bech32, so
-            // there are no LIKE metacharacters to escape.
-            "DELETE FROM actions WHERE community = ?1 AND response = 'raid:claim' \
-             AND (subject = ?2 OR subject LIKE '%:' || ?2)",
-            rusqlite::params![community, subject],
-        )
-        .map_err(|e| e.to_string())?;
-        conn.commit().map_err(|e| e.to_string())?;
-        Ok(n)
     }
 }
 
@@ -569,17 +357,115 @@ pub mod tests {
     #[test]
     fn a_reported_conviction_lands_once_however_often_it_echoes() {
         let s = mem();
-        assert!(s.record("c", "npub1a", "conv1", 2, 1000, "swore", "p1").unwrap());
+        assert!(s.record("c", "npub1a", "conv1", 2, 1000, "swore").unwrap());
         for _ in 0..5 {
-            assert!(!s.record("c", "npub1a", "conv1", 2, 1000, "swore", "p1").unwrap());
+            assert!(!s.record("c", "npub1a", "conv1", 2, 1000, "swore").unwrap());
         }
         assert_eq!(s.strikes("c", "npub1a").unwrap().len(), 1);
-        // A rung escalation mints a new conviction id, and THAT lands.
-        assert!(s.record("c", "npub1a", "conv1-rung2", 2, 2000, "kept swearing", "p1").unwrap());
+        // A rung escalation mints a new id, and THAT lands.
+        assert!(s.record("c", "npub1a", "conv1-rung2", 2, 2000, "kept swearing").unwrap());
         assert_eq!(s.strikes("c", "npub1a").unwrap().len(), 2);
     }
 
-    /// A raid of one image is one classification, not forty.
+    #[test]
+    fn strikes_are_scoped_to_their_community() {
+        let s = mem();
+        s.record("c1", "npub1a", "conv1", 4, 0, "").unwrap();
+        assert!(s.strikes("c2", "npub1a").unwrap().is_empty(), "a strike elsewhere is not a strike here");
+    }
+
+    /// Ordering by time let a later, lesser response reopen a member to
+    /// everything above it.
+    #[test]
+    fn the_strongest_response_wins_not_the_latest() {
+        let s = mem();
+        s.log_action("c", "npub1a", "kick", 1000, "").unwrap();
+        s.log_action("c", "npub1a", "warn", 2000, "").unwrap();
+        assert_eq!(s.strongest_response("c", "npub1a").unwrap().as_deref(), Some("kick"));
+    }
+
+    /// Raid rows share the table and must never read as a ladder response: an
+    /// unarmed raid stamping "kick" on every suspect would immunise all of them.
+    #[test]
+    fn a_raid_row_is_not_a_ladder_response() {
+        let s = mem();
+        s.log_action("c", "npub1a", "raid:kick", 0, "").unwrap();
+        assert_eq!(s.strongest_response("c", "npub1a").unwrap(), None);
+        assert_eq!(s.actions_last_hour("c", 1000).unwrap(), 0, "and answers to its own bound");
+    }
+
+    #[test]
+    fn a_claim_holds_for_its_wave_and_expires_with_it() {
+        let s = mem();
+        let ttl = 10_000u64;
+        assert!(s.claim("c", "kick:npub1a", 0, ttl).unwrap(), "the first claim wins");
+        assert!(!s.claim("c", "kick:npub1a", 5_000, ttl).unwrap(), "and holds inside the wave");
+        assert!(s.claim("c", "kick:npub1b", 0, ttl).unwrap(), "another member is their own claim");
+        assert!(s.claim("c", "kick:npub1a", 20_000, ttl).unwrap(), "next week's raid is a new event");
+        assert_eq!(s.strongest_response("c", "kick:npub1a").unwrap(), None, "a claim is not a response");
+    }
+
+    #[test]
+    fn a_pardon_clears_everything_including_a_claim() {
+        let s = mem();
+        s.record("c", "npub1a", "x", 4, 0, "").unwrap();
+        s.log_action("c", "npub1a", "kick", 0, "").unwrap();
+        s.claim("c", "kick:npub1a", 0, 10_000).unwrap();
+
+        assert_eq!(s.pardon("c", "npub1a").unwrap(), 1);
+        assert!(s.strikes("c", "npub1a").unwrap().is_empty());
+        assert_eq!(
+            s.strongest_response("c", "npub1a").unwrap(),
+            None,
+            "a pardoned member who kept a kick on file could only ever be banned next"
+        );
+        assert!(s.claim("c", "kick:npub1a", 0, 10_000).unwrap(), "and is containable again");
+    }
+
+    /// Arming wipes the slate, which is the whole reason there is one ledger.
+    #[test]
+    fn a_change_of_arming_is_noticed_once() {
+        let s = mem();
+        assert!(!s.note_armed("c", "warn").unwrap(), "the first sight of a config is not a change");
+        assert!(!s.note_armed("c", "warn").unwrap(), "and neither is seeing it again");
+        assert!(s.note_armed("c", "warn kick").unwrap(), "arming a class is");
+        assert!(s.note_armed("c", "warn").unwrap(), "and so is disarming one");
+        assert!(!s.note_armed("other", "warn").unwrap(), "per community");
+    }
+
+    #[test]
+    fn forgetting_a_community_clears_its_slate() {
+        let s = mem();
+        s.record("c", "npub1a", "x", 4, 0, "rehearsed").unwrap();
+        s.log_action("c", "npub1a", "warn", 0, "").unwrap();
+        s.record("other", "npub1b", "y", 4, 0, "").unwrap();
+
+        s.forget("c").unwrap();
+        assert!(s.strikes("c", "npub1a").unwrap().is_empty());
+        assert_eq!(s.strongest_response("c", "npub1a").unwrap(), None);
+        assert_eq!(s.strikes("other", "npub1b").unwrap().len(), 1, "and only that community");
+    }
+
+    #[test]
+    fn every_subject_with_a_strike_is_reachable() {
+        let s = mem();
+        s.record("c", "npub1a", "x", 4, 9_000, "").unwrap();
+        s.record("c", "npub1a", "y", 4, 9_000, "").unwrap();
+        s.record("other", "npub1c", "w", 4, 9_000, "").unwrap();
+        assert_eq!(s.subjects_with_strikes("c").unwrap(), vec!["npub1a"], "distinct, in this community");
+    }
+
+    #[test]
+    fn the_hourly_bounds_are_scoped_per_community() {
+        let s = mem();
+        s.log_action("c", "npub1a", "warn", 1000, "").unwrap();
+        s.log_action("other", "npub1b", "kick", 1000, "").unwrap();
+        assert_eq!(s.actions_last_hour("c", 2000).unwrap(), 1, "another community's wave does not starve this one");
+        assert_eq!(s.actions_last_hour("c", 3_700_000 + 1000).unwrap(), 0, "and the hour rolls off");
+        assert_eq!(s.subjects_actioned_last_hour("c", 2000, "npub1a").unwrap(), 0, "the judged member is excluded");
+        assert_eq!(s.subjects_actioned_last_hour("c", 2000, "someone-else").unwrap(), 1);
+    }
+
     #[test]
     fn a_blob_is_classified_once_per_model() {
         let s = mem();
@@ -590,200 +476,12 @@ pub mod tests {
     }
 
     #[test]
-    fn strikes_are_scoped_to_their_community() {
-        let s = mem();
-        s.record("c1", "npub1a", "conv1", 4, 0, "", "p1").unwrap();
-        assert!(s.strikes("c2", "npub1a").unwrap().is_empty(), "a strike elsewhere is not a strike here");
-    }
-
-    #[test]
-    fn pardon_clears_the_history_too_or_forgiveness_is_only_on_paper() {
-        let s = mem();
-        s.record("c", "npub1a", "x", 4, 0, "", "p1").unwrap();
-        s.log_action("c", "npub1a", "kick", false, 0, "").unwrap();
-        assert_eq!(s.pardon("c", "npub1a").unwrap(), 1);
-        assert!(s.strikes("c", "npub1a").unwrap().is_empty());
-
-        // The producer re-reports the same conviction all week. A deleted row
-        // would be re-inserted at `now` — younger, so the total comes back
-        // HIGHER than it was before the pardon.
-        assert!(!s.record("c", "npub1a", "x", 4, 5_000, "", "p1").unwrap(), "a pardoned strike does not return");
-        assert!(s.strikes("c", "npub1a").unwrap().is_empty(), "and stays gone");
-        // A genuinely new offense still lands.
-        assert!(s.record("c", "npub1a", "y", 4, 5_000, "", "p1").unwrap());
-        assert_eq!(s.strikes("c", "npub1a").unwrap().len(), 1);
-        assert_eq!(
-            s.strongest_response("c", "npub1a", false, 0).unwrap(),
-            None,
-            "a pardoned member who kept a 'kick' on file could only ever be banned next"
-        );
-    }
-
-    #[test]
-    fn the_hourly_ceiling_is_scoped_by_community_and_armed_ness() {
-        let s = mem();
-        s.log_action("c", "npub1a", "warn", true, 1000, "").unwrap();
-        s.log_action("c", "npub1a", "warn", false, 1000, "").unwrap();
-        assert_eq!(s.actions_last_hour("c", false, 2000).unwrap(), 1, "real actions");
-        assert_eq!(s.actions_last_hour("c", true, 2000).unwrap(), 1, "and rehearsals bound rehearsals");
-        assert_eq!(s.actions_last_hour("c", false, 3_700_000 + 1000).unwrap(), 0, "the hour rolls off");
-        s.log_action("other", "npub1b", "kick", false, 1000, "").unwrap();
-        assert_eq!(s.actions_last_hour("c", false, 2000).unwrap(), 1, "another community's wave does not starve this one");
-        s.log_action("c", "npub1c", "raid:kick", false, 1000, "").unwrap();
-        assert_eq!(s.actions_last_hour("c", false, 2000).unwrap(), 1, "raid rows answer to their own bound");
-        assert_eq!(s.raid_actions_last_hour("c", false, 2000).unwrap(), 1, "and that bound counts them");
-        // A failure is not an action taken. Counting it let four undeliverable
-        // warnings spend the whole community's hourly budget.
-        s.log_action("c", "npub1e", "failed:warn", false, 1000, "").unwrap();
-        assert_eq!(s.actions_last_hour("c", false, 2000).unwrap(), 1, "a failure spends no budget");
-        assert_eq!(s.failure_span("c", "npub1e", "warn", 0).unwrap(), (1, Some(1000), Some(1000)), "counted for backoff");
-        assert_eq!(s.failure_span("c", "npub1e", "kick", 0).unwrap(), (0, None, None), "per response");
-        assert!(!s.has_delivered("c", "npub1e", 0).unwrap(), "a failure is not a delivery");
-        assert!(s.has_delivered("c", "npub1a", 0).unwrap(), "a real action is");
-        s.claim_cohort("c", "live:npub1d", 1000, 10_000).unwrap();
-        assert_eq!(s.raid_actions_last_hour("c", false, 2000).unwrap(), 1, "a claim is not a containment");
-    }
-
-    /// The trap this replaced: a day of dry running marked everyone as already
-    /// answered, so arming the bot did nothing for any of them.
-    #[test]
-    fn a_rehearsal_only_dedups_rehearsals() {
-        let s = mem();
-        s.log_action("c", "npub1a", "warn", true, 1000, "").unwrap();
-        assert_eq!(s.strongest_response("c", "npub1a", true, 0).unwrap().as_deref(), Some("warn"));
-        assert_eq!(s.strongest_response("c", "npub1a", false, 0).unwrap(), None, "arming starts clean");
-    }
-
-    /// Ordering by time let a later, lesser response reopen a member to
-    /// everything above it.
-    #[test]
-    fn the_strongest_response_wins_not_the_latest() {
-        let s = mem();
-        s.log_action("c", "npub1a", "kick", false, 1000, "").unwrap();
-        s.log_action("c", "npub1a", "warn", false, 2000, "").unwrap();
-        assert_eq!(s.strongest_response("c", "npub1a", false, 0).unwrap().as_deref(), Some("kick"));
-        // And an answer older than the strikes it answered is not an answer.
-        assert_eq!(s.strongest_response("c", "npub1a", false, 5000).unwrap(), None, "stale responses expire");
-    }
-
-    /// Raid rows share the actions table and must never be read as a ladder
-    /// response: an unarmed raid stamping 'kick' on every suspect would
-    /// immunise all of them against warn, delete and kick, permanently.
-    #[test]
-    fn every_subject_with_a_live_strike_is_reachable() {
-        let s = mem();
-        s.record("c", "npub1a", "x", 4, 9_000, "", "p1").unwrap();
-        s.record("c", "npub1a", "y", 4, 9_000, "", "p1").unwrap();
-        s.record("c", "npub1b", "z", 4, 1_000, "", "p1").unwrap();
-        s.record("other", "npub1c", "w", 4, 9_000, "", "p1").unwrap();
-        let mut who = s.subjects_with_strikes("c", 5_000).unwrap();
-        who.sort();
-        assert_eq!(who, vec!["npub1a"], "distinct, in this community, inside the horizon");
-    }
-
-    /// A rulebook change forgives only what THAT rulebook minted, and leaves
-    /// the ladder floor alone.
-    ///
-    /// Guessing from the id shape spared Sentinel's own stable ids while
-    /// deleting the whole community's action history — so every member with
-    /// word or media strikes kept their total, lost every answer already
-    /// given, and was walked up the ladder again from a warning.
-    #[test]
-    fn retiring_a_rulebook_forgives_only_its_own_strikes() {
-        let s = mem();
-        s.record("c", "npub1a", "engine1", 4, 0, "", "p1").unwrap();
-        // Sentinel's own ids are stable and carry no rulebook, so they are
-        // stamped '' and must survive: the id is identical next pass, so a
-        // tombstone erases that conviction for good.
-        s.record("c", "npub1a", "msg:slurs:evt1", 4, 0, "", "").unwrap();
-        s.record("c", "npub1a", "vision:hash1:gore", 4, 0, "", "").unwrap();
-        s.record("c", "npub1a", "engine2", 4, 0, "", "p2").unwrap();
-        s.log_action("c", "npub1a", "kick", false, 0, "").unwrap();
-
-        assert_eq!(s.retire_policy("c", "p2").unwrap(), 1, "only what the retired rulebook keyed");
-        assert_eq!(s.strikes("c", "npub1a").unwrap().len(), 3, "the stable ids survive");
-        // And an edit that reverts must not leave everyone permanently at zero.
-        s.record("c", "npub1a", "engine1", 4, 0, "", "p1").unwrap();
-        assert_eq!(s.strikes("c", "npub1a").unwrap().len(), 4, "a retired conviction can be charged again");
-        assert_eq!(
-            s.strongest_response("c", "npub1a", false, 0).unwrap().as_deref(),
-            Some("kick"),
-            "the ladder floor is not an amnesty's business"
-        );
-    }
-
-    /// An upgrade must not forgive a community's history as a side effect of
-    /// shipping. Rows written before the column existed carry '' and are never
-    /// retired.
-    /// Provenance rides the id, so the rows that built a total also say which
-    /// of them lean on a model's opinion.
-    #[test]
-    fn a_strike_says_whether_it_came_from_a_model() {
-        let s = mem();
-        s.record("c", "npub1a", "vision:hash1:gore", 4, 0, "", "").unwrap();
-        s.record("c", "npub1a", "msg:slurs:evt1", 4, 0, "", "").unwrap();
-        let rows = s.strikes("c", "npub1a").unwrap();
-        assert_eq!(rows.iter().filter(|r| r.from_vision).count(), 1, "the media one");
-        assert_eq!(rows.iter().filter(|r| !r.from_vision).count(), 1, "and the text one");
-    }
-
-    /// An upgrade adopts the rulebook in force for rows written before the
-    /// stamp existed — once, and never for Sentinel's own ids, which is the
-    /// invariant that makes re-running it harmless.
-    #[test]
-    fn an_upgrade_adopts_the_rulebook_but_never_sentinels_own_ids() {
-        let s = mem();
-        s.record("c", "npub1a", "deadbeefcafe", 4, 0, "", "").unwrap();
-        s.record("c", "npub1a", "msg:slurs:evt1", 4, 0, "", "").unwrap();
-        s.record("c", "npub1a", "vision:hash1:gore", 4, 0, "", "").unwrap();
-
-        assert_eq!(s.adopt_unstamped("c", "p1").unwrap(), 1, "the engine row only");
-        assert_eq!(s.adopt_unstamped("c", "p2").unwrap(), 0, "and once");
-        assert_eq!(s.retire_policy("c", "p2").unwrap(), 1, "so the next edit retires it");
-        assert_eq!(s.strikes("c", "npub1a").unwrap().len(), 2, "and the stable ids survive that edit");
-    }
-
-    #[test]
-    fn strikes_from_before_the_stamp_are_never_retired() {
-        let s = mem();
-        s.record("c", "npub1a", "old", 4, 0, "", "").unwrap();
-        assert_eq!(s.retire_policy("c", "p1").unwrap(), 0);
-        assert_eq!(s.strikes("c", "npub1a").unwrap().len(), 1);
-    }
-
-    #[test]
     fn prune_drops_what_can_no_longer_matter() {
         let s = mem();
-        s.record("c", "npub1a", "old", 4, 1_000, "", "p1").unwrap();
-        s.record("c", "npub1a", "new", 4, 9_000, "", "p1").unwrap();
-        s.log_action("c", "npub1a", "warn", false, 1_000, "").unwrap();
+        s.record("c", "npub1a", "old", 4, 1_000, "").unwrap();
+        s.record("c", "npub1a", "new", 4, 9_000, "").unwrap();
+        s.log_action("c", "npub1a", "warn", 1_000, "").unwrap();
         assert_eq!(s.prune(5_000).unwrap(), 2, "one strike and one action");
         assert_eq!(s.strikes("c", "npub1a").unwrap().len(), 1, "the live one stays");
-    }
-
-    #[test]
-    fn a_raid_claim_is_not_a_ladder_response() {
-        let s = mem();
-        let ttl = 10_000u64;
-        assert!(s.claim_cohort("c", "live:npub1a", 0, ttl).unwrap(), "the first claim wins");
-        assert!(!s.claim_cohort("c", "live:npub1a", 5_000, ttl).unwrap(), "and holds inside the wave");
-        assert!(s.claim_cohort("c", "live:npub1b", 0, ttl).unwrap(), "another member is their own claim");
-        // Next week's raid by the same accounts is a NEW event.
-        assert!(s.claim_cohort("c", "live:npub1a", 20_000, ttl).unwrap(), "a claim expires with its wave");
-        // A rehearsal never immunises a later real containment.
-        assert!(s.claim_cohort("c", "dry:npub1a", 20_000, ttl).unwrap());
-        assert_eq!(s.strongest_response("c", "live:npub1a", false, 0).unwrap(), None, "a claim is not a response");
-    }
-
-    #[test]
-    fn a_pardon_clears_a_raid_claim_however_it_was_scoped() {
-        let s = mem();
-        // The scope `contain` actually mints today.
-        s.claim_cohort("c", "armed:kick:npub1a", 0, 10_000).unwrap();
-        s.pardon("c", "npub1a").unwrap();
-        assert!(
-            s.claim_cohort("c", "armed:kick:npub1a", 0, 10_000).unwrap(),
-            "a pardoned member is containable again, whatever scope claimed them"
-        );
     }
 }

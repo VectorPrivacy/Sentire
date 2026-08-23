@@ -12,23 +12,6 @@ use crate::policy::CommunityPolicy;
 /// re-running the compile replaces it rather than stacking copies.
 pub const POLICY_ID: &str = "sentinel";
 
-/// This community's rulebook, as one short string. Stamped on every strike so
-/// an amnesty is a fact about the row rather than an inference from its shape.
-pub fn fingerprint(cfg: &crate::config::Config, community_id: &str) -> String {
-    let rules = cfg.for_community(community_id).rules;
-    format!("{:016x}", fnv(&format!("{rules:?}")))
-}
-
-/// FNV-1a. Only needs to notice a change.
-fn fnv(s: &str) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in s.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100_0000_01b3);
-    }
-    h
-}
-
 fn seriousness(g: Gravity) -> Seriousness {
     match g {
         Gravity::Note => Seriousness::Notice,
@@ -79,11 +62,7 @@ pub fn compile(cfg: &CommunityPolicy) -> Option<Policy> {
 }
 
 /// Install the compiled rulebook into one community's local policy store.
-pub async fn install(
-    community: &Community,
-    cfg: &crate::config::Config,
-    store: &crate::store::Store,
-) -> Result<&'static str, String> {
+pub async fn install(community: &Community, cfg: &crate::config::Config) -> Result<&'static str, String> {
     // The COMMUNITY's rulebook, not the defaults. Installing the top-level one
     // everywhere meant a community's own `[rules]` override changed how
     // findings were scored while the engine went on matching somebody else's
@@ -91,19 +70,6 @@ pub async fn install(
     match compile(&cfg.for_community(community.id())) {
         Some(policy) => {
             community.policies().set(POLICY_ID, policy).await.map_err(|e| e.to_string())?;
-            // Retire whatever an older rulebook minted. Strikes carry the hash
-            // they were charged under, so this is a fact rather than a guess —
-            // and an upgrade that changes the hashing cannot forgive a
-            // community's history as a side effect, because rows written before
-            // the stamp existed carry '' and are never retired.
-            let fp = fingerprint(cfg, community.id());
-            // Rows from before the stamp adopt the rulebook in force, once, so
-            // the first edit after this release does not double-charge them.
-            store.adopt_unstamped(community.id(), &fp)?;
-            let retired = store.retire_policy(community.id(), &fp)?;
-            if retired > 0 {
-                return Ok("rulebook changed — strikes it minted forgiven");
-            }
             Ok("installed")
         }
         None => {
@@ -112,16 +78,6 @@ pub async fn install(
             // and still convicting — and a swallowed failure here left it
             // installed AND its strikes forgiven, which is the worst of both.
             community.policies().delete(POLICY_ID).await.map_err(|e| e.to_string())?;
-            // Retire what an old rulebook minted, or emptying `[rules]` — the
-            // obvious way to stop a misbehaving bot — leaves the debt loop
-            // climbing the ladder on strikes nothing can convict for any more.
-            //
-            // `""` is not a rulebook, so this is a no-op unless something was
-            // actually stamped: a default config on every boot forgives nobody.
-            let retired = store.retire_policy(community.id(), "")?;
-            if retired > 0 {
-                return Ok("no custom rules — the old rulebook's strikes forgiven");
-            }
             Ok("no custom rules — built-in raid defaults only")
         }
     }

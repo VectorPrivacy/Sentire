@@ -49,7 +49,6 @@ pub struct ArmOverride {
     pub kick: Option<bool>,
     pub ban: Option<bool>,
     pub raid: Option<bool>,
-    pub vision: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -121,7 +120,6 @@ impl Config {
                 kick: f(a.kick, p.arm.kick),
                 ban: f(a.ban, p.arm.ban),
                 raid: f(a.raid, p.arm.raid),
-                vision: f(a.vision, p.arm.vision),
             };
         }
         if let Some(l) = &o.limits {

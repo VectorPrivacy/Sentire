@@ -77,25 +77,18 @@ a member escalates once, not twice.
    week apart do not.
 4. The running total meets the **ladder**, and Sentinel answers with the next rung up from
    whatever that member last received: warn, delete and warn, kick, ban. It climbs rather
-   than jumping, so a member who accrued enough for a ban while Sentinel was rehearsing
-   still gets warned first.
+   than jumping, so a member who accrued enough for a ban in one burst still gets warned
+   first. Arming a class wipes that community's slate, so nobody carries a rehearsed backlog
+   into the run that would deliver it.
 
-   Each rung is asked about the space it would be recorded in, so an `[arm]` block that arms
-   some classes and not others still climbs. A rung this community grants no permission for
-   is skipped rather than blocking the ones above it, and a rung that keeps failing to
-   deliver is given up on — but only after it has failed over time, and never in a way that
-   unlocks a kick or ban against someone nothing has ever reached.
+   A rung this community grants no permission for is skipped rather than blocking the ones
+   above it. Arming has to go bottom-up — arming `kick` while `warn` is off is refused at
+   startup, because an unarmed rung is never answered and the ladder would rehearse it
+   forever without ever reaching the armed one.
 
-Strikes carry whether they were charged on something replayable or on a model's opinion, and
-the total is split accordingly: a rung the **provable** points already reach is answered under
-the ordinary switches, while a rung only the full total reaches leans on inference and answers
-to `[arm] vision`. So one flagged image cannot make a member immune to being answered for
-everything else, and a total that only reaches a ban because a classifier said so is not
-carried out as though it were proven.
-
-Only *proven* convictions earn strikes from the engine, on either clock. Inference is reported and never
-sentenced — except where an operator arms it explicitly (`[arm] raid`, `[arm] vision`), which
-is a decision made in writing rather than inherited from a switch meant for something else.
+Only *proven* convictions earn strikes from the engine, on either clock. Windowed inference is
+reported to the mod channel for a person to answer, never sentenced — except raid containment,
+which an operator arms explicitly with `[arm] raid`.
 
 ## One decision, four lanes
 
@@ -145,7 +138,8 @@ community's keys, and forty rotations strand everyone.
 
 Optional, off by default. When `[vision] enabled` is set, Sentinel decrypts attachments as
 they arrive, asks a vision model to score them against labels you named, and feeds anything
-over its threshold into the same strike ladder as everything else.
+over its threshold into the same strike ladder as everything else. Images and video both, by
+whatever `[vision] mimes` lists.
 
 llama.cpp's `llama-server` speaks the OpenAI-compatible shape out of the box, so local is the
 default and remote is the same block with a different `base_url`. That switch is deliberate:
@@ -155,7 +149,8 @@ somebody else's server, so `allow_remote` has to be set on purpose or startup re
 Three rules this lane keeps:
 
 - **A model's verdict is Sentinel's opinion, not the engine's.** It never reaches `proven`,
-  never enters the combinator, and never appears in another client's report.
+  never enters the combinator, and never appears in another client's report — but within
+  Sentinel it is the answer. If the model says it breaks a rule, it breaks a rule.
 - **Unknown is not clean.** A timeout, a refusal or a malformed answer routes to a human. An
   unreachable model is a reason to ask, never a reason to let everything through.
 - **The bytes are never kept.** Classification happens in memory; only the content hash and
@@ -174,14 +169,10 @@ must survive as tombstones because the engine re-reports the same convictions fo
 the evidence sits in its window, and the history must go because a forgiven member who kept it
 stays immune to every response below the one they already received.
 
-Editing `[rules]` forgives the strikes that rulebook minted — the engine's window-scoped
-convictions, and only those. The engine keys its
-window-scoped convictions on the rulebook, so a change re-reports them under fresh ids, and
-charging both copies would roughly double every total. Each such strike carries the rulebook it was charged under, so the amnesty is a fact about
-the row rather than a guess from its shape. Sentinel's own convictions — a screened message,
-a classified image — carry no rulebook and are never forgiven by an edit: their ids are
-stable, so a tombstone would erase them for good. The ladder floor is left alone too, because
-an amnesty on the evidence is not an amnesty on the answers already given.
+Changing what is armed in `[arm]` wipes that community's slate. Rehearsals and real actions
+share one ledger, so the alternative is every read having to know which of two spaces a row
+came from — and getting that wrong is silent. A wipe is one line and the question never
+arises.
 
 ## Proven vs unproven
 
@@ -192,8 +183,10 @@ happening and nobody else could replay it. *Proven* evidence is byte-checkable b
 client holding the same policy and history. *Unproven* evidence is a judgement about a
 pattern, true only of the window it was measured over.
 
-Inference may not sentence. Who the second judge is — a person, a model, Sentinel's own
-ruleset — is a choice, and Sentinel exists to make it deliberately.
+Engine inference does not sentence: a windowed heuristic is reported to the mod channel for a
+person to answer. Sentinel's own lanes are a different matter. When the model says an image or
+video breaks a rule, that is the answer — it earns a strike and climbs the ladder like any
+other offense.
 
 ## Coverage is not a detail
 

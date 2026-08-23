@@ -35,8 +35,9 @@ pub enum Verdict {
 
 #[allow(async_fn_in_trait)]
 pub trait Vision {
-    /// Classify decrypted bytes. `mime` comes from the content itself, never
-    /// from a filename an uploader chose.
+    /// Classify decrypted bytes — an image, a video, whatever the operator
+    /// listed. `mime` comes from the content itself, never from a filename an
+    /// uploader chose, and the model decides whether it can read it.
     async fn classify(&self, bytes: &[u8], mime: &str) -> Verdict;
     fn model(&self) -> &str;
 }

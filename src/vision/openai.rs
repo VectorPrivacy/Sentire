@@ -23,9 +23,9 @@ pub struct OpenAiVision {
 /// tunes their community's standards, and a prompt they cannot read is a rule
 /// they cannot audit.
 pub const PROMPT: &str = "\
-You are an image classifier for a chat moderation system. Look at the image and \
-answer ONLY with a JSON object mapping each of these labels to a confidence from \
-0.0 to 1.0, with no prose and no code fence: ";
+You are a media classifier for a chat moderation system. Look at the attachment \
+and answer ONLY with a JSON object mapping each of these labels to a confidence \
+from 0.0 to 1.0, with no prose and no code fence: ";
 
 impl OpenAiVision {
     pub fn new(cfg: VisionCfg) -> Result<Self, String> {
@@ -57,6 +57,9 @@ impl Vision for OpenAiVision {
                 "role": "user",
                 "content": [
                     { "type": "text", "text": format!("{PROMPT}{}", self.labels_asked()) },
+                    // Every type goes out the same way. An endpoint that cannot
+                    // read a video answers with an error, which reads as
+                    // unjudged rather than clean.
                     { "type": "image_url", "image_url": { "url": data_uri } }
                 ]
             }]
@@ -122,9 +125,8 @@ pub fn parse_labels(text: &str) -> Option<Vec<Label>> {
         .iter()
         .filter_map(|(k, v)| v.as_f64().map(|s| Label { name: k.clone(), score: s.clamp(0.0, 1.0) as f32 }))
         .collect();
-    // An answer we could only PARTLY read is not a clean one. `{"gore": "high"}`
-    // used to filter down to an empty list, which the caller reads as Clean and
-    // caches forever.
+    // An answer we could only PARTLY read is not a clean one: `{"gore": "high"}`
+    // would otherwise filter to an empty list, which reads as Clean and caches.
     if labels.len() != map.len() {
         return None;
     }

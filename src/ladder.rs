@@ -8,33 +8,15 @@ use crate::config::{Ladder, Response};
 pub struct Strike {
     pub worth: u32,
     pub at_ms: u64,
-    /// Charged on a model's opinion rather than something replayable.
-    pub from_vision: bool,
 }
 
 /// The decayed total: each strike is worth half after the half-life, a quarter
 /// after two, never negative and never rounded up. Forgiveness is built in
 /// rather than being a pardon someone has to remember to issue.
 pub fn total(strikes: &[Strike], now_ms: u64, half_life_hours: u64) -> u32 {
-    weigh(strikes, now_ms, half_life_hours, |_| true)
-}
-
-/// The part of the total that survives replay: no model's opinion in it.
-///
-/// Provenance is a property of each STRIKE, not of the member. A boolean taint
-/// meant one flagged image disarmed every response against them — the worse the
-/// offense, the more immune they became — while a taint that expired sooner
-/// than the strike still counting meant a total only inference could reach was
-/// carried out under the text switches.
-pub fn provable_total(strikes: &[Strike], now_ms: u64, half_life_hours: u64) -> u32 {
-    weigh(strikes, now_ms, half_life_hours, |s| !s.from_vision)
-}
-
-fn weigh(strikes: &[Strike], now_ms: u64, half_life_hours: u64, keep: impl Fn(&Strike) -> bool) -> u32 {
     let half_life_ms = half_life_hours.saturating_mul(3_600_000);
     strikes
         .iter()
-        .filter(|s| keep(s))
         .map(|s| {
             let age = now_ms.saturating_sub(s.at_ms);
             // Integer halvings: cheap, monotone, and exact at the boundaries.
@@ -60,18 +42,17 @@ pub fn decide(ladder: &Ladder, total: u32) -> Option<Response> {
 /// first observed offense is a grave one. Climbing one rung per answer means
 /// every step is actually delivered, and a total that keeps rising keeps
 /// climbing.
-/// `answered_at` is asked PER RUNG, because whether a rung has been answered
-/// depends on the space it would be recorded in — and an `[arm]` block that is
-/// not uniform puts different rungs in different spaces. A single prior, looked
-/// up once with a guessed armed-ness, read the wrong space for half the ladder
-/// and proposed a rung that was always already answered.
-pub fn next_step<E>(
+/// One ledger, so one prior: the rung above whatever they last received, no
+/// higher than their total has earned, skipping anything this community grants
+/// no permission to deliver.
+pub fn next_step(
     ladder: &Ladder,
     total: u32,
-    answered_at: impl Fn(Response) -> Result<Option<String>, E>,
+    already: Option<&str>,
     can_deliver: impl Fn(Response) -> bool,
-) -> Result<Option<Response>, E> {
-    let Some(reached) = decide(ladder, total) else { return Ok(None) };
+) -> Option<Response> {
+    let reached = decide(ladder, total)?;
+    let floor = already.map(Response::rank_of).unwrap_or(0);
     // The OPERATOR's rungs, in order, deduped. Walking every Response meant a
     // ladder of `[warn, ban]` still delivered a delete and a kick, and a
     // one-step `[ban]` ladder took four passes to get there.
@@ -88,12 +69,11 @@ pub fn next_step<E>(
         if !can_deliver(r) {
             continue;
         }
-        let prior = answered_at(r)?;
-        if prior.as_deref().map(Response::rank_of).unwrap_or(0) < r.rank() {
-            return Ok(Some(r));
+        if floor < r.rank() {
+            return Some(r);
         }
     }
-    Ok(None)
+    None
 }
 
 #[cfg(test)]
@@ -104,9 +84,6 @@ mod tests {
     /// Arming after a rehearsal used to fire the whole backlog at the top rung,
     /// so a member accumulated to Ban was banned without ever being warned.
     /// Every rung the same answer, which is what a uniform `[arm]` block gives.
-    fn flat(answer: Option<&str>) -> impl Fn(Response) -> Result<Option<String>, ()> + '_ {
-        move |_| Ok(answer.map(String::from))
-    }
 
     fn all_powers(_: Response) -> bool {
         true
@@ -116,36 +93,19 @@ mod tests {
     fn the_ladder_is_climbed_one_rung_at_a_time() {
         let l = ladder();
         // Twelve points reaches Ban, but the first answer is still a warning.
-        assert_eq!(next_step(&l, 12, flat(None), all_powers), Ok(Some(Response::Warn)));
-        assert_eq!(next_step(&l, 12, flat(Some("warn")), all_powers), Ok(Some(Response::DeleteAndWarn)));
-        assert_eq!(next_step(&l, 12, flat(Some("delete_and_warn")), all_powers), Ok(Some(Response::Kick)));
-        assert_eq!(next_step(&l, 12, flat(Some("kick")), all_powers), Ok(Some(Response::Ban)));
-        assert_eq!(next_step(&l, 12, flat(Some("ban")), all_powers), Ok(None), "nothing above the top");
+        assert_eq!(next_step(&l, 12, None, all_powers), Some(Response::Warn));
+        assert_eq!(next_step(&l, 12, Some("warn"), all_powers), Some(Response::DeleteAndWarn));
+        assert_eq!(next_step(&l, 12, Some("delete_and_warn"), all_powers), Some(Response::Kick));
+        assert_eq!(next_step(&l, 12, Some("kick"), all_powers), Some(Response::Ban));
+        assert_eq!(next_step(&l, 12, Some("ban"), all_powers), None, "nothing above the top");
 
         // And it never climbs past what the total has actually earned.
-        assert_eq!(next_step(&l, 4, flat(Some("warn")), all_powers), Ok(Some(Response::DeleteAndWarn)));
-        assert_eq!(next_step(&l, 4, flat(Some("delete_and_warn")), all_powers), Ok(None), "four points is not a kick");
-        assert_eq!(next_step(&l, 0, flat(None), all_powers), Ok(None), "and a clean member answers to nothing");
+        assert_eq!(next_step(&l, 4, Some("warn"), all_powers), Some(Response::DeleteAndWarn));
+        assert_eq!(next_step(&l, 4, Some("delete_and_warn"), all_powers), None, "four points is not a kick");
+        assert_eq!(next_step(&l, 0, None, all_powers), None, "and a clean member answers to nothing");
 
         // An unrecognised prior ranks 0, so it never blocks the first rung.
-        assert_eq!(next_step(&l, 12, flat(Some("raid:kick")), all_powers), Ok(Some(Response::Warn)));
-    }
-
-    /// The case a single guessed lookup could not express: `[arm]` with warn
-    /// off and kick on puts those two rungs in different `dry` spaces, so each
-    /// has its own idea of what has been answered. Asking once wedged the
-    /// ladder silently.
-    #[test]
-    fn each_rung_is_asked_about_its_own_space() {
-        let l = ladder();
-        // warn was rehearsed (answered in the dry space); kick never was.
-        let per_rung = |r: Response| -> Result<Option<String>, ()> {
-            Ok(match r {
-                Response::Warn | Response::DeleteAndWarn => Some(r.name().to_string()),
-                _ => None,
-            })
-        };
-        assert_eq!(next_step(&l, 12, per_rung, all_powers), Ok(Some(Response::Kick)), "it climbs past what is answered");
+        assert_eq!(next_step(&l, 12, Some("raid:kick"), all_powers), Some(Response::Warn));
     }
 
     /// A rung this community cannot deliver is SKIPPED, not stopped at.
@@ -154,9 +114,9 @@ mod tests {
     fn a_rung_the_community_withholds_is_climbed_past() {
         let l = ladder();
         let no_hiding = |r: Response| r != Response::DeleteAndWarn;
-        assert_eq!(next_step(&l, 12, flat(Some("warn")), no_hiding), Ok(Some(Response::Kick)));
+        assert_eq!(next_step(&l, 12, Some("warn"), no_hiding), Some(Response::Kick));
         // And a community that grants nothing answers with nothing.
-        assert_eq!(next_step(&l, 12, flat(None), |_| false), Ok(None));
+        assert_eq!(next_step(&l, 12, None, |_| false), None);
     }
 
     /// The ladder is the operator's steps, not every response that exists.
@@ -167,22 +127,8 @@ mod tests {
             crate::config::Step { at: 1, response: Response::Warn },
             crate::config::Step { at: 12, response: Response::Ban },
         ];
-        assert_eq!(next_step(&l, 12, flat(None), all_powers), Ok(Some(Response::Warn)));
-        assert_eq!(next_step(&l, 12, flat(Some("warn")), all_powers), Ok(Some(Response::Ban)), "no rung they never configured");
-    }
-
-    /// A failed rung that gave up records `attempted:{name}`, which must rank
-    /// like the rung so the ladder can move past something undeliverable.
-    #[test]
-    fn a_rung_given_up_on_does_not_pin_the_ladder() {
-        let l = ladder();
-        // The string the code actually writes. Feeding a bare name made this
-        // a duplicate of the flat(Some("warn")) case above, so deleting the
-        // prefix handling left every test green.
-        let gave_up = |r: Response| -> Result<Option<String>, ()> {
-            Ok((r == Response::Warn).then(|| "attempted:warn".to_string()))
-        };
-        assert_eq!(next_step(&l, 12, gave_up, all_powers), Ok(Some(Response::DeleteAndWarn)));
+        assert_eq!(next_step(&l, 12, None, all_powers), Some(Response::Warn));
+        assert_eq!(next_step(&l, 12, Some("warn"), all_powers), Some(Response::Ban), "no rung they never configured");
     }
 
     fn ladder() -> Ladder {
@@ -193,14 +139,14 @@ mod tests {
     fn three_notes_do_not_reach_a_kick() {
         let l = ladder();
         let worth = l.strikes.worth(Gravity::Note);
-        let strikes: Vec<Strike> = (0..3).map(|_| Strike { worth, at_ms: 0, from_vision: false }).collect();
+        let strikes: Vec<Strike> = (0..3).map(|_| Strike { worth, at_ms: 0 }).collect();
         assert_eq!(decide(&l, total(&strikes, 0, l.decay_half_life_hours)), Some(Response::Warn));
     }
 
     #[test]
     fn one_grave_offense_reaches_the_top_without_skipping_the_math() {
         let l = ladder();
-        let strikes = [Strike { worth: l.strikes.worth(Gravity::Grave), at_ms: 0, from_vision: false }];
+        let strikes = [Strike { worth: l.strikes.worth(Gravity::Grave), at_ms: 0 }];
         assert_eq!(decide(&l, total(&strikes, 0, l.decay_half_life_hours)), Some(Response::Ban));
     }
 
@@ -213,7 +159,7 @@ mod tests {
     fn strikes_decay_by_halves_and_reach_zero() {
         let hl = 168u64;
         let hl_ms = hl * 3_600_000;
-        let s = [Strike { worth: 8, at_ms: 0, from_vision: false }];
+        let s = [Strike { worth: 8, at_ms: 0 }];
         assert_eq!(total(&s, 0, hl), 8, "fresh is full");
         assert_eq!(total(&s, hl_ms - 1, hl), 8, "just under a half-life still counts whole");
         assert_eq!(total(&s, hl_ms, hl), 4, "one half-life halves");
@@ -222,35 +168,15 @@ mod tests {
         assert_eq!(total(&s, u64::MAX, hl), 0, "distant past cannot overflow");
     }
 
-    /// Provenance belongs to the strike, not the member.
-    ///
-    /// A boolean taint failed in both directions: one flagged image disarmed
-    /// every response against them, and a taint that expired sooner than the
-    /// strike still counted let a total only inference could reach be carried
-    /// out under the text switches.
-    #[test]
-    fn the_provable_total_excludes_a_models_opinion() {
-        let text = Strike { worth: 8, at_ms: 0, from_vision: false };
-        let seen = Strike { worth: 12, at_ms: 0, from_vision: true };
-        let both = [text, seen];
-        assert_eq!(total(&both, 0, 168), 20, "everything counts toward what they have earned");
-        assert_eq!(provable_total(&both, 0, 168), 8, "but only the replayable half is provable");
-        assert_eq!(provable_total(&[seen], 0, 168), 0, "a member convicted only by a model has proved nothing");
-        // And provenance decays with its own strike rather than on a second clock.
-        let hl_ms = 168 * 3_600_000;
-        assert_eq!(provable_total(&both, 2 * hl_ms, 168), 2);
-        assert_eq!(total(&both, 2 * hl_ms, 168), 5);
-    }
-
     #[test]
     fn escalation_is_cumulative_across_gravities() {
         let l = ladder();
         // Two serious offenses (4 + 4 = 8) reach a kick; the same pair a
         // half-life apart (4 + 2 = 6) stays at delete_and_warn.
         let hl_ms = l.decay_half_life_hours * 3_600_000;
-        let fresh = [Strike { worth: 4, at_ms: hl_ms, from_vision: false }, Strike { worth: 4, at_ms: hl_ms, from_vision: false }];
+        let fresh = [Strike { worth: 4, at_ms: hl_ms }, Strike { worth: 4, at_ms: hl_ms }];
         assert_eq!(decide(&l, total(&fresh, hl_ms, l.decay_half_life_hours)), Some(Response::Kick));
-        let spread = [Strike { worth: 4, at_ms: 0, from_vision: false }, Strike { worth: 4, at_ms: hl_ms, from_vision: false }];
+        let spread = [Strike { worth: 4, at_ms: 0 }, Strike { worth: 4, at_ms: hl_ms }];
         assert_eq!(decide(&l, total(&spread, hl_ms, l.decay_half_life_hours)), Some(Response::DeleteAndWarn));
     }
 }

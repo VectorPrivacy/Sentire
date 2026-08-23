@@ -13,15 +13,17 @@ poll_secs   = 120               # floor of 90: the report is memoised that long
 # Nothing is armed until you say so, and each class arms separately. A bot that
 # warns is not thereby a bot that bans.
 # Arm from the BOTTOM UP. Turning on a harsher class while a gentler one is off
-# is refused at boot: the rungs below the armed one would be answered in the
-# rehearsal's ledger, so the first real sentence would land without a warning.
+# is refused at boot: an unarmed rung is never answered, so the ladder would
+# rehearse it forever and never reach the armed one.
+# Changing any of these clears that community's slate: a rehearsal records
+# nothing, so nobody carries a backlog of sentences that were never delivered
+# into the run that would deliver them.
 [arm]
 warn   = false
 delete = false
 kick   = false
 ban    = false
 raid   = false
-vision = false                  # a model's opinion is inference; it gets its own switch
 
 [limits]
 max_actions_per_run  = 25
@@ -118,7 +120,10 @@ allow_remote = false            # required for any host that is not loopback
 timeout_secs = 60
 max_bytes    = 8388608
 max_per_min  = 20
-mimes        = ["image/png", "image/jpeg", "image/webp", "image/gif"]
+# Whatever your model can read. Sentinel sends the bytes; an endpoint that
+# cannot answer for a video says so, and an unanswered attachment goes to a
+# person rather than being treated as clean.
+mimes        = ["image/png", "image/jpeg", "image/webp", "image/gif", "video/mp4", "video/webm"]
 
 # [[vision.labels]]
 # name = "sexual_content"

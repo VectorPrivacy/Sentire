@@ -48,9 +48,9 @@ pub fn validate_policy(p: &crate::policy::CommunityPolicy, whose: &str) -> Resul
     if p.ladder.decay_half_life_hours == 0 {
         return at("ladder.decay_half_life_hours = 0: strikes would never be forgiven, and the dedup horizon collapses".into());
     }
-    // Arming a class above an unarmed one makes the first real sentence the
-    // armed rung: the ones below it are answered in the dry space a rehearsal
-    // filled, so a member who has received nothing real is banned outright.
+    // A rehearsal records nothing, so an unarmed rung is never answered and the
+    // ladder cannot climb past it. Arming kick while warn is off therefore
+    // rehearses a warning forever and never kicks anybody.
     let armed = [
         (p.arm.warn, "warn"),
         (p.arm.delete, "delete"),
@@ -61,8 +61,8 @@ pub fn validate_policy(p: &crate::policy::CommunityPolicy, whose: &str) -> Resul
         (!on && armed[i + 1..].iter().any(|(above, _)| *above)).then_some((i, *name))
     }) {
         return at(format!(
-            "[arm] {gap} is off while a harsher class is on: the rungs below the armed one would be \
-             answered in the rehearsal's ledger, so the first real sentence lands without warning. \
+            "[arm] {gap} is off while a harsher class is on: an unarmed rung is never answered, \
+             so the ladder would rehearse it forever and never reach the armed one. \
              Arm from the bottom up."
         ));
     }
@@ -176,9 +176,10 @@ impl Default for Bot {
     }
 }
 
-/// Every one defaults false. Dry-run is the resting state, and arming is a
-/// choice made per action class — a bot that warns is not thereby a bot that
-/// bans.
+/// Every one defaults false. Dry-run is the resting state, arming is per action
+/// class — a bot that warns is not thereby a bot that bans — and changing any
+/// of them clears that community's slate, so a rehearsal never becomes a
+/// backlog the armed run discharges at once.
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
 #[serde(default)]
 pub struct Arm {
@@ -187,17 +188,6 @@ pub struct Arm {
     pub kick: bool,
     pub ban: bool,
     pub raid: bool,
-    /// A vision model's opinion is inference, and inference gets its own
-    /// switch. Riding the booleans an operator set for provable text rules
-    /// would let a classifier ban on evidence nobody can replay.
-    pub vision: bool,
-}
-
-impl Arm {
-    /// A vision finding needs BOTH its class armed and the vision switch on.
-    pub fn vision_ok(self, from_vision: bool) -> bool {
-        !from_vision || self.vision
-    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -351,11 +341,7 @@ impl Response {
     /// The rank of a stored response name. `None` maps to 0 — an unrecognised
     /// row is not a prior action, which is the safe reading in both directions.
     pub fn rank_of(name: &str) -> u8 {
-        // `attempted:` is a rung Sentinel gave up on after repeated failures.
-        // It ranks like the rung so the ladder can move PAST something
-        // undeliverable — otherwise "unreachable" became "untouchable".
-        let bare = name.strip_prefix("attempted:").unwrap_or(name);
-        Response::ALL.iter().find(|r| r.name() == bare).map(|r| r.rank()).unwrap_or(0)
+        Response::ALL.iter().find(|r| r.name() == name).map(|r| r.rank()).unwrap_or(0)
     }
 }
 
@@ -395,6 +381,9 @@ pub struct VisionCfg {
     /// Classifications per minute, so a wave of images cannot become a bill or
     /// a stalled sweep.
     pub max_per_min: u32,
+    /// What to send the model. Whether it can read a given type is its
+    /// business, not Sentinel's: an endpoint that cannot answer for a video
+    /// says so, and an unanswered attachment goes to a person.
     pub mimes: Vec<String>,
     pub labels: Vec<VisionLabel>,
 }
@@ -418,7 +407,10 @@ impl Default for VisionCfg {
             timeout_secs: 60,
             max_bytes: 8 * 1024 * 1024,
             max_per_min: 20,
-            mimes: ["image/png", "image/jpeg", "image/webp", "image/gif"].iter().map(|s| s.to_string()).collect(),
+            mimes: ["image/png", "image/jpeg", "image/webp", "image/gif", "video/mp4", "video/webm"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             labels: vec![],
         }
     }
@@ -602,16 +594,10 @@ mod tests {
         assert_eq!(Response::ALL.len(), 4);
         for r in Response::ALL {
             assert_eq!(Response::rank_of(r.name()), r.rank(), "{r:?} is missing from ALL");
-            // The prefixes the enforcement path actually writes. `attempted:`
-            // is the sole mechanism stopping an undeliverable rung from
-            // pinning every member below it forever.
-            assert_eq!(
-                Response::rank_of(&format!("attempted:{}", r.name())),
-                r.rank(),
-                "a given-up {r:?} must unpin the ladder"
-            );
-            assert_eq!(Response::rank_of(&format!("failed:{}", r.name())), 0, "a failure answers nothing");
-            assert_eq!(Response::rank_of(&format!("raid:{}", r.name())), 0, "a raid row is not a ladder response");
+            // A raid row shares the table and must never read as a ladder
+            // response: an unarmed raid stamping "kick" on every suspect would
+            // immunise all of them.
+            assert_eq!(Response::rank_of(&format!("raid:{}", r.name())), 0);
         }
         let mut ranks: Vec<u8> = Response::ALL.iter().map(|r| r.rank()).collect();
         ranks.dedup();
