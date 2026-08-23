@@ -16,10 +16,12 @@ Early, but complete: live content screening, a periodic sweep, raid containment,
 optional media lane, all feeding one strike ladder. **Nothing is armed by default**, so it
 decides, records and prints without acting.
 
-Tested against the real engine offline. `src/harness.rs` builds a community in memory, runs
-the actual policy engine over it, and converts the result through the same code path the live
-bot uses — so "three offenses reach a kick" is checked from the words to the rung, with no
-network involved. What is not covered is the act itself and the relay round-trip.
+Tested against the real engine offline — 217 tests, about as many lines of test as of code.
+`src/harness.rs` builds a community in memory, runs the actual policy engine over it, and
+converts the result through the same code path the live bot uses, so "three offenses reach a
+kick" is checked from the words to the rung with no network involved. A raid is driven the
+same way, through the engine's own defaults. What is not covered is the act itself and the
+relay round-trip.
 
 Not yet run against a real raid. Nothing here is field-tested.
 
