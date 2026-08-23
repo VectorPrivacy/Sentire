@@ -14,12 +14,14 @@ what any of that is worth.
 
 Early, but complete: live content screening, a periodic sweep, raid containment, and an
 optional media lane, all feeding one strike ladder. **Nothing is armed by default**, so it
-rehearses and prints instead of acting.
+decides, records and prints without acting.
 
-Not yet run against a real raid. The decision itself (`adjudicate`), the ladder, the store,
-the tripwire, raid selection and config validation are unit-tested; the lanes that gather
-facts and carry sentences out are exercised only by those parts. Nothing here is
-field-tested.
+Tested against the real engine offline. `src/harness.rs` builds a community in memory, runs
+the actual policy engine over it, and converts the result through the same code path the live
+bot uses — so "three offenses reach a kick" is checked from the words to the rung, with no
+network involved. What is not covered is the act itself and the relay round-trip.
+
+Not yet run against a real raid. Nothing here is field-tested.
 
 ## Running
 
@@ -78,8 +80,13 @@ a member escalates once, not twice.
 4. The running total meets the **ladder**, and Sentinel answers with the next rung up from
    whatever that member last received: warn, delete and warn, kick, ban. It climbs rather
    than jumping, so a member who accrued enough for a ban in one burst still gets warned
-   first. Arming a class wipes that community's slate, so nobody carries a rehearsed backlog
-   into the run that would deliver it.
+   first.
+
+   It climbs per **offense**, not per pass. An answer records the total it answered, and the
+   next rung is owed only once the total rises above it — otherwise a verdict re-reporting a
+   standing conviction every poll would walk one message up the whole ladder in minutes. That
+   recorded total is aged by the same halving that forgives strikes, so a kick from March
+   stops making a light offense in October answerable only by a ban.
 
    A rung this community grants no permission for is skipped rather than blocking the ones
    above it. Arming has to go bottom-up — arming `kick` while `warn` is off is refused at
@@ -154,7 +161,16 @@ Three rules this lane keeps:
 - **Unknown is not clean.** A timeout, a refusal or a malformed answer routes to a human. An
   unreachable model is a reason to ask, never a reason to let everything through.
 - **The bytes are never kept.** Classification happens in memory; only the content hash and
-  the verdict are stored, so forty accounts posting one image cost a single call.
+  the verdict are stored, so forty accounts posting one image cost a single call. The cache
+  key carries the labels and thresholds it was asked about, so adding a label re-asks rather
+  than serving an answer to a question nobody asked.
+- **The sender's filename decides nothing.** It says whether something could be media at all;
+  the bytes say what it is. Anything claiming to be an image or a video is fetched and
+  answered for, and whatever the operator did not list goes to a person — a client renders by
+  extension, so a type Sentinel skipped in silence would still be on screen.
+- **One community's flood is its own.** The classifier budget is per community, and its
+  single permit is held from before the fetch, so a wave in one room cannot spend the minute
+  or the memory of another.
 
 ## Asking it things
 
@@ -169,10 +185,12 @@ must survive as tombstones because the engine re-reports the same convictions fo
 the evidence sits in its window, and the history must go because a forgiven member who kept it
 stays immune to every response below the one they already received.
 
-Changing what is armed in `[arm]` wipes that community's slate. Rehearsals and real actions
-share one ledger, so the alternative is every read having to know which of two spaces a row
-came from — and getting that wrong is silent. A wipe is one line and the question never
-arises.
+Changing what is armed in `[arm]` wipes that community's slate, tombstones included. That
+wipe is what lets one ledger hold both rehearsals and real actions: a rehearsal records
+everything a real answer would, so the ladder climbs, the ceilings fill, and an operator
+watches the run they are about to arm rather than meeting it for the first time when the
+switch flips. Keeping two spaces instead would mean every read having to know which one it
+was in, and getting that wrong is silent.
 
 ## Proven vs unproven
 
