@@ -57,6 +57,10 @@ struct Watch {
     standing: HashMap<String, String>,
     /// True once a sweep has filled `standing`.
     known: bool,
+    /// This community's share of the classifier. Per community, or twenty junk
+    /// images in one room spend the minute for every other room Sentinel
+    /// watches — one community's traffic deciding another's screening.
+    budget: Option<Arc<crate::lanes::Budget>>,
 }
 
 type Watches = Arc<Mutex<HashMap<String, Watch>>>;
@@ -146,6 +150,18 @@ impl Drop for ShutdownFlag {
     }
 }
 
+/// This community's classifier budget, made on first use.
+fn budget_of(watches: &Watches, community: &str, per_min: u32) -> Arc<crate::lanes::Budget> {
+    watches
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(community.to_string())
+        .or_default()
+        .budget
+        .get_or_insert_with(|| Arc::new(crate::lanes::Budget::new(per_min.max(1))))
+        .clone()
+}
+
 /// One community's turn to sentence.
 fn enforce_lock(wires: &Watches, community: &str) -> Arc<tokio::sync::Mutex<()>> {
     wires.lock().unwrap_or_else(|e| e.into_inner()).entry(community.to_string()).or_default().enforcing.clone()
@@ -222,7 +238,7 @@ async fn main() -> vector_sdk::Result<()> {
 
     commands::operator_surface(&bot, &cfg, &store);
     let eyes = lanes::media_lane(&cfg)?;
-    let budget = Arc::new(lanes::Budget::new(cfg.vision.max_per_min.max(1)));
+
 
     // The sweep runs beside the listener rather than instead of it: slash
     // commands arrive through the inbound stream, so a bot that only loops on
@@ -294,10 +310,10 @@ async fn main() -> vector_sdk::Result<()> {
     // 90-second cache. `on_event` rather than `on_message` because joins are
     // half the raid signal and a message handler never sees them.
     {
-        let (cfg, store, me, budget) = (cfg.clone(), store.clone(), bot.npub().to_string(), budget.clone());
+        let (cfg, store, me) = (cfg.clone(), store.clone(), bot.npub().to_string());
     bot.on_event(move |bot, event| {
-            let (cfg, store, eyes, wires, me, budget) =
-                (cfg.clone(), store.clone(), eyes.clone(), wires.clone(), me.clone(), budget.clone());
+            let (cfg, store, eyes, wires, me) =
+                (cfg.clone(), store.clone(), eyes.clone(), wires.clone(), me.clone());
             async move {
                 match event {
                     BotEvent::Message(msg) => {
@@ -305,7 +321,7 @@ async fn main() -> vector_sdk::Result<()> {
                             eprintln!("screen: {e}");
                         }
                         if let Err(e) =
-                            lanes::watch_media(&bot, &msg, &cfg, &store, eyes.as_ref().as_ref(), &wires, &budget, &me).await
+                            lanes::watch_media(&bot, &msg, &cfg, &store, eyes.as_ref().as_ref(), &wires, &me).await
                         {
                             eprintln!("media: {e}");
                         }

@@ -159,7 +159,6 @@ pub(crate) async fn watch_media(
     store: &Arc<Store>,
     eyes: Option<&vision::openai::OpenAiVision>,
     watches: &Watches,
-    budget: &Budget,
     me: &str,
 ) -> vector_sdk::Result<()> {
     let (Some(eyes), true) = (eyes, msg.is_group && msg.is_file && !msg.is_mine()) else { return Ok(()) };
@@ -183,6 +182,7 @@ pub(crate) async fn watch_media(
     // the model alone, a blob classified before a label existed was exempt from
     // that label for good — the answer was cached, the question was not.
     let asked = asked_of(eyes.model(), &cfg.vision);
+    let budget = crate::budget_of(watches, community.id(), cfg.vision.max_per_min);
     // Every flagged attachment in this message, so one post is one sentence.
     let mut flagged: Vec<String> = Vec::new();
 
@@ -198,6 +198,13 @@ pub(crate) async fn watch_media(
             }
             Gate::Fetch => {}
         }
+        // Held from BEFORE the fetch until the answer, so this community has
+        // at most one blob resident at a time. The SDK's own cap is 256 MiB and
+        // decryption copies, so N handlers fetching at once is N × that — and
+        // the SDK spawns a handler per message, with 32 attachments allowed in
+        // each. Waiting rather than declining: an image that has to queue still
+        // gets judged, and a decline is a mod-channel line saying it was not.
+        let _slot = budget.slot.acquire().await;
         // `att.id` is the SENDER's declared hash and is never verified, so the
         // cache keys on what actually downloaded.
         let bytes = match bot.download_attachment_from(att, msg.message.npub.as_deref()).await {
@@ -229,14 +236,6 @@ pub(crate) async fn watch_media(
                 Err(e) => vision::Verdict::Unknown(format!("cache unreadable: {e}")),
             },
             None => {
-                let Ok(_slot) = budget.slot.try_acquire() else {
-                    // Contention is not a reason to wait with megabytes pinned
-                    // in memory. Unclassified routes to a person, which is the
-                    // safe answer — but it must SAY so, or a wave of junk
-                    // images is a way to slip one past unnoticed.
-                    unclassified(bot, &community, cfg, store, watches, me, now, &att.id, "classifier busy").await;
-                    continue;
-                };
                 if !budget.claim() {
                     unclassified(bot, &community, cfg, store, watches, me, now, &att.id, "budget spent this minute").await;
                     continue;
@@ -419,9 +418,12 @@ pub(crate) async fn live_ctx(cfg: &Config, community: &Community, watches: &Watc
     }
 }
 
-/// One classification at a time, and no more than the operator allows per
+/// One blob at a time per community, and no more than the operator allows per
 /// minute. Every message is its own task, so without this a wave of images is a
-/// wave of concurrent multi-megabyte uploads to the model.
+/// wave of concurrent multi-megabyte fetches and uploads.
+///
+/// Per COMMUNITY. One shared budget meant twenty junk images in one room spent
+/// the minute for every other room Sentinel watches.
 pub(crate) struct Budget {
     pub(crate) slot: Semaphore,
     pub(crate) per_min: u32,
@@ -569,5 +571,16 @@ mod tests {
         let mut b = vision();
         b.labels = vec![label("sexual_content", 0.8), label("gore", 0.9)];
         assert_eq!(asked_of("llava", &a), asked_of("llava", &b));
+    }
+
+    /// The minute is per community: one room's flood must not decide another
+    /// room's screening.
+    #[test]
+    fn each_community_spends_its_own_minute() {
+        let a = Budget::new(2);
+        let b = Budget::new(2);
+        assert!(a.claim() && a.claim(), "its own allowance");
+        assert!(!a.claim(), "and then it is spent");
+        assert!(b.claim(), "which says nothing about anywhere else");
     }
 }
