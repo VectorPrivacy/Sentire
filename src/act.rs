@@ -103,6 +103,10 @@ pub(crate) async fn enforce(
     let total = ladder::total(strikes, now, ctx.policy.ladder.decay_half_life_hours);
     println!("[{id}] {} {name} {who} — {total} strike(s) — {why}", if armed { "ENFORCE" } else { "WOULD  " });
 
+    // Resolved before the act: a delete removes the very messages the channel
+    // would have been read from.
+    let warn = warn_text(&why, &ctx.community_name, cited_channel(bot, community, v).await.as_deref());
+
     // Announced BEFORE, recorded AFTER. The two want opposite sides of the act:
     // an operator has to see what is about to happen, and the ledger must hold
     // only what did. A named mod channel that cannot be reached holds the
@@ -125,7 +129,7 @@ pub(crate) async fn enforce(
         Ok(())
     } else {
         match response {
-            Response::Warn => bot.dm(&v.npub).send(&warn_text(&why)).await.map(|_| ()),
+            Response::Warn => bot.dm(&v.npub).send(&warn).await.map(|_| ()),
             Response::DeleteAndWarn => {
                 // A rung with nothing to hide is still spent: the warning is
                 // delivered and the ladder moves on. Skipping it instead walked
@@ -137,7 +141,7 @@ pub(crate) async fn enforce(
                 } else {
                     hide_cited(bot, v, id).await;
                 }
-                bot.dm(&v.npub).send(&warn_text(&why)).await.map(|_| ())
+                bot.dm(&v.npub).send(&warn).await.map(|_| ())
             }
             Response::Kick => community.member(v.npub.clone()).kick().await,
             Response::Ban => community.member(v.npub.clone()).ban().await,
@@ -263,11 +267,30 @@ pub(crate) fn own_finding(rule: &str, detail: &str, message_id: String) -> vecto
     }
 }
 
-fn warn_text(why: &str) -> String {
+/// What a warned member reads.
+///
+/// It names WHERE. Somebody in several communities, told only that "a rule
+/// matched your recent messages", has to guess which room they are in trouble
+/// in — and a warning nobody can act on is not a warning.
+fn warn_text(why: &str, community: &str, channel: Option<&str>) -> String {
+    let place = match channel {
+        Some(c) if !c.is_empty() => format!("{community}, in #{c}"),
+        _ => community.to_string(),
+    };
     format!(
-        "Sentinel here. A community rule matched your recent messages: {why}. \
+        "A rule in {place} matched your recent messages: {why}. \
          This is a warning; repeated matches escalate. Reply to a moderator if you think this is wrong."
     )
+}
+
+/// The channel a sentence is about, by name.
+///
+/// Resolved from what the conviction CITED, so it names the room the offence
+/// happened in rather than wherever Sentinel happens to be looking.
+async fn cited_channel(bot: &VectorBot, community: &Community, v: &Verdict) -> Option<String> {
+    let first = cited_ids(v).first().map(|m| m.to_string())?;
+    let chat = bot.message(&first).await?.chat_id;
+    community.channels().await.into_iter().find(|c| c.id() == chat).map(|c| c.name().to_string())
 }
 
 /// Best-effort audit line into the operator's mod channel, when one is named.
@@ -300,6 +323,7 @@ impl Ctx {
         roster: usize,
     ) -> Ctx {
         Ctx {
+            community_name: community.name().await,
             policy: cfg.for_community(community.id()),
             powers: crate::powers_of(community).await,
             roster,
@@ -312,6 +336,8 @@ impl Ctx {
 /// One community, as this pass sees it: its own rulebook, its own powers, its
 /// own roster. Nothing about judging one community may leak into another.
 pub(crate) struct Ctx {
+    /// What the community calls itself, for the person being answered.
+    pub(crate) community_name: String,
     pub(crate) policy: CommunityPolicy,
     pub(crate) powers: Powers,
     pub(crate) roster: usize,
@@ -489,13 +515,15 @@ mod tests {
         assert_eq!(cited_ids(&v), vec!["m1", "m2"]);
     }
 
-    /// The warned member reads this, so it has to say what matched and what
-    /// happens next — and must never be empty, whatever the evidence was.
+    /// The warned member reads this, so it has to say what matched, what
+    /// happens next, and WHERE — somebody in several communities told only
+    /// that "a rule matched" has to guess which room they are in trouble in.
     #[test]
-    fn a_warning_says_what_matched_and_what_comes_next() {
+    fn a_warning_says_what_matched_where_and_what_comes_next() {
         for why in ["slurs [severe] 3×", "", "no findings", "a\nmultiline\nreason"] {
-            let text = warn_text(why);
-            assert!(text.contains("Sentinel"), "{text}");
+            let text = warn_text(why, "Vector Community", Some("general"));
+            assert!(text.contains("Vector Community"), "it must name the community: {text}");
+            assert!(text.contains("#general"), "and the channel: {text}");
             assert!(text.contains("warning"), "{text}");
             assert!(text.contains("escalate"), "a warning that does not say it escalates is not one");
             assert!(text.contains("moderator"), "and it must name the way to dispute it");
@@ -503,6 +531,23 @@ mod tests {
                 assert!(text.contains(why), "the evidence has to appear: {text}");
             }
         }
+    }
+
+    /// A sentence the citations cannot place still names the community.
+    #[test]
+    fn a_warning_without_a_channel_still_says_where() {
+        for channel in [None, Some("")] {
+            let text = warn_text("slurs [severe]", "Vector Community", channel);
+            assert!(text.contains("Vector Community"), "{text}");
+            assert!(!text.contains('#'), "no empty channel reference: {text}");
+        }
+    }
+
+    /// It speaks for the community, not for itself.
+    #[test]
+    fn a_warning_does_not_introduce_the_bot() {
+        let text = warn_text("slurs [severe]", "Vector Community", Some("general"));
+        assert!(!text.contains("Sentinel"), "the member cares where and why, not who: {text}");
     }
 
     /// Upstream drift must not promote engine findings to Sentinel's own. The
