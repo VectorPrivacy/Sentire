@@ -191,6 +191,12 @@ Inside a community, from any client that renders slash commands:
 - `/why <member>` — their strike record, decayed, and the next step
 - `/pardon <member>` — clear it. Moderators only; the community's own roles decide.
 
+Every armed sentence is **announced before it is carried out**, when a mod channel is named.
+The two want opposite sides of the act: an operator has to see what is about to happen, and
+the ledger must hold only what did. A channel that was named and cannot be reached holds the
+sentence — a bot removing people with no record of it is the incident the audit trail exists
+to prevent. Name no channel and nothing is held; that is the operator's call, made once.
+
 A pardon tombstones the strikes and clears the action history. Both halves matter: the strikes
 must survive as tombstones because the engine re-reports the same convictions for as long as
 the evidence sits in its window, and the history must go because a forgiven member who kept it

@@ -340,6 +340,17 @@ pub(crate) async fn contain(
     );
     println!("[{id}] {line}");
 
+    // Announced BEFORE, for the same reason the ladder does it: this is the
+    // largest thing Sentinel can do, and doing it with no record where an
+    // operator asked for one is the incident the trail exists to prevent.
+    if armed && response != RaidResponse::Report && !announce(bot, community, ctx, &line).await {
+        println!("[{id}] HELD — the mod channel is unreachable, and this would go unrecorded");
+        for npub in &fresh {
+            let _ = store.release(community.id(), &format!("{scope}:{npub}"));
+        }
+        return Ok(());
+    }
+
     // Act, THEN log — the same discipline the ladder keeps. Logging first meant
     // a failed ban left an audit trail claiming a contained raid.
     let mut done: Vec<&str> = Vec::new();
@@ -412,7 +423,7 @@ pub(crate) async fn contain(
             .log_action(community.id(), npub, &recorded, now, "raid cohort")
             .map_err(vector_sdk::Error::Other)?;
     }
-    if armed {
+    if armed && response == RaidResponse::Report {
         announce(bot, community, ctx, &line).await;
     }
     Ok(())

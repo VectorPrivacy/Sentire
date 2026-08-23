@@ -96,6 +96,15 @@ pub(crate) async fn enforce(
     let total = ladder::total(strikes, now, ctx.policy.ladder.decay_half_life_hours);
     println!("[{id}] {} {name} {who} — {total} strike(s) — {why}", if armed { "ENFORCE" } else { "WOULD  " });
 
+    // Announced BEFORE, recorded AFTER. The two want opposite sides of the act:
+    // an operator has to see what is about to happen, and the ledger must hold
+    // only what did. A named mod channel that cannot be reached holds the
+    // sentence rather than carrying it out unrecorded.
+    if armed && !announce(bot, community, ctx, &format!("{name} {who} — {total} strike(s) — {why}")).await {
+        println!("[{id}] HELD    {who} — the mod channel is unreachable, and this would go unrecorded");
+        return Ok(Outcome::Held);
+    }
+
     // Act, THEN log. Logging first recorded a failed ban as a success: it spent
     // the ceiling and marked the member answered forever.
     //
@@ -129,8 +138,10 @@ pub(crate) async fn enforce(
     };
     if let Err(e) = outcome {
         // Nothing happened, so nothing is recorded: the debt stands and they
-        // are reachable again next pass.
+        // are reachable again next pass. The channel was told this was coming,
+        // so it is told it did not.
         eprintln!("[{id}] {name} {who} FAILED: {e}");
+        announce(bot, community, ctx, &format!("{name} {who} did NOT go through: {e}")).await;
         return Ok(Outcome::Failed);
     }
 
@@ -141,9 +152,6 @@ pub(crate) async fn enforce(
     store
         .log_action(community.id(), &v.npub, name, now, &why)
         .map_err(|e| vector_sdk::Error::Other(format!("{name} {who} happened but could not be recorded: {e}")))?;
-    if armed {
-        announce(bot, community, ctx, &format!("{name} {who} — {total} strike(s) — {why}")).await;
-    }
     *pass.lock().unwrap_or_else(|e| e.into_inner()) += 1;
     Ok(Outcome::Acted)
 }
@@ -256,14 +264,20 @@ fn warn_text(why: &str) -> String {
 }
 
 /// Best-effort audit line into the operator's mod channel, when one is named.
-pub(crate) async fn announce(bot: &VectorBot, community: &Community, ctx: &Ctx, line: &str) {
-    let Some(want) = &ctx.mod_channel else { return };
+/// True when there was nothing to say to, or it was said.
+///
+/// An operator who named a mod channel asked for an audit trail. Silence when
+/// that channel cannot be reached is the one answer it must not give: a bot
+/// removing people with no record of it is the incident the trail exists to
+/// prevent.
+pub(crate) async fn announce(bot: &VectorBot, community: &Community, ctx: &Ctx, line: &str) -> bool {
+    let Some(want) = &ctx.mod_channel else { return true };
     for ch in community.channels().await {
         if ch.name() == want && ch.is_readable() {
-            let _ = bot.channel(ch.id()).send(line).await;
-            return;
+            return bot.channel(ch.id()).send(line).await.is_ok();
         }
     }
+    false
 }
 
 impl Ctx {

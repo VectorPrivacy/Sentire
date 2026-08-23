@@ -8,6 +8,9 @@
 nsec_env    = "SENTINEL_NSEC"   # the env var holding the key, never the key
 communities = ["*"]             # or explicit community ids
 # mod_channel = "mod-log"       # channel NAME for the audit trail; omit to stay silent
+# Named, every armed sentence is announced there BEFORE it is carried out, and
+# a channel that cannot be reached holds the sentence rather than acting with
+# no record of it.
 poll_secs   = 120               # floor of 90: the report is memoised that long
 
 # Nothing is armed until you say so, and each class arms separately. A bot that
