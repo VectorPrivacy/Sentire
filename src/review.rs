@@ -49,6 +49,15 @@ pub(crate) fn charges(v: &vector_sdk::policy::Verdict, policy: &crate::policy::C
         if !f.is_proven() {
             continue; // inference never earns a strike
         }
+        // A strike points at something the member DID. The engine's raid
+        // aggravators — `fresh` (an account under a day old), `quiet` (has
+        // posted at most twice) — cite nothing because they describe a person
+        // rather than an act, and they convict nobody on their own: a cohort
+        // arms them. Charging them meant being new earned ladder strikes for
+        // every member caught in a raid detection, with `[arm] raid` off.
+        if f.citation_count == 0 {
+            continue;
+        }
         if !f.stateless && charged_per_message.contains(f.rule_id.as_str()) {
             continue;
         }
@@ -550,6 +559,27 @@ mod tests {
 
     fn base() -> crate::policy::CommunityPolicy {
         crate::config::Config::default().for_community("")
+    }
+
+    /// The engine's raid aggravators describe a PERSON — an account under a
+    /// day old, one that has posted twice — not an act, so they cite nothing
+    /// and convict nobody on their own. Charging them made being new an
+    /// offense for every member caught in a raid detection, with the raid
+    /// switch off.
+    #[test]
+    fn a_finding_that_cites_nothing_charges_nothing() {
+        let v = verdict(vec![
+            f("fresh", "whole", false, "deterministic", 1, &[], 0),
+            f("quiet", "whole", false, "deterministic", 1, &[], 0),
+        ]);
+        assert!(charges(&v, &base()).is_empty(), "a strike points at something the member did");
+    }
+
+    /// And the operator's own rules always do cite, so nothing real is lost.
+    #[test]
+    fn a_finding_that_cites_evidence_still_charges() {
+        let v = verdict(vec![f("rate", "per_window", false, "deterministic", 20, &["m1"], 20)]);
+        assert_eq!(charges(&v, &base()).len(), 1);
     }
 
     #[test]

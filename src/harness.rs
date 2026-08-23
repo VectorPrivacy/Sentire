@@ -275,6 +275,14 @@ impl Pipeline {
     }
 }
 
+/// The engine's own raid defaults, which every community gets without asking.
+/// Sentinel does not compile these; it reads what they convict.
+pub fn default_policy() -> Policy {
+    let doc = vector_sdk::vector_core::community::policy::harness::default_policy();
+    let json = serde_json::to_string(&doc).expect("the defaults serialize");
+    Policy::from_json(&json).expect("and round-trip")
+}
+
 /// The npub of a verdict, shortened the way the logs do.
 pub fn find<'a>(vs: &'a Verdicts, who: &Who) -> Option<&'a vector_sdk::policy::Verdict> {
     let npub = who.npub();
@@ -289,7 +297,7 @@ pub fn assert_derivable(seed: u8) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::{Config, Gravity, WordRule, LinkRule};
     use crate::rules;
@@ -791,4 +799,113 @@ mod tests {
         let v = find(&vs, &who).expect("reported");
         assert!(v.findings.is_empty(), "a week and a half ago is outside a one-week window");
     }
+
+    /// A raid, end to end and offline: fresh accounts posting one line each,
+    /// through the engine's own defaults, into Sentinel's containment decision.
+    #[test]
+    fn a_wave_of_fresh_accounts_saying_one_line_is_contained() {
+        let mut w = World::new();
+        let raiders: Vec<Who> = (0..8).map(|_| w.stranger()).collect();
+        for r in &raiders {
+            w.says(*r, "JOIN OUR CHANNEL NOW t.me/spam");
+        }
+        // A regular, saying something else entirely.
+        let regular = w.regular(60 * 24 * HOUR, 400);
+        for i in 0..5u64 {
+            w.said_at(regular, &format!("morning all {i}"), w.now_ms - (10 - i) * HOUR, 0);
+        }
+
+        let vs = w.verdicts(&default_policy());
+        assert!(vs.raid_detected(), "eight accounts posting one line is the raid shape");
+
+        let mut cfg = armed();
+        cfg.arm.raid = true;
+        cfg.limits.halt_if_over_pct = 100;
+        match crate::raid::select(&vs, &cfg.for_community(""), "npub1sentinel") {
+            crate::raid::Containment::Contain { suspects, .. } => {
+                assert_eq!(suspects.len(), raiders.len(), "the wave, and only the wave");
+                assert!(
+                    !suspects.contains(&regular.npub()),
+                    "a regular caught in a raid sweep is the worst thing this can do"
+                );
+            }
+            other => panic!("expected containment, got {other:?}"),
+        }
+    }
+
+    /// The other half of the safety property: no cohort, no containment, no
+    /// matter how busy the room is.
+    #[test]
+    fn ordinary_traffic_is_not_a_raid() {
+        let mut w = World::new();
+        // Genuinely different lines: the cohort matcher compares skeletons, and
+        // "message 1" and "message 2" skeletonize to the same thing.
+        let chatter = [
+            "has anyone tried the new build yet",
+            "the weather here is unbelievable today",
+            "I finally finished that book about lighthouses",
+            "does anyone know a good recipe for lentil soup",
+            "my cat has learned to open the fridge",
+            "thinking about learning to sail this summer",
+            "the bus was forty minutes late again",
+            "just saw the most enormous moth",
+        ];
+        for (i, line) in chatter.iter().enumerate() {
+            let who = w.regular((10 + i as u64) * 24 * HOUR, 100 + i as u64 * 10);
+            w.says(who, line);
+        }
+        let vs = w.verdicts(&default_policy());
+        assert!(!vs.raid_detected(), "twenty people saying twenty things is a conversation");
+
+        let mut cfg = armed();
+        cfg.arm.raid = true;
+        assert_eq!(
+            crate::raid::select(&vs, &cfg.for_community(""), "npub1sentinel"),
+            crate::raid::Containment::Quiet
+        );
+    }
+
+    /// Containment is inference, so it stays rehearsed until an operator arms
+    /// it in writing — the one switch that is not the ladder's.
+    #[test]
+    fn a_raid_is_only_rehearsed_until_arm_raid_is_set() {
+        let mut w = World::new();
+        for _ in 0..8 {
+            let r = w.stranger();
+            w.says(r, "JOIN OUR CHANNEL NOW t.me/spam");
+        }
+        let vs = w.verdicts(&default_policy());
+
+        let mut cfg = armed();
+        cfg.limits.halt_if_over_pct = 100;
+        assert!(!cfg.arm.raid, "the ladder's switches say nothing about containment");
+        assert!(matches!(
+            crate::raid::select(&vs, &cfg.for_community(""), "npub1sentinel"),
+            crate::raid::Containment::WouldContain { .. }
+        ));
+    }
+
+    /// And a raid cohort is inference, so it must never reach the ladder.
+    #[test]
+    fn a_raid_cohort_earns_no_strikes() {
+        let mut w = World::new();
+        let raiders: Vec<Who> = (0..8).map(|_| w.stranger()).collect();
+        for r in &raiders {
+            w.says(*r, "JOIN OUR CHANNEL NOW t.me/spam");
+        }
+        let vs = w.verdicts(&default_policy());
+        let cfg = armed();
+        let p = Pipeline::new(cfg.clone());
+
+        for r in &raiders {
+            let v = find(&vs, r).expect("reported");
+            assert!(!v.findings.is_empty(), "the engine did convict them");
+            assert!(
+                crate::review::charges(v, &cfg.for_community("")).is_empty(),
+                "but on inference, which the ladder may not act on"
+            );
+            assert_eq!(p.answer(v, w.now_ms), None);
+        }
+    }
 }
+
