@@ -109,7 +109,8 @@ pub(crate) async fn enforce(
 
     // Resolved before the act: a delete removes the very messages the channel
     // would have been read from.
-    let warn = warn_text(&why, &ctx.community_name, cited_channel(bot, community, v).await.as_deref());
+    let warn =
+        warn_text(&why, &ctx.community_name, cited_channel(bot, community, v).await.as_deref(), strikes.len());
 
     // Announced BEFORE, recorded AFTER. The two want opposite sides of the act:
     // an operator has to see what is about to happen, and the ledger must hold
@@ -287,13 +288,21 @@ fn tally(strikes: &[ladder::Strike], total: u32) -> String {
 /// It names WHERE. Somebody in several communities, told only that "a rule
 /// matched your recent messages", has to guess which room they are in trouble
 /// in — and a warning nobody can act on is not a warning.
-fn warn_text(why: &str, community: &str, channel: Option<&str>) -> String {
+fn warn_text(why: &str, community: &str, channel: Option<&str>, on_record: usize) -> String {
     let place = match channel {
-        Some(c) if !c.is_empty() => format!("{community}, in #{c}"),
-        _ => community.to_string(),
+        Some(c) if !c.is_empty() => format!("**{community}**, in **#{c}**"),
+        _ => format!("**{community}**"),
+    };
+    // What they did and how many times — the two things a person actually
+    // asks. NOT the strike total: "worth 12" is the operator's number for
+    // tuning a ladder, and it reads to a member like twelve accusations.
+    let tally = if on_record == 1 {
+        "That is 1 match on record for you here.".to_string()
+    } else {
+        format!("That is {on_record} matches on record for you here.")
     };
     format!(
-        "A rule in {place} matched your recent messages: {why}. \
+        "A rule in {place} matched your recent messages: {why}. {tally} \
          This is a warning; repeated matches escalate. Reply to a moderator if you think this is wrong."
     )
 }
@@ -530,6 +539,23 @@ mod tests {
         assert_eq!(cited_ids(&v), vec!["m1", "m2"]);
     }
 
+    /// A member asks two things: what did I do, and how many times. Neither
+    /// answer is a strike total — "worth 12" is the operator's number for
+    /// tuning a ladder, and it reads like twelve accusations.
+    #[test]
+    fn a_warning_counts_matches_and_never_shows_a_score() {
+        let one = warn_text("Used \"badword\" (1 time)", "Lab", Some("general"), 1);
+        assert!(one.contains("1 match on record"), "singular: {one}");
+
+        let many = warn_text("Used \"badword\" (1 time)", "Lab", Some("general"), 4);
+        assert!(many.contains("4 matches on record"), "plural: {many}");
+
+        // The score belongs to the operator, not to the person being warned.
+        for total in ["12", "48", "worth"] {
+            assert!(!many.contains(total), "a score reached the member: {many}");
+        }
+    }
+
     /// Two different numbers, and saying one when you mean the other is how
     /// "one grave offence" came to read as twelve of them. The total is a SUM
     /// OF WORTHS; the count is how many offences are on file.
@@ -560,9 +586,9 @@ mod tests {
     #[test]
     fn a_warning_says_what_matched_where_and_what_comes_next() {
         for why in ["slurs [severe] 3×", "", "no findings", "a\nmultiline\nreason"] {
-            let text = warn_text(why, "Vector Community", Some("general"));
-            assert!(text.contains("Vector Community"), "it must name the community: {text}");
-            assert!(text.contains("#general"), "and the channel: {text}");
+            let text = warn_text(why, "Vector Community", Some("general"), 1);
+            assert!(text.contains("**Vector Community**"), "the community, in bold: {text}");
+            assert!(text.contains("**#general**"), "and the channel: {text}");
             assert!(text.contains("warning"), "{text}");
             assert!(text.contains("escalate"), "a warning that does not say it escalates is not one");
             assert!(text.contains("moderator"), "and it must name the way to dispute it");
@@ -576,8 +602,8 @@ mod tests {
     #[test]
     fn a_warning_without_a_channel_still_says_where() {
         for channel in [None, Some("")] {
-            let text = warn_text("slurs [severe]", "Vector Community", channel);
-            assert!(text.contains("Vector Community"), "{text}");
+            let text = warn_text("Used \"badword\" (1 time)", "Vector Community", channel, 1);
+            assert!(text.contains("**Vector Community**"), "{text}");
             assert!(!text.contains('#'), "no empty channel reference: {text}");
         }
     }
@@ -585,7 +611,7 @@ mod tests {
     /// It speaks for the community, not for itself.
     #[test]
     fn a_warning_does_not_introduce_the_bot() {
-        let text = warn_text("slurs [severe]", "Vector Community", Some("general"));
+        let text = warn_text("Used \"badword\" (1 time)", "Vector Community", Some("general"), 1);
         assert!(!text.contains("Sentinel"), "the member cares where and why, not who: {text}");
     }
 

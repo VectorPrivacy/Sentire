@@ -69,10 +69,14 @@ pub(crate) async fn screen(
         }
         let gravity = policy.gravity_of(&f.rule_id, &f.severity);
         let worth = policy.ladder.strikes.worth(gravity);
+        // Plain English, the way the engine writes its own reasons — this line
+        // is read by the member in a warning DM, not only by an operator in a
+        // log. `slurs [severe] badword` told them nothing they could act on.
         let evidence = if f.detail.is_empty() {
-            format!("{} [{}]", f.rule_id, f.severity)
+            format!("Matched the \"{}\" rule", f.rule_id)
         } else {
-            format!("{} [{}] {}", f.rule_id, f.severity, f.detail.join(", "))
+            let words: Vec<String> = f.detail.iter().map(|d| format!("\"{d}\"")).collect();
+            format!("Used {} ({} time{})", words.join(", "), f.hits, if f.hits == 1 { "" } else { "s" })
         };
         // The same id the sweep mints for this message, so whichever clock
         // reaches the offense first wins and the other is an ignored insert.
