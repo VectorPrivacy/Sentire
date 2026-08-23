@@ -427,6 +427,34 @@ mod tests {
         }
     }
 
+    /// A clock that steps backwards is bounded, not permanent: the offense is
+    /// invisible only until one lands after the answer, and it still counts
+    /// toward the total when that happens.
+    #[test]
+    fn a_backward_clock_delays_an_answer_rather_than_losing_it() {
+        let l = ladder();
+        let answered_at = 1_000_000u64;
+        // The clock stepped back, so this offense reads as older than the
+        // answer that preceded it.
+        let stepped_back = [at(12, answered_at - 5_000), at(12, answered_at - 1_000)];
+        assert_eq!(owed(&l, &stepped_back, [("warn", answered_at)], all_powers, answered_at, HL), None);
+
+        // Once the clock has caught up, the next offense opens the gate and
+        // everything it hid is in the total.
+        let caught_up = [at(12, answered_at - 5_000), at(12, answered_at - 1_000), at(12, answered_at + 1)];
+        assert!(owed(&l, &caught_up, [("warn", answered_at)], all_powers, answered_at + 2, HL).is_some());
+    }
+
+    /// A strike landing in the same millisecond as the answer was answered by
+    /// it — that is the strike that caused it. Under-enforcing here is the
+    /// safe direction, and the next offense picks it up.
+    #[test]
+    fn a_strike_in_the_same_millisecond_as_its_answer_is_not_new() {
+        let l = ladder();
+        assert_eq!(owed(&l, &[at(12, 500)], [("warn", 500u64)], all_powers, 600, HL), None);
+        assert!(owed(&l, &[at(12, 500), at(12, 501)], [("warn", 500u64)], all_powers, 600, HL).is_some());
+    }
+
     /// Decay is monotone and never negative.
     #[test]
     fn decay_only_ever_falls() {
