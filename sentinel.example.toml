@@ -49,17 +49,20 @@ window_messages = 4000
 # domains = ["bit.ly", "tinyurl.com"]
 # gravity = "serious"
 
-# [rules.rate]
+# [rules.rate]                   # too many messages too fast
 # enabled  = true
-# per_secs = 60
+# per_secs = 60                  # the window
+# messages = 10                  # how many inside it convict; ONE is a member talking
 # gravity  = "minor"
 
 # [rules.mass_tagging]           # one message naming a crowd; counts DISTINCT people
 # enabled = true
+# times   = 15                   # how many p-tags convict
 # gravity = "serious"
 
 # [rules.repetition]             # the same line over and over, inside a burst
 # enabled = true
+# times   = 4                    # how many times; one is not a repeat
 # gravity = "minor"
 
 # What an offense costs, and what a running total answers to. Strikes halve

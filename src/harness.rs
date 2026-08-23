@@ -652,6 +652,42 @@ pub(crate) mod tests {
 
     /// Every rule type the operator can switch on has to actually convict, or
     /// the config field is decoration.
+    /// The rung ladder starts at ONE hit, so a rate rule and a repetition rule
+    /// convict a member for their first message unless a threshold is set.
+    /// Found live: one test post produced sixteen strikes across three rules.
+    #[test]
+    fn a_rate_rule_does_not_convict_a_member_for_speaking_once() {
+        let mut w = World::new();
+        let who = w.stranger();
+        w.says(who, "hello everyone");
+
+        let policy = rules_policy(|r| {
+            r.rate = Some(crate::config::RateRule {
+                enabled: true,
+                per_secs: 60,
+                messages: 10,
+                gravity: Gravity::Minor,
+            })
+        });
+        let vs = w.verdicts(&policy);
+        let v = find(&vs, &who).expect("reported");
+        assert!(v.findings.is_empty(), "one message in a minute is a member talking: {:?}", v.findings);
+    }
+
+    #[test]
+    fn a_repetition_rule_does_not_convict_a_single_message() {
+        let mut w = World::new();
+        let who = w.stranger();
+        w.says(who, "just the one message");
+
+        let policy = rules_policy(|r| {
+            r.repetition = Some(crate::config::ToggleRule { enabled: true, times: 4, gravity: Gravity::Minor })
+        });
+        let vs = w.verdicts(&policy);
+        let v = find(&vs, &who).expect("reported");
+        assert!(v.findings.is_empty(), "a message does not repeat itself: {:?}", v.findings);
+    }
+
     #[test]
     fn a_rate_rule_convicts_a_burst() {
         let mut w = World::new();
@@ -661,7 +697,7 @@ pub(crate) mod tests {
             w.said_at(who, &format!("message {i}"), start + i * 100, 0);
         }
         let policy = rules_policy(|r| {
-            r.rate = Some(crate::config::RateRule { enabled: true, per_secs: 60, gravity: Gravity::Minor })
+            r.rate = Some(crate::config::RateRule { enabled: true, per_secs: 60, messages: 5, gravity: Gravity::Minor })
         });
         let vs = w.verdicts(&policy);
         let v = find(&vs, &who).expect("reported");
@@ -677,7 +713,7 @@ pub(crate) mod tests {
             w.said_at(who, "buy my coin", start + i * 1000, 0);
         }
         let policy =
-            rules_policy(|r| r.repetition = Some(crate::config::ToggleRule { enabled: true, gravity: Gravity::Minor }));
+            rules_policy(|r| r.repetition = Some(crate::config::ToggleRule { enabled: true, times: 3, gravity: Gravity::Minor }));
         let vs = w.verdicts(&policy);
         let v = find(&vs, &who).expect("reported");
         assert!(v.findings.iter().any(|f| f.rule_id == "repetition"), "ten identical lines is repetition");
@@ -689,7 +725,7 @@ pub(crate) mod tests {
         let who = w.stranger();
         w.says_tagging(who, "everyone look at this", 30);
         let policy = rules_policy(|r| {
-            r.mass_tagging = Some(crate::config::ToggleRule { enabled: true, gravity: Gravity::Serious })
+            r.mass_tagging = Some(crate::config::ToggleRule { enabled: true, times: 3, gravity: Gravity::Serious })
         });
         let vs = w.verdicts(&policy);
         let v = find(&vs, &who).expect("reported");
@@ -707,11 +743,11 @@ pub(crate) mod tests {
         }
         for policy in [
             rules_policy(|r| {
-                r.rate = Some(crate::config::RateRule { enabled: false, per_secs: 60, gravity: Gravity::Minor });
+                r.rate = Some(crate::config::RateRule { enabled: false, per_secs: 60, messages: 5, gravity: Gravity::Minor });
                 r.words = vec![WordRule { id: "x".into(), patterns: vec!["zzz".into()], gravity: Gravity::Note }];
             }),
             rules_policy(|r| {
-                r.repetition = Some(crate::config::ToggleRule { enabled: false, gravity: Gravity::Minor });
+                r.repetition = Some(crate::config::ToggleRule { enabled: false, times: 3, gravity: Gravity::Minor });
                 r.words = vec![WordRule { id: "x".into(), patterns: vec!["zzz".into()], gravity: Gravity::Note }];
             }),
         ] {
@@ -1070,19 +1106,19 @@ pub(crate) mod tests {
             (
                 "rate",
                 Box::new(|r: &mut crate::config::Rules| {
-                    r.rate = Some(crate::config::RateRule { enabled: true, per_secs: 60, gravity: Gravity::Minor })
+                    r.rate = Some(crate::config::RateRule { enabled: true, per_secs: 60, messages: 5, gravity: Gravity::Minor })
                 }),
             ),
             (
                 "repetition",
                 Box::new(|r: &mut crate::config::Rules| {
-                    r.repetition = Some(crate::config::ToggleRule { enabled: true, gravity: Gravity::Minor })
+                    r.repetition = Some(crate::config::ToggleRule { enabled: true, times: 3, gravity: Gravity::Minor })
                 }),
             ),
             (
                 "mass-tagging",
                 Box::new(|r: &mut crate::config::Rules| {
-                    r.mass_tagging = Some(crate::config::ToggleRule { enabled: true, gravity: Gravity::Serious })
+                    r.mass_tagging = Some(crate::config::ToggleRule { enabled: true, times: 3, gravity: Gravity::Serious })
                 }),
             ),
         ];

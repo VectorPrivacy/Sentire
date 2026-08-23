@@ -53,19 +53,25 @@ pub fn compile(cfg: &CommunityPolicy) -> Option<Policy> {
     }
     if let Some(rate) = &r.rate {
         if rate.enabled {
-            policy = policy.rule(PolicyRule::rate_limit("rate", rate.per_secs).seriousness(seriousness(rate.gravity)));
+            policy = policy.rule(
+                PolicyRule::rate_limit("rate", rate.per_secs)
+                    .at_least(rate.messages)
+                    .seriousness(seriousness(rate.gravity)),
+            );
             any = true;
         }
     }
     if let Some(mt) = &r.mass_tagging {
         if mt.enabled {
-            policy = policy.rule(PolicyRule::mass_tagging("mass-tagging").seriousness(seriousness(mt.gravity)));
+            policy = policy
+                .rule(PolicyRule::mass_tagging("mass-tagging").at_least(mt.times).seriousness(seriousness(mt.gravity)));
             any = true;
         }
     }
     if let Some(rep) = &r.repetition {
         if rep.enabled {
-            policy = policy.rule(PolicyRule::repetition("repetition").seriousness(seriousness(rep.gravity)));
+            policy = policy
+                .rule(PolicyRule::repetition("repetition").at_least(rep.times).seriousness(seriousness(rep.gravity)));
             any = true;
         }
     }

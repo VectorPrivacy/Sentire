@@ -95,6 +95,27 @@ pub fn validate_policy(p: &crate::policy::CommunityPolicy, whose: &str) -> Resul
             p.raid.max_batch
         ));
     }
+    // ONE is not a rate and not a repeat: the engine's rung ladder starts at a
+    // single hit, so a threshold of one convicts a member for their first
+    // message. That flags everybody, which is the same as flagging nobody.
+    if let Some(r) = &p.rules.rate {
+        if r.enabled && r.messages < 2 {
+            return at(format!(
+                "rules.rate.messages = {}: one message inside {}s is not a flood, it is a member talking",
+                r.messages, r.per_secs
+            ));
+        }
+        if r.enabled && r.per_secs == 0 {
+            return at("rules.rate.per_secs = 0: there is no window to count in".into());
+        }
+    }
+    for (block, t) in [("repetition", &p.rules.repetition), ("mass_tagging", &p.rules.mass_tagging)] {
+        if let Some(t) = t {
+            if t.enabled && t.times < 2 {
+                return at(format!("rules.{block}.times = {}: one occurrence is not a pattern", t.times));
+            }
+        }
+    }
     if p.raid.tripwire_accounts < 2 {
         return at("raid.tripwire_accounts must be at least 2: one member talking is a conversation".into());
     }
@@ -287,18 +308,40 @@ pub struct LinkRule {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct RateRule {
     pub enabled: bool,
+    /// The window messages are counted in.
     pub per_secs: u64,
+    /// How many inside that window convict. The engine's rung ladder starts at
+    /// ONE hit, so without this a member's first message in a minute is a
+    /// flood.
+    pub messages: u32,
     pub gravity: Gravity,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct ToggleRule {
     pub enabled: bool,
+    /// How many occurrences convict. One is not a repeat.
+    pub times: u32,
     pub gravity: Gravity,
+}
+
+impl Default for RateRule {
+    fn default() -> Self {
+        // Ten in a minute is a flood; one is a member talking. Defaults exist
+        // so `enabled = true` alone means something sane, and so a
+        // per-community override can switch a block off without restating it.
+        RateRule { enabled: false, per_secs: 60, messages: 10, gravity: Gravity::Minor }
+    }
+}
+
+impl Default for ToggleRule {
+    fn default() -> Self {
+        ToggleRule { enabled: false, times: 4, gravity: Gravity::Minor }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
