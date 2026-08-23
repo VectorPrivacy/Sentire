@@ -1019,5 +1019,81 @@ pub(crate) mod tests {
             }
         }
     }
+
+    /// The citation-less skip must not disable an operator rule. Every rule
+    /// Sentinel can compile has to reach the ledger, checked against the real
+    /// engine rather than assumed.
+    #[test]
+    fn every_rule_an_operator_can_configure_reaches_the_ledger() {
+        let cfg_of = |f: &dyn Fn(&mut crate::config::Rules)| {
+            let mut cfg = armed();
+            f(&mut cfg.rules);
+            cfg
+        };
+
+        let cases: Vec<(&str, Box<dyn Fn(&mut crate::config::Rules)>)> = vec![
+            (
+                "words",
+                Box::new(|r: &mut crate::config::Rules| {
+                    r.words = vec![WordRule {
+                        id: "words".into(),
+                        patterns: vec!["badword".into()],
+                        gravity: Gravity::Serious,
+                    }]
+                }),
+            ),
+            (
+                "links",
+                Box::new(|r: &mut crate::config::Rules| {
+                    r.links = vec![LinkRule {
+                        id: "links".into(),
+                        domains: vec!["evil.example".into()],
+                        gravity: Gravity::Serious,
+                    }]
+                }),
+            ),
+            (
+                "rate",
+                Box::new(|r: &mut crate::config::Rules| {
+                    r.rate = Some(crate::config::RateRule { enabled: true, per_secs: 60, gravity: Gravity::Minor })
+                }),
+            ),
+            (
+                "repetition",
+                Box::new(|r: &mut crate::config::Rules| {
+                    r.repetition = Some(crate::config::ToggleRule { enabled: true, gravity: Gravity::Minor })
+                }),
+            ),
+            (
+                "mass-tagging",
+                Box::new(|r: &mut crate::config::Rules| {
+                    r.mass_tagging = Some(crate::config::ToggleRule { enabled: true, gravity: Gravity::Serious })
+                }),
+            ),
+        ];
+
+        for (name, build) in cases {
+            let cfg = cfg_of(&*build);
+            let policy = rules::compile(&cfg.for_community("")).expect("a rule is a rule");
+
+            let mut w = World::new();
+            let who = w.stranger();
+            let start = w.now_ms - HOUR;
+            // Traffic that trips all five: a listed word, a listed domain, a
+            // burst, the same line repeatedly, and a message naming a crowd.
+            for i in 0..20u64 {
+                w.said_at(who, "badword at https://evil.example/x", start + i * 100, 0);
+            }
+            w.says_tagging(who, "badword everyone https://evil.example/x", 30);
+
+            let vs = w.verdicts(&policy);
+            let v = find(&vs, &who).unwrap_or_else(|| panic!("{name}: nobody reported"));
+            assert!(!v.findings.is_empty(), "{name}: the engine convicted nobody");
+            assert!(
+                !crate::review::charges(v, &cfg.for_community("")).is_empty(),
+                "{name}: convicted, and then charged nothing — the rule is decoration"
+            );
+        }
+    }
 }
 
