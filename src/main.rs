@@ -236,14 +236,14 @@ async fn main() -> vector_sdk::Result<()> {
         }
     }
 
-    commands::operator_surface(&bot, &cfg, &store);
+    let wires: Watches = Arc::new(Mutex::new(HashMap::new()));
+    commands::operator_surface(&bot, &cfg, &store, &wires);
     let eyes = lanes::media_lane(&cfg)?;
 
 
     // The sweep runs beside the listener rather than instead of it: slash
     // commands arrive through the inbound stream, so a bot that only loops on
     // verdicts can be watched but never asked anything.
-    let wires: Watches = Arc::new(Mutex::new(HashMap::new()));
     let poll = Duration::from_secs(cfg.bot.poll_secs.max(90));
     {
         let (bot, store, cfg, wires) = (bot.clone(), store.clone(), cfg.clone(), wires.clone());
@@ -421,6 +421,8 @@ async fn powers_of(community: &Community) -> Powers {
 fn conviction_id(rule_id: &str, message_id: &str) -> String {
     // Deliberately WITHOUT the policy hash: the rule and the message identify
     // the offense, so editing a pattern must not re-charge the open window.
+    // `review::charges` mints window ids on the same principle, because the
+    // engine's own carry the hash.
     format!("msg:{rule_id}:{message_id}")
 }
 

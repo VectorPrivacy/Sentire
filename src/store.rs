@@ -450,8 +450,10 @@ pub mod tests {
         assert_eq!(got[1].at_ms, 2000);
     }
 
-    /// Raid rows share the table and must never read as a ladder response: an
-    /// unarmed raid stamping "kick" on every suspect would immunise all of them.
+    /// Raid rows share the table and must never read as a ladder response —
+    /// neither as a floor (they would immunise every suspect) nor as a TIME
+    /// (they would close the gate over strikes they never answered). The rank
+    /// is what tells them apart, and `ladder::owed` filters on it.
     #[test]
     fn a_raid_row_is_not_a_ladder_response() {
         let s = mem();

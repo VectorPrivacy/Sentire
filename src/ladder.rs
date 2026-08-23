@@ -53,23 +53,28 @@ pub fn owed<'a>(
     now_ms: u64,
     half_life_hours: u64,
 ) -> Option<Response> {
-    let answers: Vec<(&str, u64)> = answers.into_iter().collect();
+    // LADDER answers only. The raid lane writes into the same table keyed on
+    // the same npub — including in a rehearsal, where it touches nobody — and
+    // one of its rows would otherwise close this gate over strikes it never
+    // answered. `rank_of` is what tells the two apart.
+    let answers: Vec<(&str, u64)> =
+        answers.into_iter().filter(|(name, _)| Response::rank_of(name) > 0).collect();
 
     // Has anything happened SINCE the last answer? Times, not totals: a
-    // re-reported conviction keeps its original timestamp, so it is never
-    // newer, while a comparison of magnitudes has to age the answered total
-    // the same way the strikes age — and it cannot, because that total was a
-    // sum and `>>` floors a sum more kindly than it floors its parts. Twenty
-    // four notes answered with a warning silently swallowed a grave offense a
-    // week later, exactly and forever.
+    // magnitude comparison has to age the answered total the same way the
+    // strikes age, and it cannot — that total is a sum, and `>>` floors a sum
+    // more kindly than it floors its parts. Times need no schedule to agree,
+    // because a re-reported conviction keeps its original timestamp and is
+    // never newer. The cost of the trade is that it assumes a forward clock.
     if let Some(last) = answers.iter().map(|(_, at)| *at).max() {
         if !strikes.iter().any(|s| s.at_ms > last) {
             return None;
         }
     }
 
+    let total = total(strikes, now_ms, half_life_hours);
     // Nothing to answer with below the first step.
-    decide(l, total(strikes, now_ms, half_life_hours))?;
+    decide(l, total)?;
 
     // An answer outlives its evidence exactly as long as that evidence stands.
     // Without this a kick from March leaves a light offense in October
@@ -85,7 +90,7 @@ pub fn owed<'a>(
         .max_by_key(|(name, _)| Response::rank_of(name))
         .map(|(name, _)| *name);
 
-    next_step(l, total(strikes, now_ms, half_life_hours), floor, can_deliver)
+    next_step(l, total, floor, can_deliver)
 }
 
 /// The NEXT rung to answer with, given what this member has already received.
@@ -425,6 +430,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The raid lane writes into the same table keyed on the same npub — in a
+    /// rehearsal too, where it touches nobody. One of its rows closing this
+    /// gate would silently discharge every strike a ceiling had held or a
+    /// failed DM had left owing, concentrated on exactly the cohort.
+    #[test]
+    fn a_raid_row_does_not_close_the_ladders_gate() {
+        let l = ladder();
+        let strikes = [at(12, 90_000)];
+        for raid_row in ["raid:kick", "raid:ban", "raid:report", "raid:would-kick", "raid:claim"] {
+            assert_eq!(
+                owed(&l, &strikes, [(raid_row, 90_001u64)], all_powers, 180_000, HL),
+                Some(Response::Warn),
+                "{raid_row} closed a gate it never answered"
+            );
+        }
+        // And a real answer still does.
+        assert_eq!(owed(&l, &strikes, [("warn", 90_001u64)], all_powers, 180_000, HL), None);
+        // Even mixed in with them.
+        assert_eq!(
+            owed(&l, &strikes, [("warn", 90_001u64), ("raid:kick", 90_002)], all_powers, 180_000, HL),
+            None
+        );
     }
 
     /// A clock that steps backwards is bounded, not permanent: the offense is

@@ -25,6 +25,7 @@ use crate::ladder;
 /// received and every rung this community grants no permission for.
 pub(crate) fn why_line(
     who: &str,
+    shield: &str,
     strikes: &[ladder::Strike],
     answers: &[crate::store::Answer],
     policy: &CommunityPolicy,
@@ -33,6 +34,12 @@ pub(crate) fn why_line(
 ) -> String {
     if strikes.is_empty() {
         return format!("{} has no strikes with me.", short(who));
+    }
+    // Standing first, exactly as every lane asks it. The ladder is shared
+    // between this answer and the enforcer; the gates are not, so naming a rung
+    // for somebody the gate always spares describes a run that will not happen.
+    if let Some(why) = crate::adjudicate::spared_by_standing(policy, shield) {
+        return format!("{} carries a record, but standing answers for them: {why}.", short(who));
     }
     let hl = policy.ladder.decay_half_life_hours;
     let total = ladder::total(strikes, now, hl);
@@ -57,9 +64,9 @@ pub(crate) fn why_line(
 
 /// Register every command Sentinel answers. One function per command, because
 /// each carries its own clone dance and they share nothing but the bot.
-pub(crate) fn operator_surface(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<Store>) {
+pub(crate) fn operator_surface(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<Store>, wires: &crate::Watches) {
     status(bot, cfg);
-    why(bot, cfg, store);
+    why(bot, cfg, store, wires);
     pardon(bot, cfg, store);
 }
 
@@ -105,13 +112,13 @@ fn status(bot: &VectorBot, cfg: &Arc<Config>) {
     });
 }
 
-fn why(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<Store>) {
+fn why(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<Store>, wires: &crate::Watches) {
     bot.command("why", "Why Sentinel has flagged someone")
         .user("member", "Whose standing to explain", true)
         .run({
-            let (store, cfg) = (store.clone(), cfg.clone());
+            let (store, cfg, wires) = (store.clone(), cfg.clone(), wires.clone());
             move |ctx| {
-                let (store, cfg) = (store.clone(), cfg.clone());
+                let (store, cfg, wires) = (store.clone(), cfg.clone(), wires.clone());
                 async move {
                     let (Some(community), Some(who)) =
                         (ctx.msg.community().filter(|c| cfg.watches(c.id())), ctx.str("member").map(str::to_string))
@@ -132,7 +139,9 @@ fn why(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<Store>) {
                     };
                     let answers = store.answers(community.id(), &who).unwrap_or_default();
                     let powers = crate::powers_of(&community).await;
-                    let _ = ctx.reply(why_line(&who, &strikes, &answers, &policy, powers, now_ms())).await;
+                    let shield = crate::standing_of(&wires, community.id(), &who);
+                    let _ =
+                        ctx.reply(why_line(&who, &shield, &strikes, &answers, &policy, powers, now_ms())).await;
                 }
             }
         });
@@ -220,7 +229,7 @@ mod tests {
 
     #[test]
     fn a_clean_member_is_said_to_be_clean() {
-        let line = why_line("npub1abcdefghijk", &[], &[], &policy(), all(), NOW);
+        let line = why_line("npub1abcdefghijk", "none", &[], &[], &policy(), all(), NOW);
         assert!(line.contains("no strikes"), "{line}");
     }
 
@@ -230,7 +239,7 @@ mod tests {
     #[test]
     fn why_names_the_rung_that_will_actually_be_delivered() {
         let p = policy();
-        let line = why_line("npub1abcdefghijk", &strikes(&[12]), &[], &p, all(), NOW);
+        let line = why_line("npub1abcdefghijk", "none", &strikes(&[12]), &[], &p, all(), NOW);
         assert!(line.contains("next: warn"), "twelve points still starts at a warning: {line}");
     }
 
@@ -245,7 +254,7 @@ mod tests {
             ladder::Strike { worth: 12, at_ms: NOW + 60_000 },
         ];
         let line =
-            why_line("npub1abcdefghijk", &after, std::slice::from_ref(&prior), &p, no_hiding, NOW + 60_001);
+            why_line("npub1abcdefghijk", "none", &after, std::slice::from_ref(&prior), &p, no_hiding, NOW + 60_001);
         assert!(
             line.contains("next: kick"),
             "delete_and_warn cannot be delivered here, so it is not what comes next: {line}"
@@ -258,8 +267,25 @@ mod tests {
     fn why_says_nothing_is_owed_when_nothing_is() {
         let p = policy();
         let prior = Answer { response: "warn".into(), at_ms: NOW };
-        let line = why_line("npub1abcdefghijk", &strikes(&[12]), std::slice::from_ref(&prior), &p, all(), NOW);
+        let line = why_line("npub1abcdefghijk", "none", &strikes(&[12]), std::slice::from_ref(&prior), &p, all(), NOW);
         assert!(line.contains("nothing owed"), "{line}");
+    }
+
+    /// The ladder is shared between this answer and the enforcer; the gates
+    /// are not. Naming a rung for somebody every lane spares describes a run
+    /// that will not happen — and standing is earned over time, so a member
+    /// charged while ordinary can be trusted by the time anyone asks.
+    #[test]
+    fn why_reports_standing_rather_than_a_rung_no_lane_would_deliver() {
+        let p = policy();
+        for shield in ["protected", "trusted", "unknown", "absent"] {
+            let line = why_line("npub1abcdefghijk", shield, &strikes(&[12]), &[], &p, all(), NOW);
+            assert!(!line.contains("next:"), "{shield}: {line}");
+            assert!(line.contains("standing"), "{shield}: {line}");
+        }
+        // And an ordinary member still gets the ladder's answer.
+        let line = why_line("npub1abcdefghijk", "none", &strikes(&[12]), &[], &p, all(), NOW);
+        assert!(line.contains("next: warn"), "{line}");
     }
 
     #[test]
@@ -267,7 +293,7 @@ mod tests {
         let p = policy();
         let hl = p.ladder.decay_half_life_hours * 3_600_000;
         let old = vec![ladder::Strike { worth: 12, at_ms: NOW }];
-        let line = why_line("npub1abcdefghijk", &old, &[], &p, all(), NOW + hl);
+        let line = why_line("npub1abcdefghijk", "none", &old, &[], &p, all(), NOW + hl);
         assert!(line.contains("worth 6 "), "one half-life halves it: {line}");
     }
 

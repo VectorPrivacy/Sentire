@@ -73,7 +73,21 @@ pub(crate) fn charges(v: &vector_sdk::policy::Verdict, policy: &crate::policy::C
             }
             continue;
         }
-        out.push(Charge { conviction: f.conviction_id.clone(), worth, evidence });
+        // Sentinel's OWN id, not the engine's. The engine keys a conviction on
+        // the POLICY HASH, so editing any rule — or toggling
+        // `shields.respect_trusted`, which rewrites every rule — re-mints every
+        // standing window conviction, and INSERT OR IGNORE finds no row: the
+        // whole open window is charged again at `now` and the ladder climbs a
+        // rung for it. An afternoon of tuning would kick and then ban a member
+        // who had done nothing since the first edit.
+        //
+        // The rule, the scope and the rung identify the offense. The rulebook
+        // version does not — which is what the per-message id has always said.
+        out.push(Charge {
+            conviction: format!("win:{}:{}:{}", f.rule_id, f.scope, f.rung),
+            worth,
+            evidence,
+        });
     }
     out
 }
@@ -677,7 +691,7 @@ mod tests {
         ]);
         let got = charges(&v, &base());
         assert_eq!(got.len(), 2, "one cited message, plus the window rung it did not cover");
-        assert!(got.iter().any(|c| c.conviction == "slurs:per_window"));
+        assert!(got.iter().any(|c| c.conviction == "win:slurs:per_window:0"));
     }
 
     #[test]
@@ -688,7 +702,7 @@ mod tests {
         ]);
         let got = charges(&v, &base());
         assert_eq!(got.len(), 1, "the window rung is the only thing that charged");
-        assert_eq!(got[0].conviction, "slurs:per_window");
+        assert_eq!(got[0].conviction, "win:slurs:per_window:0");
     }
 
     /// Different rules never suppress each other.
@@ -700,6 +714,34 @@ mod tests {
         ]);
         let got = charges(&v, &base());
         assert_eq!(got.len(), 2, "a link rule is not paid for by a word rule");
+    }
+
+    /// The engine keys a window conviction on the POLICY HASH, so editing any
+    /// rule re-mints every standing one — and INSERT OR IGNORE would find no
+    /// row, charge the whole open window again at `now`, and climb a rung for
+    /// it. Sentinel mints its own, on the rule and scope and rung.
+    #[test]
+    fn a_rulebook_edit_does_not_re_charge_the_open_window() {
+        let before = verdict(vec![f("rate", "per_window", false, "deterministic", 9, &["m1"], 9)]);
+        let mut after_edit = before.clone();
+        // Exactly what an edit changes upstream, and nothing else.
+        after_edit.findings[0].conviction_id = "a-completely-different-hash".into();
+        after_edit.findings[0].policy_hash = "H2".into();
+
+        let a = charges(&before, &base());
+        let b = charges(&after_edit, &base());
+        assert_eq!(a, b, "the same offense under a rewritten rulebook is the same offense");
+        assert!(!a[0].conviction.contains("hash"), "and the id carries no rulebook version");
+    }
+
+    /// Escalating a rung IS a new answer, though — that is the engine's design
+    /// and the moment to act again.
+    #[test]
+    fn a_rung_escalation_is_a_new_offense() {
+        let low = verdict(vec![f("rate", "per_window", false, "deterministic", 3, &["m1"], 3)]);
+        let mut high = low.clone();
+        high.findings[0].rung = 1;
+        assert_ne!(charges(&low, &base())[0].conviction, charges(&high, &base())[0].conviction);
     }
 
     /// The id is what separates an offense from an echo of one, so the same
