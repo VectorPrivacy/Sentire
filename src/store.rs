@@ -480,6 +480,15 @@ pub mod tests {
         // report-then-kick is the documented rollout.
         s.log_action("c", "npub1e", "raid:report", 0, "").unwrap();
         assert_eq!(s.contained_last_hour("c", 1000).unwrap(), 2, "a report removed nobody");
+
+        // Nor did a rehearsal — and arming containment does not wipe the slate,
+        // so these would otherwise put the first real pass over its ceiling.
+        s.log_action("c", "npub1f", "raid:would-kick", 0, "").unwrap();
+        s.log_action("c", "npub1g", "raid:would-ban", 0, "").unwrap();
+        assert_eq!(s.contained_last_hour("c", 1000).unwrap(), 2, "a rehearsal removed nobody");
+        for row in ["raid:would-kick", "raid:would-ban", "raid:report"] {
+            assert_eq!(crate::config::Response::rank_of(row), 0, "{row} must never floor the ladder");
+        }
     }
 
     #[test]

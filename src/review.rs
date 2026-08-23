@@ -397,9 +397,19 @@ pub(crate) async fn contain(
     // Prefixed, so a raid row is never read as a ladder response. An unarmed
     // raid stamping a bare "kick" on every suspect immunised all of them
     // against warn, delete and kick — permanently, on evidence nobody acted on.
+    //
+    // A rehearsal is marked as one. Arming containment does NOT wipe the slate
+    // — it shares no state with the ladder — so a bare `raid:kick` written
+    // while unarmed would sit in the removal count and put the first real
+    // containment over its ceiling before it acted on anybody.
+    let recorded = if armed && response != RaidResponse::Report {
+        format!("raid:{verb}")
+    } else {
+        format!("raid:would-{verb}")
+    };
     for npub in &done {
         store
-            .log_action(community.id(), npub, &format!("raid:{verb}"), now, "raid cohort")
+            .log_action(community.id(), npub, &recorded, now, "raid cohort")
             .map_err(vector_sdk::Error::Other)?;
     }
     if armed {
