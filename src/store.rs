@@ -612,4 +612,140 @@ pub mod tests {
         assert_eq!(s.prune(5_000).unwrap(), 2, "one strike and one action");
         assert_eq!(s.strikes("c", "npub1a").unwrap().len(), 1, "the live one stays");
     }
+
+    /// The ledger is per community, in every direction.
+    #[test]
+    fn nothing_in_the_ledger_crosses_between_communities() {
+        let s = mem();
+        s.record("one", "npub1a", "x", 4, 0, "ev").unwrap();
+        s.log_action("one", "npub1a", "kick", 0, 4, "").unwrap();
+
+        assert!(s.strikes("two", "npub1a").unwrap().is_empty());
+        assert_eq!(s.strongest_response("two", "npub1a").unwrap(), None);
+        assert!(s.subjects_with_strikes("two").unwrap().is_empty());
+        assert!(s.evidence("two", "npub1a").unwrap().is_empty());
+        assert_eq!(s.actions_last_hour("two", 1000).unwrap(), 0);
+        assert_eq!(s.contained_last_hour("two", 1000).unwrap(), 0);
+        assert_eq!(s.subjects_actioned_last_hour("two", 1000, "").unwrap(), 0);
+        // And the same conviction id is a fresh offense somewhere else.
+        assert!(s.record("two", "npub1a", "x", 4, 0, "ev").unwrap());
+    }
+
+    /// The same id twice is an echo, not a second offense — that is the whole
+    /// job of the id, since a verdict re-reports every standing conviction.
+    #[test]
+    fn the_same_conviction_is_recorded_once_however_often_it_is_reported() {
+        let s = mem();
+        assert!(s.record("c", "npub1a", "x", 4, 1_000, "first").unwrap());
+        for poll in 1..=50u64 {
+            assert!(!s.record("c", "npub1a", "x", 4, poll * 90_000, "again").unwrap(), "poll {poll}");
+        }
+        assert_eq!(s.strikes("c", "npub1a").unwrap().len(), 1);
+        assert_eq!(s.strikes("c", "npub1a").unwrap()[0].at_ms, 1_000, "and keeps its ORIGINAL time");
+    }
+
+    /// Which matters: re-stamping would reset the decay clock, so an offense
+    /// could never be forgiven while its evidence sat in the engine's window.
+    #[test]
+    fn re_reporting_does_not_reset_the_decay_clock() {
+        let s = mem();
+        s.record("c", "npub1a", "x", 12, 0, "").unwrap();
+        let hl = 168 * 3_600_000u64;
+        s.record("c", "npub1a", "x", 12, hl, "").unwrap();
+        let strikes = s.strikes("c", "npub1a").unwrap();
+        assert_eq!(crate::ladder::total(&strikes, hl, 168), 6, "one half-life on, it is halved");
+    }
+
+    #[test]
+    fn a_hidden_hour_boundary_is_not_off_by_one() {
+        let s = mem();
+        let hour = 3_600_000u64;
+        s.log_action("c", "npub1a", "warn", 1_000, 1, "").unwrap();
+        assert_eq!(s.actions_last_hour("c", 1_000 + hour).unwrap(), 1, "exactly an hour old still counts");
+        assert_eq!(s.actions_last_hour("c", 1_000 + hour + 1).unwrap(), 0, "a millisecond later it does not");
+    }
+
+    #[test]
+    fn a_claim_is_scoped_and_expires() {
+        let s = mem();
+        let ttl = 10_000u64;
+        assert!(s.claim("c", "armed:kick:npub1a", 0, ttl).unwrap());
+        assert!(!s.claim("c", "armed:kick:npub1a", ttl - 1, ttl).unwrap(), "inside the wave");
+        assert!(s.claim("c", "armed:kick:npub1a", ttl + 1, ttl).unwrap(), "and again once it has passed");
+        assert!(s.claim("c", "armed:ban:npub1a", 0, ttl).unwrap(), "a different verb is a different claim");
+        assert!(s.claim("other", "armed:kick:npub1a", 0, ttl).unwrap(), "and a different community");
+    }
+
+    /// Evidence is a person's view of the record, so it must not surface what
+    /// was forgiven, and it must be stable rather than an accident of ordering.
+    #[test]
+    fn evidence_is_the_live_record_newest_first_and_deterministic() {
+        let s = mem();
+        s.record("c", "npub1a", "a", 4, 1, "oldest").unwrap();
+        s.record("c", "npub1a", "b", 4, 2, "middle").unwrap();
+        s.record("c", "npub1a", "c", 4, 3, "newest").unwrap();
+        s.record("c", "npub1a", "d", 4, 4, "").unwrap();
+
+        let once = s.evidence("c", "npub1a").unwrap();
+        assert_eq!(once, s.evidence("c", "npub1a").unwrap(), "the same answer every time");
+        assert_eq!(once.first().map(String::as_str), Some("newest"));
+        assert!(!once.iter().any(|e| e.is_empty()), "a blank line cites nothing");
+        assert!(once.len() <= 3, "capped");
+    }
+
+    /// A database written by a newer Sentinel must be refused, not silently
+    /// written to by a build that does not know its columns.
+    #[test]
+    fn a_newer_database_is_refused_rather_than_downgraded() {
+        let dir = std::env::temp_dir().join(format!("sentinel-newer-{}", std::process::id()));
+        let path = dir.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        Store::open(&path).expect("a fresh database opens");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute("UPDATE meta SET value = ?1 WHERE key = 'schema'", [SCHEMA_VERSION + 1]).unwrap();
+        }
+        let err = match Store::open(&path) {
+            Ok(_) => panic!("a newer schema must be refused"),
+            Err(e) => e,
+        };
+        assert!(err.contains("newer Sentinel"), "{err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An OLDER database is rebuilt rather than migrated: the ledger is derived
+    /// state and the engine refills it within one poll.
+    #[test]
+    fn an_older_database_is_rebuilt_and_keeps_what_is_not_derived() {
+        let dir = std::env::temp_dir().join(format!("sentinel-older-{}", std::process::id()));
+        let path = dir.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let s = Store::open(&path).expect("a fresh database opens");
+            s.record("c", "npub1a", "x", 4, 0, "").unwrap();
+            s.cache_verdict("hash", "llava", "{}", 0).unwrap();
+            s.note_armed("c", "warn").unwrap();
+        }
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute("UPDATE meta SET value = 1 WHERE key = 'schema'", []).unwrap();
+        }
+        let s = Store::open(&path).expect("an older schema opens");
+        assert!(s.strikes("c", "npub1a").unwrap().is_empty(), "the ledger is rebuilt");
+        assert_eq!(s.cached_verdict("hash", "llava").as_deref(), Some("{}"), "classifications are not");
+        assert!(!s.note_armed("c", "warn").unwrap(), "and neither is what is armed");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pruning_keeps_what_is_still_inside_the_horizon() {
+        let s = mem();
+        s.record("c", "npub1a", "old", 4, 1_000, "").unwrap();
+        s.record("c", "npub1a", "edge", 4, 5_000, "").unwrap();
+        s.record("c", "npub1a", "new", 4, 9_000, "").unwrap();
+        assert_eq!(s.prune(5_000).unwrap(), 1, "strictly older than the horizon");
+        assert_eq!(s.strikes("c", "npub1a").unwrap().len(), 2);
+    }
 }
