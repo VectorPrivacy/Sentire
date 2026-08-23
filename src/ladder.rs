@@ -432,6 +432,46 @@ mod tests {
         }
     }
 
+    /// The ladder is the OPERATOR's, not a fixed four rungs. Leaving `warn` out
+    /// of the steps means the first answer is a delete; a single-step ladder
+    /// bans on the first offence. The climb-one-rung rule is fixed, the rungs
+    /// it climbs are configuration.
+    #[test]
+    fn a_ladder_that_omits_a_rung_never_delivers_it() {
+        let strict = Ladder {
+            steps: vec![
+                crate::config::Step { at: 1, response: Response::DeleteAndWarn },
+                crate::config::Step { at: 8, response: Response::Kick },
+                crate::config::Step { at: 12, response: Response::Ban },
+            ],
+            ..Config::default().ladder
+        };
+        let one = [at(12, 0)];
+        assert_eq!(
+            owed(&strict, &one, [], all_powers, 1, HL),
+            Some(Response::DeleteAndWarn),
+            "a strict ladder answers the first offence with a delete, not a warning"
+        );
+        // And it still climbs one rung at a time from there.
+        assert_eq!(
+            owed(&strict, &[at(12, 0), at(12, 20)], [("delete_and_warn", 10u64)], all_powers, 30, HL),
+            Some(Response::Kick)
+        );
+
+        // The strictest shape of all: one step, straight to a ban.
+        let brutal = Ladder { steps: vec![crate::config::Step { at: 1, response: Response::Ban }], ..Config::default().ladder };
+        assert_eq!(owed(&brutal, &[at(1, 0)], [], all_powers, 1, HL), Some(Response::Ban));
+
+        // And the gentlest: warnings and nothing else, forever.
+        let gentle = Ladder { steps: vec![crate::config::Step { at: 1, response: Response::Warn }], ..Config::default().ladder };
+        assert_eq!(owed(&gentle, &[at(12, 0)], [], all_powers, 1, HL), Some(Response::Warn));
+        assert_eq!(
+            owed(&gentle, &[at(12, 0), at(12, 20)], [("warn", 10u64)], all_powers, 30, HL),
+            None,
+            "nothing above the top rung the operator configured"
+        );
+    }
+
     /// The raid lane writes into the same table keyed on the same npub — in a
     /// rehearsal too, where it touches nobody. One of its rows closing this
     /// gate would silently discharge every strike a ceiling had held or a
