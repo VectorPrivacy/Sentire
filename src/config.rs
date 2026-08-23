@@ -244,11 +244,7 @@ impl Default for Profile {
     fn default() -> Self {
         Profile {
             name: "Sentinel".into(),
-            about: "A moderation bot. The community's own rulebook decides what counts as an \
-                    offence; I decide what to do about it — a warning, a deleted message, a kick, \
-                    a ban — one step at a time, and never for anyone the community has vouched \
-                    for. Ask me /status, /why <member> or /pardon <member>."
-                .into(),
+            about: "The watchtower for your Community".into(),
             avatar: String::new(),
             banner: String::new(),
         }

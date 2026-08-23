@@ -19,7 +19,7 @@ poll_secs   = 120               # floor of 90: the report is memoised that long
 # looks up the npub that warned them, and an empty profile tells them nothing.
 [bot.profile]
 name  = "Sentinel"
-# about = "..."                 # the default explains what it is and how to appeal
+# about = "The watchtower for your Community"
 # avatar = "https://..."
 # banner = "https://..."
 
