@@ -524,4 +524,137 @@ mod tests {
             );
         }
     }
+
+    fn f(
+        rule: &str,
+        scope: &str,
+        stateless: bool,
+        basis: &str,
+        hits: u32,
+        msgs: &[&str],
+        citation_count: u32,
+    ) -> vector_sdk::policy::Finding {
+        vector_sdk::policy::Finding {
+            conviction_id: format!("{rule}:{scope}"),
+            policy_hash: "hash".into(),
+            rule_id: rule.into(),
+            scope: scope.into(),
+            basis: basis.into(),
+            severity: "major".into(),
+            stateless,
+            rung: 0,
+            hits,
+            weight: 0,
+            detail: vec![],
+            messages: msgs.iter().map(|m| m.to_string()).collect(),
+            citation_count,
+        }
+    }
+
+    fn verdict(findings: Vec<vector_sdk::policy::Finding>) -> vector_sdk::policy::Verdict {
+        crate::act::own_verdict("npub1a", "none".into(), vec![], findings)
+    }
+
+    fn base() -> crate::policy::CommunityPolicy {
+        crate::config::Config::default().for_community("")
+    }
+
+    #[test]
+    fn inference_never_earns_a_strike() {
+        let v = verdict(vec![f("cohort", "whole", false, "heuristic", 1, &[], 0)]);
+        assert!(charges(&v, &base()).is_empty(), "the engine's inference is reported, never charged");
+    }
+
+    /// A content rule convicts at BOTH scopes over the same citations, so
+    /// charging the window rung too billed one offense twice.
+    #[test]
+    fn one_offense_is_not_billed_at_both_scopes() {
+        let v = verdict(vec![
+            f("slurs", "per_message", true, "deterministic", 3, &["m1", "m2", "m3"], 3),
+            f("slurs", "per_window", false, "deterministic", 3, &["m1", "m2", "m3"], 3),
+        ]);
+        let got = charges(&v, &base());
+        assert_eq!(got.len(), 3, "three messages, three charges");
+        assert!(got.iter().all(|c| c.conviction.starts_with("msg:slurs:")));
+    }
+
+    /// Unless the per-message charges do NOT cover the evidence — then
+    /// suppressing the window rung charged the worst offenders the least.
+    #[test]
+    fn the_window_rung_stands_when_the_citations_fall_short() {
+        let v = verdict(vec![
+            f("slurs", "per_message", true, "deterministic", 30, &["m1"], 30),
+            f("slurs", "per_window", false, "deterministic", 30, &[], 30),
+        ]);
+        let got = charges(&v, &base());
+        assert_eq!(got.len(), 2, "one cited message, plus the window rung it did not cover");
+        assert!(got.iter().any(|c| c.conviction == "slurs:per_window"));
+    }
+
+    #[test]
+    fn a_stateless_finding_citing_nothing_charges_nothing_and_suppresses_nothing() {
+        let v = verdict(vec![
+            f("slurs", "per_message", true, "deterministic", 1, &[], 1),
+            f("slurs", "per_window", false, "deterministic", 1, &["m1"], 1),
+        ]);
+        let got = charges(&v, &base());
+        assert_eq!(got.len(), 1, "the window rung is the only thing that charged");
+        assert_eq!(got[0].conviction, "slurs:per_window");
+    }
+
+    /// Different rules never suppress each other.
+    #[test]
+    fn one_rules_per_message_charges_do_not_cover_another_rule() {
+        let v = verdict(vec![
+            f("slurs", "per_message", true, "deterministic", 1, &["m1"], 1),
+            f("links", "per_window", false, "deterministic", 5, &["m1"], 5),
+        ]);
+        let got = charges(&v, &base());
+        assert_eq!(got.len(), 2, "a link rule is not paid for by a word rule");
+    }
+
+    /// The id is what separates an offense from an echo of one, so the same
+    /// verdict read twice has to mint the same ids.
+    #[test]
+    fn charging_is_deterministic() {
+        let v = verdict(vec![
+            f("slurs", "per_message", true, "deterministic", 2, &["m1", "m2"], 2),
+            f("rate", "per_window", false, "deterministic", 9, &["m3"], 1),
+        ]);
+        let once = charges(&v, &base());
+        let twice = charges(&v, &base());
+        assert_eq!(once, twice);
+        let ids: std::collections::HashSet<&str> = once.iter().map(|c| c.conviction.as_str()).collect();
+        assert_eq!(ids.len(), once.len(), "and no id is minted twice");
+    }
+
+    /// The operator's scale, not the engine's.
+    #[test]
+    fn a_charge_is_worth_what_the_operator_said() {
+        let mut cfg = crate::config::Config::default();
+        cfg.rules.words = vec![crate::config::WordRule {
+            id: "slurs".into(),
+            patterns: vec!["x".into()],
+            gravity: crate::config::Gravity::Grave,
+        }];
+        let p = cfg.for_community("");
+        let v = verdict(vec![f("slurs", "per_message", true, "deterministic", 1, &["m1"], 1)]);
+        assert_eq!(charges(&v, &p)[0].worth, p.ladder.strikes.grave);
+    }
+
+    /// A member nothing convicted is charged nothing.
+    #[test]
+    fn a_clean_verdict_charges_nothing() {
+        assert!(charges(&verdict(vec![]), &base()).is_empty());
+    }
+
+    /// Every charge carries a line a person can read.
+    #[test]
+    fn every_charge_cites_its_evidence() {
+        let v = verdict(vec![f("slurs", "per_message", true, "deterministic", 2, &["m1", "m2"], 2)]);
+        for c in charges(&v, &base()) {
+            assert!(c.evidence.contains("slurs"), "{}", c.evidence);
+            assert!(!c.conviction.is_empty());
+        }
+    }
 }

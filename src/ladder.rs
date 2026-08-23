@@ -216,4 +216,101 @@ mod tests {
         let spread = [Strike { worth: 4, at_ms: 0 }, Strike { worth: 4, at_ms: hl_ms }];
         assert_eq!(decide(&l, total(&spread, hl_ms, l.decay_half_life_hours)), Some(Response::DeleteAndWarn));
     }
+
+    fn answer(name: &str, at_total: u32, at_ms: u64) -> (&str, u32, u64) {
+        (name, at_total, at_ms)
+    }
+
+    const HL: u64 = 168;
+    const HOUR: u64 = 3_600_000;
+
+    /// The whole decision, as a table. Each row is (total, prior, now) -> rung.
+    #[test]
+    fn owed_answers_the_same_way_every_time() {
+        let l = ladder();
+        let cases: &[(u32, Option<(&str, u32, u64)>, u64, Option<Response>)] = &[
+            // Nothing on file: the first answer is the bottom rung.
+            (12, None, 0, Some(Response::Warn)),
+            (1, None, 0, Some(Response::Warn)),
+            (0, None, 0, None),
+            // Answered, and nothing new has happened.
+            (12, Some(answer("warn", 12, 0)), 0, None),
+            (11, Some(answer("warn", 12, 0)), 0, None),
+            // A new offense, so it climbs one rung.
+            (24, Some(answer("warn", 12, 0)), 0, Some(Response::DeleteAndWarn)),
+            (36, Some(answer("delete_and_warn", 24, 0)), 0, Some(Response::Kick)),
+            (48, Some(answer("kick", 36, 0)), 0, Some(Response::Ban)),
+            // Nothing above the top.
+            (60, Some(answer("ban", 48, 0)), 0, None),
+            // Decay closes the gate as the total falls with it.
+            (6, Some(answer("warn", 12, 0)), HL * HOUR, None),
+            // And opens it once the old answer is fully forgiven.
+            (4, Some(answer("kick", 12, 0)), HL * HOUR * 40, Some(Response::Warn)),
+            // A prior no ladder configures floors nothing.
+            (12, Some(answer("raid:kick", 0, 0)), 0, Some(Response::Warn)),
+        ];
+        for (total, prior, now, want) in cases {
+            assert_eq!(
+                owed(&l, *total, *prior, all_powers, *now, HL),
+                *want,
+                "total {total}, prior {prior:?}, at {now}"
+            );
+        }
+    }
+
+    /// Whatever the record says, one call answers at most one rung above what
+    /// was last delivered — so nothing can jump the ladder.
+    #[test]
+    fn owed_never_climbs_more_than_one_rung() {
+        let l = ladder();
+        for prior_rank in 0..=4u8 {
+            let name = match prior_rank {
+                1 => Some("warn"),
+                2 => Some("delete_and_warn"),
+                3 => Some("kick"),
+                4 => Some("ban"),
+                _ => None,
+            };
+            for total in [1u32, 4, 8, 12, 50, 1000, u32::MAX / 2] {
+                let prior = name.map(|n| answer(n, 1, 0));
+                if let Some(got) = owed(&l, total, prior, all_powers, 0, HL) {
+                    assert!(
+                        got.rank() <= prior_rank.max(1) + 1,
+                        "prior {name:?} at total {total} answered {got:?}, which skips a rung"
+                    );
+                }
+            }
+        }
+    }
+
+    /// An absurd total must not panic or wrap.
+    #[test]
+    fn extreme_totals_are_answered_without_arithmetic_trouble() {
+        let l = ladder();
+        for total in [0, 1, u32::MAX - 1, u32::MAX] {
+            let _ = owed(&l, total, None, all_powers, u64::MAX, HL);
+            let _ = owed(&l, total, Some(answer("warn", u32::MAX, 0)), all_powers, u64::MAX, 1);
+        }
+    }
+
+    /// Decay is monotone and never negative.
+    #[test]
+    fn decay_only_ever_falls() {
+        let mut last = u32::MAX;
+        for halvings in 0..40u64 {
+            let got = decay(1000, halvings * HL * HOUR, HL);
+            assert!(got <= last, "decay rose from {last} to {got} at {halvings} half-lives");
+            last = got;
+        }
+        assert_eq!(last, 0, "and reaches zero");
+        assert_eq!(decay(1000, u64::MAX, HL), 0);
+        assert_eq!(decay(0, 0, HL), 0);
+        assert_eq!(decay(1000, 0, HL), 1000, "no age, no decay");
+    }
+
+    /// A zero half-life cannot divide by zero.
+    #[test]
+    fn a_zero_half_life_does_not_divide_by_zero() {
+        assert_eq!(decay(12, 1_000_000, 0), 12, "nothing decays, and nothing panics");
+    }
 }
