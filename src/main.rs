@@ -317,18 +317,37 @@ async fn main() -> vector_sdk::Result<()> {
             async move {
                 match event {
                     BotEvent::Message(msg) => {
-                        if let Err(e) = lanes::screen(&bot, &msg, &cfg, &store, &wires, &me).await {
-                            eprintln!("screen: {e}");
-                        }
-                        if let Err(e) =
-                            lanes::watch_media(&bot, &msg, &cfg, &store, eyes.as_ref().as_ref(), &wires, &me).await
-                        {
-                            eprintln!("media: {e}");
-                        }
+                        // The tripwire FIRST. These three run in order in one
+                        // task, and the media lane waits on a per-community
+                        // permit held across a download — so behind it the
+                        // tripwire's arrivals were stamped at release time,
+                        // one classification apart, and a wave of images could
+                        // never look like a wave.
                         if let (Some(community), Some(author)) = (msg.community(), msg.author()) {
                             if !msg.is_mine() {
                                 lanes::trip(&bot, &community, &cfg, &store, &wires, &author, &me).await;
                             }
+                        }
+                        let sentenced = match lanes::screen(&bot, &msg, &cfg, &store, &wires, &me).await {
+                            Ok(sentenced) => sentenced,
+                            Err(e) => {
+                                eprintln!("screen: {e}");
+                                false
+                            }
+                        };
+                        if let Err(e) = lanes::watch_media(
+                            &bot,
+                            &msg,
+                            &cfg,
+                            &store,
+                            eyes.as_ref().as_ref(),
+                            &wires,
+                            &me,
+                            sentenced,
+                        )
+                        .await
+                        {
+                            eprintln!("media: {e}");
                         }
                     }
                     // A join flood is the other half of the raid shape, and it

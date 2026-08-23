@@ -61,24 +61,6 @@ pub fn validate_policy(p: &crate::policy::CommunityPolicy, whose: &str) -> Resul
     if s.grave == 0 {
         return at("ladder.strikes.grave = 0: every offense is worth nothing, so no total ever answers to anything".into());
     }
-    // A rehearsal records nothing, so an unarmed rung is never answered and the
-    // ladder cannot climb past it. Arming kick while warn is off therefore
-    // rehearses a warning forever and never kicks anybody.
-    let armed = [
-        (p.arm.warn, "warn"),
-        (p.arm.delete, "delete"),
-        (p.arm.kick, "kick"),
-        (p.arm.ban, "ban"),
-    ];
-    if let Some((_, gap)) = armed.iter().enumerate().find_map(|(i, (on, name))| {
-        (!on && armed[i + 1..].iter().any(|(above, _)| *above)).then_some((i, *name))
-    }) {
-        return at(format!(
-            "[arm] {gap} is off while a harsher class is on: an unarmed rung is never answered, \
-             so the ladder would rehearse it forever and never reach the armed one. \
-             Arm from the bottom up."
-        ));
-    }
     if p.limits.halt_if_over_pct == 0 || p.limits.halt_if_over_pct > 100 {
         return at(format!(
             "limits.halt_if_over_pct = {} — must be 1..=100 (0 would mean 'never act', which is what [arm] is for)",
@@ -130,7 +112,10 @@ pub fn validate_policy(p: &crate::policy::CommunityPolicy, whose: &str) -> Resul
         }
         // The matcher drops an empty needle, so the rule is configured, armed
         // and silently matches nothing.
-        if let Some(bad) = r.patterns.iter().find(|pat| pat.trim().is_empty() || pat.trim() == "*") {
+        // The matcher strips one leading and one trailing `*`, so anything that
+        // is only asterisks reduces to an empty needle and is dropped: the rule
+        // is configured, armed, and matches nothing.
+        if let Some(bad) = r.patterns.iter().find(|pat| pat.trim().chars().all(|c| c == '*')) {
             return at(format!("rules.words '{}' has the pattern {bad:?}, which matches nothing", r.id));
         }
     }
@@ -627,6 +612,24 @@ impl Config {
             if self.vision.mimes.is_empty() {
                 return Err("vision.mimes is empty: nothing would ever be sent to the model".into());
             }
+            // A type the byte sniffer cannot name is one Sentinel will fetch,
+            // fail to identify, and route to a person — forever, for every
+            // attachment of that type.
+            let known = vector_sdk::vector_core::crypto::RECOGNISED_MIMES;
+            if let Some(bad) = self.vision.mimes.iter().find(|m| !known.contains(&m.as_str())) {
+                return Err(format!(
+                    "vision.mimes lists '{bad}', which cannot be recognised from an attachment's bytes. \
+                     Known types: {}",
+                    known.join(", ")
+                ));
+            }
+            if !self.vision.base_url.contains("://") {
+                return Err(format!(
+                    "vision.base_url '{}' has no scheme — every request would fail to build, and every \
+                     attachment would route to a person",
+                    self.vision.base_url
+                ));
+            }
             if self.vision.max_bytes == 0 {
                 return Err("vision.max_bytes = 0: every attachment is refused as oversize".into());
             }
@@ -706,8 +709,6 @@ mod tests {
             ("[raid]\nmax_batch = 900", "max_batch"),
             ("[raid]\ntripwire_accounts = 1", "tripwire_accounts"),
             ("[limits]\nhalt_if_over_pct = 0", "halt_if_over_pct"),
-            ("[arm]\nwarn = false\nkick = true", "Arm from the bottom up"),
-            ("[arm]\nwarn = true\ndelete = false\nban = true", "Arm from the bottom up"),
             ("[limits]\nhalt_if_over_pct = 200", "halt_if_over_pct"),
             ("[limits]\nmax_actions_per_run = 0", "max_actions_"),
             ("[bot]\ncommunities = []", "communities"),
@@ -785,6 +786,21 @@ mod unknown_key_tests {
 
     /// Values that parse, validate today, and then make the thing they
     /// configure structurally unable to do its job.
+    /// The bottom-up refusal used to reject this, on the premise that an
+    /// unarmed rung is never answered. A rehearsal records, so it is — the
+    /// ladder climbs past the rehearsed warning and delivers the kick.
+    #[test]
+    fn arming_a_harsher_class_than_a_gentler_one_is_a_real_configuration() {
+        for text in [
+            "[arm]\nwarn = false\nkick = true",
+            "[arm]\nwarn = true\ndelete = false\nban = true",
+            "[arm]\nban = true",
+        ] {
+            let cfg: Config = toml::from_str(text).unwrap();
+            Config::validate_for_test(&cfg).unwrap_or_else(|e| panic!("{text:?} must boot: {e}"));
+        }
+    }
+
     #[test]
     fn a_config_that_can_only_fail_is_refused_at_boot() {
         let label = "[[vision.labels]]\nname = \"gore\"\nthreshold = 0.9\ngravity = \"grave\"";
@@ -794,12 +810,20 @@ mod unknown_key_tests {
             (format!("[vision]\nenabled = true\nmax_per_min = 0\n{label}"), "max_per_min"),
             (format!("[vision]\nenabled = true\ntimeout_secs = 0\n{label}"), "timeout_secs"),
             (format!("[vision]\nenabled = true\nmodel = \"\"\n{label}"), "model"),
+            (format!("[vision]\nenabled = true\nmimes = [\"image/avif\"]\n{label}"), "cannot be recognised"),
+            (format!("[vision]\nenabled = true\nmimes = [\"image/heic\"]\n{label}"), "cannot be recognised"),
+            (
+                format!("[vision]\nenabled = true\nbase_url = \"127.0.0.1:8080/v1\"\nallow_remote = true\n{label}"),
+                "no scheme",
+            ),
             (format!("[vision]\nenabled = true\n{label}\n{label}"), "listed twice"),
             ("[raid]\nmin_confidence = 0".into(), "min_confidence"),
             ("[raid]\ntripwire_cooldown_secs = 0".into(), "tripwire_cooldown_secs"),
             ("[ladder]\ndecay_half_life_hours = 100000000".into(), "decay_half_life_hours"),
             ("[ladder]\nstrikes = { note = 0, minor = 0, serious = 0, grave = 0 }".into(), "grave = 0"),
             ("[[rules.words]]\nid = \"x\"\npatterns = [\"\"]\ngravity = \"minor\"".into(), "matches nothing"),
+            ("[[rules.words]]\nid = \"x\"\npatterns = [\"**\"]\ngravity = \"minor\"".into(), "matches nothing"),
+            ("[[rules.words]]\nid = \"x\"\npatterns = [\"***\"]\ngravity = \"minor\"".into(), "matches nothing"),
             ("[[rules.links]]\nid = \"x\"\ndomains = [\"\"]\ngravity = \"minor\"".into(), "matches nothing"),
         ];
         for (text, needle) in cases {

@@ -89,9 +89,9 @@ a member escalates once, not twice.
    stops making a light offense in October answerable only by a ban.
 
    A rung this community grants no permission for is skipped rather than blocking the ones
-   above it. Arming has to go bottom-up — arming `kick` while `warn` is off is refused at
-   startup, because an unarmed rung is never answered and the ladder would rehearse it
-   forever without ever reaching the armed one.
+   above it, and an unarmed one is rehearsed and recorded, so the ladder goes on climbing
+   past it. Arming `kick` while `warn` is off is a real configuration: the warning is
+   rehearsed and the kick is delivered.
 
 Only *proven* convictions earn strikes from the engine, on either clock. Windowed inference is
 reported to the mod channel for a person to answer, never sentenced — except raid containment,
@@ -170,7 +170,8 @@ Three rules this lane keeps:
   extension, so a type Sentinel skipped in silence would still be on screen.
 - **One community's flood is its own.** The classifier budget is per community, and its
   single permit is held from before the fetch, so a wave in one room cannot spend the minute
-  or the memory of another.
+  of another. That bounds each community to one blob in memory at a time — N watched
+  communities is N of them, not one.
 
 ## Asking it things
 

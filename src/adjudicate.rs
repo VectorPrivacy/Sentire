@@ -276,7 +276,6 @@ mod tests {
         assert!(matches!(adjudicate(&cfg, all_powers(), &f, Response::Ban), Sentence::Carry { .. }));
     }
 
-    /// A model's opinion is inference and must not ride the switch an operator
     #[test]
     fn arming_is_per_class_and_rehearsal_is_the_resting_state() {
         let mut cfg = policy();

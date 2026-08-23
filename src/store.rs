@@ -232,13 +232,16 @@ impl Store {
     /// Containment's own budget. The ladder's count deliberately excludes raid
     /// rows, so reading it here measured an unrelated quantity: a raid ceiling
     /// that could never see a raid, and that a single warning switched off.
-    /// Claims are excluded — a claim is a reservation, not a removal.
+    /// REMOVALS only. A claim is a reservation and a report touches nobody, so
+    /// counting either meant report mode halted the containment it was
+    /// rehearsing — and an operator following the documented rollout, report
+    /// then kick, found the first real containment already over its ceiling.
     pub fn contained_last_hour(&self, community: &str, now_ms: u64) -> Result<usize, String> {
         let since = now_ms.saturating_sub(3_600_000) as i64;
         self.lock()
             .query_row(
                 "SELECT COUNT(DISTINCT subject) FROM actions WHERE community = ?1 AND at_ms >= ?2 \
-                 AND response LIKE 'raid:%' AND response != 'raid:claim'",
+                 AND response IN ('raid:kick', 'raid:ban')",
                 rusqlite::params![community, since],
                 |r| r.get::<_, i64>(0).map(|n| n as usize),
             )
@@ -476,6 +479,11 @@ pub mod tests {
 
         assert_eq!(s.actions_last_hour("c", 1000).unwrap(), 2, "the ladder sees only ladder rows");
         assert_eq!(s.contained_last_hour("c", 1000).unwrap(), 2, "containment sees only removals");
+
+        // A report touches nobody, so it must not spend the removal ceiling —
+        // report-then-kick is the documented rollout.
+        s.log_action("c", "npub1e", "raid:report", 0, 0, "").unwrap();
+        assert_eq!(s.contained_last_hour("c", 1000).unwrap(), 2, "a report removed nobody");
     }
 
     #[test]

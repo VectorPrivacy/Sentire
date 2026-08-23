@@ -12,7 +12,7 @@ use crate::tripwire::Tripwire;
 use crate::vision::Vision as _;
 use crate::review::sweep;
 use tokio::sync::Semaphore;
-use crate::act::{announce, enforce, own_finding, own_verdict, Ctx};
+use crate::act::{announce, enforce, own_finding, own_verdict, Ctx, Outcome};
 use crate::{
     conviction_id, now_ms, powers_of, resolve_absent, roster_size, short, standing_of, untrip, Pass,
     Watches,
@@ -36,17 +36,17 @@ pub(crate) async fn screen(
     store: &Arc<Store>,
     watches: &Watches,
     me: &str,
-) -> vector_sdk::Result<()> {
+) -> vector_sdk::Result<bool> {
     if !msg.is_group || msg.is_mine() {
-        return Ok(());
+        return Ok(false);
     }
-    let (Some(community), Some(author)) = (msg.community(), msg.author()) else { return Ok(()) };
+    let (Some(community), Some(author)) = (msg.community(), msg.author()) else { return Ok(false) };
     if !cfg.watches(community.id()) {
-        return Ok(());
+        return Ok(false);
     }
     let findings = community.screen(msg).await?;
     if findings.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let now = now_ms();
     let policy = cfg.for_community(community.id());
@@ -54,7 +54,7 @@ pub(crate) async fn screen(
     // long-tenured regular reads as untrusted here.
     let shield = resolve_absent(standing_of(watches, community.id(), &author), msg);
     if matches!(shield.as_str(), "protected" | "unknown") || (shield == "trusted" && policy.shields.respect_trusted) {
-        return Ok(());
+        return Ok(false);
     }
     let mut fresh = false;
     let mut worst: Option<(Gravity, String)> = None;
@@ -69,13 +69,8 @@ pub(crate) async fn screen(
         } else {
             format!("{} [{}] {}", f.rule_id, f.severity, f.detail.join(", "))
         };
-        // The screen has no conviction id — the message has no id yet at send
-        // time and this is a different pipeline — so one is minted from what
-        // makes this offense distinct. The sweep's own id for the same text
-        // differs, which is deliberate: an offense caught live and the same
-        // offense re-read from the corpus are one event, and the sweep skips
-        // members whose standing has already been answered.
-        // The same id the sweep mints, so whichever clock arrives first wins.
+        // The same id the sweep mints for this message, so whichever clock
+        // reaches the offense first wins and the other is an ignored insert.
         let conviction = conviction_id(&f.rule_id, &msg.message.id);
         fresh |= store
             .record(community.id(), &author, &conviction, worth, now, &evidence)
@@ -85,10 +80,10 @@ pub(crate) async fn screen(
             worst = Some((gravity, evidence));
         }
     }
-    let Some((_, evidence)) = worst else { return Ok(()) };
+    let Some((_, evidence)) = worst else { return Ok(false) };
     println!("[screen] {} — {evidence}", short(&author));
     if !fresh {
-        return Ok(());
+        return Ok(false);
     }
     let strikes = store.strikes(community.id(), &author).map_err(vector_sdk::Error::Other)?;
     let total = ladder::total(&strikes, now, policy.ladder.decay_half_life_hours);
@@ -101,9 +96,10 @@ pub(crate) async fn screen(
             f.messages = vec![msg.message.id.clone()];
         }
         let v = own_verdict(&author, shield, vec![evidence.clone()], findings);
-        enforce(bot, &community, &ctx, store, watches, &Mutex::new(0), &v, &strikes).await?;
+        let outcome = enforce(bot, &community, &ctx, store, watches, &Mutex::new(0), &v, &strikes).await?;
+        return Ok(outcome == Outcome::Acted);
     }
-    Ok(())
+    Ok(false)
 }
 
 /// The cache key: which model was asked, and what it was asked about.
@@ -160,6 +156,10 @@ pub(crate) async fn watch_media(
     eyes: Option<&vision::openai::OpenAiVision>,
     watches: &Watches,
     me: &str,
+    // The text screen already answered for this post: one post is one
+    // sentence, so the strike is still recorded and the rung is not spent
+    // twice seconds apart.
+    already_sentenced: bool,
 ) -> vector_sdk::Result<()> {
     let (Some(eyes), true) = (eyes, msg.is_group && msg.is_file && !msg.is_mine()) else { return Ok(()) };
     let (Some(community), Some(author)) = (msg.community(), msg.author()) else { return Ok(()) };
@@ -205,6 +205,10 @@ pub(crate) async fn watch_media(
         // each. Waiting rather than declining: an image that has to queue still
         // gets judged, and a decline is a mod-channel line saying it was not.
         let _slot = budget.slot.acquire().await;
+        // After the wait, not before it. The permit is held across a download
+        // a sender can stretch, so a timestamp read at the top of the handler
+        // would stamp strikes and cache rows minutes early.
+        let now = now_ms();
         // `att.id` is the SENDER's declared hash and is never verified, so the
         // cache keys on what actually downloaded.
         let bytes = match bot.download_attachment_from(att, msg.message.npub.as_deref()).await {
@@ -287,6 +291,12 @@ pub(crate) async fn watch_media(
     // Enforcing per attachment walked the whole ladder inside a single post:
     // four flagged images were a warn, a delete, a kick and a ban.
     if flagged.is_empty() {
+        return Ok(());
+    }
+    if already_sentenced {
+        // Recorded, not answered: the strike stands and the next offense
+        // climbs from it.
+        println!("[media] {} — already answered for this post", short(&author));
         return Ok(());
     }
     let strikes = store.strikes(community.id(), &author).map_err(vector_sdk::Error::Other)?;
@@ -379,10 +389,13 @@ pub(crate) async fn unclassified(
     why: &str,
 ) {
     println!("[media] UNJUDGED {} — {why} — for review", short(att_id));
-    let bucket = format!("unjudged:{}", now / 60_000);
+    // Bucketed per REASON as well as per minute: a download failure, an
+    // unlisted type and a spent budget are different problems, and one line
+    // covering all three tells an operator nothing about which they have.
+    let bucket = format!("unjudged:{}:{}", why, now / 60_000);
     if store.claim(community.id(), &bucket, now, 3_600_000).unwrap_or(false) {
         let ctx = live_ctx(cfg, community, watches, me).await;
-        announce(bot, community, &ctx, "Attachments arrived faster than I could check them — some were not judged.").await;
+        announce(bot, community, &ctx, &format!("Some attachments were not judged — {why}.")).await;
     }
 }
 
@@ -422,8 +435,10 @@ pub(crate) async fn live_ctx(cfg: &Config, community: &Community, watches: &Watc
 /// minute. Every message is its own task, so without this a wave of images is a
 /// wave of concurrent multi-megabyte fetches and uploads.
 ///
-/// Per COMMUNITY. One shared budget meant twenty junk images in one room spent
-/// the minute for every other room Sentinel watches.
+/// Per COMMUNITY, so one room's flood cannot spend another's minute — and so
+/// the resident-bytes bound is one blob per WATCHED COMMUNITY, not one overall.
+/// The tripwire runs before this, or a queue here would hide a wave of images
+/// from the one thing meant to catch it.
 pub(crate) struct Budget {
     pub(crate) slot: Semaphore,
     pub(crate) per_min: u32,
@@ -482,13 +497,14 @@ mod tests {
         }
     }
 
-    /// A voice note or a document renders as a file nobody meets by accident,
-    /// so skipping it is quiet rather than a mod-channel line every minute.
+    /// Audio and documents are skipped because no vision model can judge them,
+    /// not because nobody sees them — a client does render audio as a player.
+    /// Announcing every voice note would be a mod-channel line a minute.
     #[test]
-    fn things_no_client_renders_as_an_image_are_skipped_quietly() {
+    fn what_a_vision_model_cannot_judge_is_skipped_quietly() {
         let cfg = vision();
-        for ext in ["ogg", "mp3", "pdf", "zip", "txt", "wav", "xyz", ""] {
-            assert_eq!(gate(ext, 1024, &cfg), Gate::Skip, ".{ext} is not media a reader stumbles into");
+        for ext in ["ogg", "mp3", "pdf", "zip", "txt", "wav", "flac", "m4a", "xyz", ""] {
+            assert_eq!(gate(ext, 1024, &cfg), Gate::Skip, ".{ext} is not something a vision model can judge");
         }
     }
 
