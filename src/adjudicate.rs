@@ -307,6 +307,28 @@ mod tests {
         );
     }
 
+    /// Each class answers to its OWN switch, and to no other.
+    #[test]
+    fn every_class_reads_only_its_own_arming_switch() {
+        let cases = [
+            (Response::Warn, "warn"),
+            (Response::DeleteAndWarn, "delete"),
+            (Response::Kick, "kick"),
+            (Response::Ban, "ban"),
+        ];
+        for (response, field) in cases {
+            let cfg: Config =
+                toml::from_str(&format!("[arm]\n{field} = true")).expect("a switch by name");
+            let p = cfg.for_community("");
+            assert!(armed_for(&p, response), "{field} must arm {response:?}");
+            for (other, other_field) in cases {
+                if other != response {
+                    assert!(!armed_for(&p, other), "{field} must not arm {other_field}");
+                }
+            }
+        }
+    }
+
     /// The pre-filters every lane runs before recording anything must be the
     /// same rule as the gate that follows them. Three hand-written copies had
     /// already drifted: the sweep's omitted `unknown` and `absent`, so it built

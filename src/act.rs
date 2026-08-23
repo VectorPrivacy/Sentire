@@ -470,6 +470,22 @@ mod tests {
         assert_eq!(cited_ids(&v), vec!["m1", "m2"]);
     }
 
+    /// The warned member reads this, so it has to say what matched and what
+    /// happens next — and must never be empty, whatever the evidence was.
+    #[test]
+    fn a_warning_says_what_matched_and_what_comes_next() {
+        for why in ["slurs [severe] 3×", "", "no findings", "a\nmultiline\nreason"] {
+            let text = warn_text(why);
+            assert!(text.contains("Sentinel"), "{text}");
+            assert!(text.contains("warning"), "{text}");
+            assert!(text.contains("escalate"), "a warning that does not say it escalates is not one");
+            assert!(text.contains("moderator"), "and it must name the way to dispute it");
+            if !why.is_empty() {
+                assert!(text.contains(why), "the evidence has to appear: {text}");
+            }
+        }
+    }
+
     /// Upstream drift must not promote engine findings to Sentinel's own. The
     /// SDK parses this field with `unwrap_or_default`, so an absence test would
     /// read a renamed field as "mine" for everything the engine ever reached.

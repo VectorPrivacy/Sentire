@@ -174,4 +174,31 @@ mod tests {
         let cfg = policy("[rules.rate]\nenabled = false\nper_secs = 60\ngravity = \"minor\"");
         assert!(compile(&cfg).is_none(), "disabled is absent, not present-but-off");
     }
+
+    /// Sentinel's gravity and the engine's severity are deliberately different
+    /// vocabularies, and the map between them must be total and ordered.
+    #[test]
+    fn gravity_maps_onto_severity_in_order() {
+        use vector_sdk::policy::Seriousness;
+        let pairs = [
+            (Gravity::Note, Seriousness::Notice),
+            (Gravity::Minor, Seriousness::Minor),
+            (Gravity::Serious, Seriousness::Major),
+            (Gravity::Grave, Seriousness::Severe),
+        ];
+        for (g, want) in pairs {
+            assert_eq!(seriousness(g), want, "{g:?}");
+        }
+        // And the round trip Sentinel actually performs: a severity coming back
+        // from the engine maps to the gravity that produced it.
+        for (g, _) in pairs {
+            let severity = match seriousness(g) {
+                Seriousness::Notice => "notice",
+                Seriousness::Minor => "minor",
+                Seriousness::Major => "major",
+                Seriousness::Severe => "severe",
+            };
+            assert_eq!(Gravity::from_severity(severity), g, "{severity} must come back as {g:?}");
+        }
+    }
 }
