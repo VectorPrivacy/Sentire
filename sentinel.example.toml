@@ -13,6 +13,16 @@ communities = ["*"]             # or explicit community ids
 # no record of it.
 poll_secs   = 120               # floor of 90: the report is memoised that long
 
+
+# How Sentinel introduces itself. Published as a kind-0 at boot, and only when
+# it differs from what is already out there — a member who has just been warned
+# looks up the npub that warned them, and an empty profile tells them nothing.
+[bot.profile]
+name  = "Sentinel"
+# about = "..."                 # the default explains what it is and how to appeal
+# avatar = "https://..."
+# banner = "https://..."
+
 # Nothing is armed until you say so, and each class arms separately. A bot that
 # warns is not thereby a bot that bans.
 # An unarmed rung is still rehearsed and recorded, so the ladder climbs past it.

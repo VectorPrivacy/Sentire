@@ -204,6 +204,7 @@ async fn main() -> vector_sdk::Result<()> {
 
     let bot = VectorBot::builder().nsec(nsec).public().build().await?;
     println!("Sentinel online as {}", bot.npub());
+    introduce(&bot, &cfg.bot.profile).await;
 
     let me = bot.npub().to_string();
     let communities: Vec<Community> = bot
@@ -388,6 +389,27 @@ async fn main() -> vector_sdk::Result<()> {
 /// points of "would ban" during a dry run must not be banned the moment the
 /// switch flips — they have never actually been warned. Wiping is the whole
 /// reason there is one ledger rather than two.
+/// Publish who Sentinel is, if that has changed.
+///
+/// A member who has just been warned looks up the npub that warned them, and
+/// an empty profile tells them nothing — not what it is, not what it does, not
+/// how to appeal. Only on a real difference: a kind-0 per restart is noise on
+/// every relay that carries it.
+async fn introduce(bot: &VectorBot, want: &crate::config::Profile) {
+    let now = bot.fetch_profile(&bot.npub()).await;
+    let same = now.as_ref().is_some_and(|p| {
+        p.name == want.name && p.about == want.about && p.avatar == want.avatar && p.banner == want.banner
+    });
+    if same {
+        return;
+    }
+    if bot.update_profile(&want.name, &want.avatar, &want.banner, &want.about).await {
+        println!("published profile — {}", want.name);
+    } else {
+        eprintln!("could not publish profile; members looking up this npub will find nothing");
+    }
+}
+
 /// What a wipe keys on: the LADDER's classes, in a stable order.
 ///
 /// Raid containment keeps no strikes and no rung, and its claims are already

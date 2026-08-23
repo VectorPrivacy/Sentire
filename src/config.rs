@@ -225,11 +225,45 @@ pub struct Bot {
     /// Seconds between sweeps. Clamped up to 90: the report is memoised for
     /// that long, so anything faster re-parses bytes it has already seen.
     pub poll_secs: u64,
+    /// How Sentinel introduces itself. Published as a kind-0 at boot, and only
+    /// when it differs from what is already out there — a member looking up an
+    /// npub that just warned them deserves to find out what it is.
+    pub profile: Profile,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Profile {
+    pub name: String,
+    pub about: String,
+    pub avatar: String,
+    pub banner: String,
+}
+
+impl Default for Profile {
+    fn default() -> Self {
+        Profile {
+            name: "Sentinel".into(),
+            about: "A moderation bot. The community's own rulebook decides what counts as an \
+                    offence; I decide what to do about it — a warning, a deleted message, a kick, \
+                    a ban — one step at a time, and never for anyone the community has vouched \
+                    for. Ask me /status, /why <member> or /pardon <member>."
+                .into(),
+            avatar: String::new(),
+            banner: String::new(),
+        }
+    }
 }
 
 impl Default for Bot {
     fn default() -> Self {
-        Bot { nsec_env: "SENTINEL_NSEC".into(), communities: vec!["*".into()], mod_channel: None, poll_secs: 120 }
+        Bot {
+            nsec_env: "SENTINEL_NSEC".into(),
+            communities: vec!["*".into()],
+            mod_channel: None,
+            poll_secs: 120,
+            profile: Profile::default(),
+        }
     }
 }
 
