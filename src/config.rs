@@ -69,6 +69,9 @@ pub fn validate_policy(p: &crate::policy::CommunityPolicy, whose: &str) -> Resul
             p.limits.halt_if_over_pct
         ));
     }
+    if p.limits.halt_floor == 0 {
+        return at("limits.halt_floor = 0: Sentinel could never answer for anybody".into());
+    }
     if p.limits.max_actions_per_run == 0 || p.limits.max_actions_per_hour == 0 {
         return at("limits.max_actions_* = 0 silently disables enforcement; leave the class unarmed instead".into());
     }
@@ -249,14 +252,22 @@ pub struct Arm {
 pub struct Limits {
     pub max_actions_per_run: usize,
     pub max_actions_per_hour: usize,
-    /// Acting on more than this % of the roster in one pass = stop everything
-    /// and page a human. A bug must not be able to empty a community.
+    /// How many DISTINCT people Sentinel may answer for in one community in an
+    /// hour, as a percentage of the roster, before it stops and asks a person.
+    /// Not a rate limit — every member has their own strikes and their own
+    /// rung. This is the blast radius: a misconfigured rule or a bad raid call
+    /// must not be able to walk the whole memberlist.
     pub halt_if_over_pct: u32,
+    /// ...but never fewer than this many people. A percentage alone is the
+    /// wrong shape when a community is small: 10% of four members floors to
+    /// one, so the SECOND offender in an hour deadlocks the bot — and a halt
+    /// also defers raid containment and skips the debt loop.
+    pub halt_floor: usize,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Limits { max_actions_per_run: 25, max_actions_per_hour: 100, halt_if_over_pct: 10 }
+        Limits { max_actions_per_run: 25, max_actions_per_hour: 100, halt_if_over_pct: 10, halt_floor: 3 }
     }
 }
 

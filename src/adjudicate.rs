@@ -44,16 +44,23 @@ pub struct Facts<'a> {
     pub is_me: bool,
 }
 
-/// How many actions the roster percentage allows.
+/// How many DISTINCT people Sentinel may answer for here in an hour.
 ///
-/// Floored at one. `10%` of a five-member community rounds to zero, which
-/// halted the ladder before its first action forever — a small community looked
-/// peaceful while nothing worked at all.
+/// Not a rate limit — every member has their own strikes and their own rung.
+/// This is the blast radius, so a misconfigured rule or a bad raid call cannot
+/// walk the whole memberlist.
+///
+/// A percentage alone is the wrong shape when a community is small: 10% of four
+/// members floors to one, so the SECOND offender in an hour deadlocks the bot,
+/// and a halt also defers raid containment and skips the debt loop. The floor
+/// keeps the protection where it matters and stops tiny communities seizing up.
+/// Never more than the roster, so the guard is always expressible.
 pub fn roster_ceiling(cfg: &CommunityPolicy, roster: usize) -> Option<usize> {
     if roster == 0 {
         return None;
     }
-    Some(((cfg.limits.halt_if_over_pct as usize * roster) / 100).max(1))
+    let pct = (cfg.limits.halt_if_over_pct as usize * roster) / 100;
+    Some(pct.max(cfg.limits.halt_floor).min(roster))
 }
 
 /// Whether this class is armed at all.
@@ -240,22 +247,61 @@ mod tests {
         assert_eq!(adjudicate(&cfg, partial, &facts(), Response::Ban), Sentence::Powerless { needs: "BAN" });
     }
 
-    /// A ceiling of 1 — every roster under 20 at the default 10% — must still
-    /// let the member already inside it climb. Counting them halted the bot on
-    /// the first sentence of every hour and took raid containment with it.
+    /// A member already inside the bound must still climb. Counting them halted
+    /// the bot on the first sentence of every hour and took raid containment
+    /// with it.
     #[test]
     fn a_member_already_inside_the_bound_can_still_be_escalated() {
         let cfg = policy();
         for roster in 1..=19usize {
-            assert_eq!(roster_ceiling(&cfg, roster), Some(1), "roster {roster}");
+            assert_eq!(roster_ceiling(&cfg, roster), Some(cfg.limits.halt_floor.min(roster)), "roster {roster}");
             let f = Facts { roster, subjects_this_hour: 0, ..facts() };
             assert!(
                 matches!(adjudicate(&cfg, all_powers(), &f, Response::Kick), Sentence::Carry { .. }),
                 "roster {roster} could not escalate the one member it had acted on"
             );
-            // But a SECOND person is over the bound.
-            let f = Facts { roster, subjects_this_hour: 1, ..facts() };
+            // And one distinct person PAST the ceiling halts — which the floor
+            // now pushes out to a sane number rather than the second offender.
+            let ceiling = roster_ceiling(&cfg, roster).expect("a non-empty roster has one");
+            let f = Facts { roster, subjects_this_hour: ceiling, ..facts() };
             assert!(matches!(adjudicate(&cfg, all_powers(), &f, Response::Kick), Sentence::Halt { .. }));
+        }
+    }
+
+    /// The shape a live four-member lab exposed: 10% floors to one, so the
+    /// SECOND distinct offender in an hour deadlocked the bot — and a halt also
+    /// defers raid containment and skips the debt loop.
+    #[test]
+    fn a_small_community_does_not_deadlock_on_its_second_offender() {
+        let cfg = policy();
+        for roster in 2..=10usize {
+            let f = Facts { roster, subjects_this_hour: 1, ..facts() };
+            assert!(
+                matches!(adjudicate(&cfg, all_powers(), &f, Response::Warn), Sentence::Carry { .. }),
+                "roster {roster} halted on its second offender"
+            );
+        }
+    }
+
+    /// And the guard still binds where it matters: a large community is held to
+    /// its percentage, not to the floor.
+    #[test]
+    fn a_large_community_answers_to_the_percentage() {
+        let cfg = policy();
+        assert_eq!(roster_ceiling(&cfg, 200), Some(20), "10% of 200");
+        assert_eq!(roster_ceiling(&cfg, 1000), Some(100));
+        let f = Facts { roster: 200, subjects_this_hour: 20, ..facts() };
+        assert!(matches!(adjudicate(&cfg, all_powers(), &f, Response::Kick), Sentence::Halt { .. }));
+    }
+
+    /// The ceiling can never exceed the community it is protecting.
+    #[test]
+    fn the_ceiling_never_exceeds_the_roster() {
+        let cfg = policy();
+        for roster in 1..=50usize {
+            let ceiling = roster_ceiling(&cfg, roster).expect("non-empty");
+            assert!(ceiling <= roster, "roster {roster} allows {ceiling}");
+            assert!(ceiling >= 1, "roster {roster} allows nothing");
         }
     }
 

@@ -70,6 +70,7 @@ pub struct LimitsOverride {
     pub max_actions_per_run: Option<usize>,
     pub max_actions_per_hour: Option<usize>,
     pub halt_if_over_pct: Option<u32>,
+    pub halt_floor: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -151,6 +152,7 @@ impl Config {
             p.limits.max_actions_per_run = l.max_actions_per_run.unwrap_or(p.limits.max_actions_per_run);
             p.limits.max_actions_per_hour = l.max_actions_per_hour.unwrap_or(p.limits.max_actions_per_hour);
             p.limits.halt_if_over_pct = l.halt_if_over_pct.unwrap_or(p.limits.halt_if_over_pct);
+            p.limits.halt_floor = l.halt_floor.unwrap_or(p.limits.halt_floor);
         }
         if let Some(l) = &o.ladder {
             if let Some(o) = &l.strikes {

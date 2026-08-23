@@ -31,7 +31,14 @@ raid   = false
 [limits]
 max_actions_per_run  = 25
 max_actions_per_hour = 100
-halt_if_over_pct     = 10       # touching more of the roster than this halts the pass
+# The blast radius, NOT a rate limit — every member has their own strikes and
+# their own rung on the ladder. This caps how many DISTINCT people Sentinel may
+# answer for in one community in an hour before it stops and asks a person, so
+# a misconfigured rule or a bad raid call cannot walk the whole memberlist.
+# The percentage scales with the community; the floor stops a small one
+# deadlocking on its second offender. Whichever is larger wins.
+halt_if_over_pct     = 10       # % of the roster, per hour
+halt_floor           = 3        # ...but never fewer than this many people
 
 # The rules Sentinel compiles into an engine policy. Vector's built-in raid
 # detection runs regardless; everything here is yours.

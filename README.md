@@ -144,9 +144,25 @@ proven: nobody can replay it, and the engine's rule is that inference may not se
 `[arm] raid` is you overriding that, deliberately, for this case. It is false by default.
 
 Even armed, three things still hold: shields survive (a trusted regular caught in a wave is
-never contained), a pass that would touch more than `halt_if_over_pct` of the roster stops and
-asks for a person, and bans go out via `ban_many` in batches — each individual ban rotates the
-community's keys, and forty rotations strand everyone.
+never contained), the blast-radius ceiling applies (below), and bans go out via `ban_many` in
+batches — each individual ban rotates the community's keys, and forty rotations strand
+everyone.
+
+## The blast radius
+
+`[limits] halt_if_over_pct` and `halt_floor` cap how many **distinct people** Sentinel may
+answer for in one community in an hour. Past that it stops and asks a person.
+
+This is not a rate limit, and it is not per member: every member has their own strikes, their
+own decaying total and their own rung, and none of that is shared. It is the blast radius — a
+misconfigured rule, an engine bug or a bad raid call must not be able to walk the whole
+memberlist while nobody is watching.
+
+The percentage scales with the community and the floor keeps a small one working; whichever is
+larger wins, and neither can exceed the roster. A percentage alone was the wrong shape: 10% of
+four members floors to one, so the second offender in an hour deadlocked the bot — and a halt
+also defers raid containment and skips the debt loop for that pass. The member currently being
+answered is excluded from the count, so someone already inside the bound still climbs.
 
 ## The media lane
 
