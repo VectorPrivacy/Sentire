@@ -90,7 +90,14 @@ pub fn adjudicate(cfg: &CommunityPolicy, powers: Powers, facts: &Facts, response
         // this — a live lane, which has the member in hand — passes the resolved
         // value; one that cannot gets a refusal rather than a default.
         "absent" => return Sentence::Spare { why: "not on the roster" },
-        _ => {}
+        // Known vocabulary that is not a shield here: `indeterminate` means
+        // tenure could not be established, and `trusted` has already passed the
+        // guard above in a community that chose to reach its regulars.
+        "none" | "indeterminate" | "trusted" => {}
+        // Anything else is the engine's vocabulary having moved. Falling
+        // through would read a renamed shield as "not shielded", which is a
+        // removal — the one direction upstream drift must never take.
+        _ => return Sentence::Spare { why: "standing not recognised" },
     }
 
     // Can Sentinel even do this here? Being a member is not being a moderator,
@@ -287,5 +294,60 @@ mod tests {
             adjudicate(&cfg, all_powers(), &facts(), Response::Ban),
             Sentence::Carry { response: Response::Ban, armed: false }
         );
+    }
+
+    /// The whole vocabulary, in one place. A shield the gate does not know used
+    /// to fall through to "not shielded", which is a removal — so an engine
+    /// rename would have been a bug that only showed up as banned moderators.
+    #[test]
+    fn every_shield_string_is_recognised_and_an_unknown_one_spares() {
+        let cfg = policy();
+        for (shield, spared) in [
+            ("protected", true),
+            ("trusted", true),
+            ("unknown", true),
+            ("absent", true),
+            ("none", false),
+            ("indeterminate", false),
+        ] {
+            let f = Facts { shield, ..facts() };
+            let got = adjudicate(&cfg, all_powers(), &f, Response::Ban);
+            assert_eq!(
+                matches!(got, Sentence::Spare { .. }),
+                spared,
+                "{shield} must {} be spared, got {got:?}",
+                if spared { "" } else { "not" }
+            );
+        }
+
+        // Anything the engine might rename to.
+        for unknown in ["Trusted", "protected ", "vouched", "", "staff", "none "] {
+            let f = Facts { shield: unknown, ..facts() };
+            assert!(
+                matches!(adjudicate(&cfg, all_powers(), &f, Response::Ban), Sentence::Spare { .. }),
+                "an unrecognised shield ({unknown:?}) must spare, never remove"
+            );
+        }
+    }
+
+    /// The shields the ENGINE emits, taken from its own enum rather than from
+    /// this file's memory of it.
+    #[test]
+    fn the_engines_own_shield_names_are_all_handled() {
+        use vector_sdk::vector_core::community::policy::types::Shield;
+        let cfg = policy();
+        for shield in [Shield::None, Shield::Trusted, Shield::Protected, Shield::Indeterminate] {
+            // Exactly how the console renders it for a consumer.
+            let name = format!("{shield:?}").to_lowercase();
+            let f = Facts { shield: &name, ..facts() };
+            let got = adjudicate(&cfg, all_powers(), &f, Response::Ban);
+            let spared = matches!(got, Sentence::Spare { .. });
+            match shield {
+                Shield::Protected | Shield::Trusted => assert!(spared, "{name} is standing"),
+                Shield::None | Shield::Indeterminate => {
+                    assert!(!spared, "{name} is not standing, and must not be spared as unrecognised")
+                }
+            }
+        }
     }
 }

@@ -85,13 +85,22 @@ fn standing_of(watches: &Watches, community: &str, npub: &str) -> String {
 
 /// A member the last sweep never saw — joined since, or the roster is stale.
 /// Ask the community's own roles before treating them as ordinary.
+///
+/// Fails CLOSED. Every other unresolved standing in this codebase does, and
+/// this one gates more than enforcement: an unshielded member's attachments are
+/// decrypted and, with a remote endpoint, posted to somebody else's server. A
+/// local read that errored is not evidence that somebody is ordinary.
 fn resolve_absent(shield: String, msg: &vector_sdk::IncomingMessage) -> String {
     if shield != "absent" {
         return shield;
     }
     match msg.member() {
-        Some(m) if m.is_admin() => "protected".into(),
-        _ => "none".into(),
+        Some(m) => match m.try_is_admin() {
+            Ok(true) => "protected".into(),
+            Ok(false) => "none".into(),
+            Err(_) => "unknown".into(),
+        },
+        None => "unknown".into(),
     }
 }
 
@@ -341,13 +350,7 @@ fn wipe_on_arming_change(cfg: &Config, community: &Community, store: &Arc<Store>
     .collect::<Vec<_>>()
     .join(" ");
     match store.note_armed(community.id(), &classes) {
-        Ok(true) => {
-            if let Err(e) = store.forget(community.id()) {
-                eprintln!("{}: could not clear the slate: {e}", short(community.id()));
-            } else {
-                println!("{} — arming changed, starting from a clean slate", short(community.id()));
-            }
-        }
+        Ok(true) => println!("{} — arming changed, starting from a clean slate", short(community.id())),
         Ok(false) => {}
         Err(e) => eprintln!("{}: {e}", short(community.id())),
     }

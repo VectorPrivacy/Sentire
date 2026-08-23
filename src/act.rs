@@ -96,22 +96,27 @@ pub(crate) async fn enforce(
     let total = ladder::total(strikes, now, ctx.policy.ladder.decay_half_life_hours);
     println!("[{id}] {} {name} {who} — {total} strike(s) — {why}", if armed { "ENFORCE" } else { "WOULD  " });
 
-    // A rehearsal records nothing. There is one ledger, and arming wipes it —
-    // so a dry run leaves no trace to be mistaken for a real answer later.
-    if !armed {
-        return Ok(Outcome::Acted);
-    }
-
     // Act, THEN log. Logging first recorded a failed ban as a success: it spent
     // the ceiling and marked the member answered forever.
-    let outcome = match response {
-        Response::Warn => bot.dm(&v.npub).send(&warn_text(&why)).await.map(|_| ()),
-        Response::DeleteAndWarn => {
-            hide_cited(bot, v, id).await;
-            bot.dm(&v.npub).send(&warn_text(&why)).await.map(|_| ())
+    //
+    // A rehearsal does everything EXCEPT the act. It writes the same row, so
+    // the ladder climbs, the ceilings fill and the operator sees the run they
+    // are about to arm — recording nothing meant a dry run could only ever
+    // print `WOULD warn`, and arming switched on escalation plus three
+    // ceilings at once, into behaviour nobody had watched. Arming wipes the
+    // slate, so the rehearsal's rows can never be mistaken for real answers.
+    let outcome = if !armed {
+        Ok(())
+    } else {
+        match response {
+            Response::Warn => bot.dm(&v.npub).send(&warn_text(&why)).await.map(|_| ()),
+            Response::DeleteAndWarn => {
+                hide_cited(bot, v, id).await;
+                bot.dm(&v.npub).send(&warn_text(&why)).await.map(|_| ())
+            }
+            Response::Kick => community.member(v.npub.clone()).kick().await,
+            Response::Ban => community.member(v.npub.clone()).ban().await,
         }
-        Response::Kick => community.member(v.npub.clone()).kick().await,
-        Response::Ban => community.member(v.npub.clone()).ban().await,
     };
     if let Err(e) = outcome {
         // Nothing happened, so nothing is recorded: the debt stands and they
@@ -121,7 +126,9 @@ pub(crate) async fn enforce(
     }
 
     store.log_action(community.id(), &v.npub, name, now, total, &why).map_err(vector_sdk::Error::Other)?;
-    announce(bot, community, ctx, &format!("{name} {who} — {total} strike(s) — {why}")).await;
+    if armed {
+        announce(bot, community, ctx, &format!("{name} {who} — {total} strike(s) — {why}")).await;
+    }
     *pass.lock().unwrap_or_else(|e| e.into_inner()) += 1;
     Ok(Outcome::Acted)
 }

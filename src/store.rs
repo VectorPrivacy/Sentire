@@ -326,39 +326,38 @@ impl Store {
             .map_err(|e| e.to_string())
     }
 
-    /// Note what is armed here, and wipe the slate when it changes.
+    /// Note what is armed here, wiping the slate if it changed.
     ///
-    /// This is the whole reason there is one ledger. A rehearsal writes nothing
-    /// and arming starts clean, so nobody carries a backlog of sentences that
-    /// were never delivered into the run that would deliver them.
+    /// This is the whole reason there is one ledger. A rehearsal records what
+    /// it WOULD have done so the operator sees the run they are arming, and
+    /// arming starts clean, so nobody carries a rehearsed backlog into the run
+    /// that would deliver it.
     ///
-    /// True when the arming changed.
+    /// ONE transaction. As two calls the destructive half came second, so a
+    /// failure between them left the new arming noted and the slate never
+    /// wiped — permanently, since every later boot then read no change.
+    ///
+    /// True when the arming changed and the slate was wiped.
     pub fn note_armed(&self, community: &str, classes: &str) -> Result<bool, String> {
         use rusqlite::OptionalExtension;
-        let conn = self.lock();
-        let seen: Option<String> = conn
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let seen: Option<String> = tx
             .query_row("SELECT classes FROM armed WHERE community = ?1", [community], |r| r.get(0))
             .optional()
             .map_err(|e| e.to_string())?;
         let changed = seen.as_deref().is_some_and(|s| s != classes);
-        conn.execute(
+        if changed {
+            tx.execute("DELETE FROM strikes WHERE community = ?1", [community]).map_err(|e| e.to_string())?;
+            tx.execute("DELETE FROM actions WHERE community = ?1", [community]).map_err(|e| e.to_string())?;
+        }
+        tx.execute(
             "INSERT OR REPLACE INTO armed (community, classes) VALUES (?1, ?2)",
             rusqlite::params![community, classes],
         )
         .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
         Ok(changed)
-    }
-
-    /// Forget everything this community knows about its members.
-    ///
-    /// This is what arming does, and it is why there is only one ledger: a
-    /// rehearsal must not silence the run that follows it, and wiping is a
-    /// simpler answer than keeping two of everything.
-    pub fn forget(&self, community: &str) -> Result<(), String> {
-        let conn = self.lock();
-        conn.execute("DELETE FROM strikes WHERE community = ?1", [community]).map_err(|e| e.to_string())?;
-        conn.execute("DELETE FROM actions WHERE community = ?1", [community]).map_err(|e| e.to_string())?;
-        Ok(())
     }
 
     /// Clear one member's record. The undo an operator needs when Sentinel is
@@ -543,17 +542,36 @@ pub mod tests {
         assert!(!s.note_armed("other", "warn").unwrap(), "per community");
     }
 
+    /// Arming wipes, and the wipe is the same transaction as the note — as two
+    /// calls a failure between them left the arming recorded and the slate
+    /// never cleared, for the life of the database.
     #[test]
-    fn forgetting_a_community_clears_its_slate() {
+    fn arming_clears_the_slate_of_that_community_only() {
         let s = mem();
+        s.note_armed("c", "warn").unwrap();
+        s.note_armed("other", "warn").unwrap();
         s.record("c", "npub1a", "x", 4, 0, "rehearsed").unwrap();
-        s.log_action("c", "npub1a", "warn", 0, 0, "").unwrap();
+        s.log_action("c", "npub1a", "warn", 0, 4, "").unwrap();
         s.record("other", "npub1b", "y", 4, 0, "").unwrap();
 
-        s.forget("c").unwrap();
+        assert!(s.note_armed("c", "warn kick").unwrap(), "arming a class is a change");
         assert!(s.strikes("c", "npub1a").unwrap().is_empty());
         assert_eq!(s.strongest_response("c", "npub1a").unwrap(), None);
         assert_eq!(s.strikes("other", "npub1b").unwrap().len(), 1, "and only that community");
+    }
+
+    /// A tombstone is a strike row, so it must not survive a wipe: the member
+    /// would be permanently unconvictable for evidence still in the window.
+    #[test]
+    fn arming_clears_tombstones_too() {
+        let s = mem();
+        s.note_armed("c", "warn").unwrap();
+        s.record("c", "npub1a", "x", 4, 0, "").unwrap();
+        s.pardon("c", "npub1a").unwrap();
+        assert!(!s.record("c", "npub1a", "x", 4, 1, "").unwrap(), "tombstoned");
+
+        s.note_armed("c", "warn kick").unwrap();
+        assert!(s.record("c", "npub1a", "x", 4, 2, "").unwrap(), "a clean slate is clean both ways");
     }
 
     #[test]
