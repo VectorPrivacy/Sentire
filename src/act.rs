@@ -53,6 +53,12 @@ pub(crate) async fn enforce(
     let Some(response) = select_rung(&ctx.policy, deliverable, store, community.id(), &v.npub, strikes, now)
         .map_err(vector_sdk::Error::Other)?
     else {
+        // Three states used to collapse into one wordless return: nothing owed,
+        // already answered, and every remaining rung undeliverable here. The
+        // last is the one a stuck bot spends its life in.
+        if !ctx.powers.any() {
+            println!("[{id}] CANNOT answer {who} — this community grants Sentinel no moderation powers");
+        }
         return Ok(Outcome::AlreadyAnswered);
     };
 

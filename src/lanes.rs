@@ -106,6 +106,17 @@ pub(crate) async fn screen(
     Ok(())
 }
 
+/// The cache key: which model was asked, and what it was asked about.
+///
+/// Adding a label or moving a threshold is a different question, and every
+/// blob has to be asked it again.
+pub(crate) fn asked_of(model: &str, cfg: &crate::config::VisionCfg) -> String {
+    let mut labels: Vec<String> =
+        cfg.labels.iter().map(|l| format!("{}@{}", l.name, l.threshold)).collect();
+    labels.sort();
+    format!("{model}?{}", labels.join(","))
+}
+
 /// What to do about one attachment, before any byte is fetched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Gate {
@@ -168,6 +179,12 @@ pub(crate) async fn watch_media(
         return Ok(());
     }
     let now = now_ms();
+    // The cache remembers a verdict; `asked` remembers the QUESTION. Keyed on
+    // the model alone, a blob classified before a label existed was exempt from
+    // that label for good — the answer was cached, the question was not.
+    let asked = asked_of(eyes.model(), &cfg.vision);
+    // Every flagged attachment in this message, so one post is one sentence.
+    let mut flagged: Vec<String> = Vec::new();
 
     for att in &msg.message.attachments {
         match gate(&att.extension, att.size, &cfg.vision) {
@@ -204,7 +221,7 @@ pub(crate) async fn watch_media(
             continue;
         }
         let content_hash = vector_sdk::vector_core::crypto::sha256_hex(&bytes);
-        let verdict = match store.cached_verdict(&content_hash, eyes.model()) {
+        let verdict = match store.cached_verdict(&content_hash, &asked) {
             Some(cached) => match serde_json::from_str(&cached) {
                 Ok(v) => v,
                 // An unreadable row is not an all-clear: a shape change would
@@ -229,7 +246,7 @@ pub(crate) async fn watch_media(
                 // classification forever.
                 if !matches!(v, vision::Verdict::Unknown(_)) {
                     if let Ok(json) = serde_json::to_string(&v) {
-                        let _ = store.cache_verdict(&content_hash, eyes.model(), &json, now);
+                        let _ = store.cache_verdict(&content_hash, &asked, &json, now);
                     }
                 }
                 v
@@ -260,26 +277,29 @@ pub(crate) async fn watch_media(
                     .record(community.id(), &author, &conviction, worth, now, &evidence)
                     .map_err(vector_sdk::Error::Other)?;
                 println!("[media] FLAGGED {} from {} — {evidence}", short(&att.id), short(&author));
-                if !fresh {
-                    continue;
-                }
-                let strikes = store.strikes(community.id(), &author).map_err(vector_sdk::Error::Other)?;
-                let total = ladder::total(&strikes, now, policy.ladder.decay_half_life_hours);
-                // The verdict is what matters from here; N handlers queued on
-                // the community gate must not each pin megabytes.
-                drop(bytes);
-                let ctx = live_ctx(cfg, &community, watches, me).await;
-                if ladder::decide(&ctx.policy.ladder, total).is_some() {
-                    let v = own_verdict(
-                        &author,
-                        shield.clone(),
-                        vec![evidence.clone()],
-                        vec![own_finding("vision", &evidence, msg.message.id.clone())],
-                    );
-                    enforce(bot, &community, &ctx, store, watches, &Mutex::new(0), &v, &strikes).await?;
+                if fresh {
+                    flagged.push(evidence);
                 }
             }
         }
+    }
+
+    // ONE sentence for the message, after every attachment has been weighed.
+    // Enforcing per attachment walked the whole ladder inside a single post:
+    // four flagged images were a warn, a delete, a kick and a ban.
+    if flagged.is_empty() {
+        return Ok(());
+    }
+    let strikes = store.strikes(community.id(), &author).map_err(vector_sdk::Error::Other)?;
+    let total = ladder::total(&strikes, now, policy.ladder.decay_half_life_hours);
+    let ctx = live_ctx(cfg, &community, watches, me).await;
+    if ladder::decide(&ctx.policy.ladder, total).is_some() {
+        let findings = flagged
+            .iter()
+            .map(|e| own_finding("vision", e, msg.message.id.clone()))
+            .collect();
+        let v = own_verdict(&author, shield, flagged, findings);
+        enforce(bot, &community, &ctx, store, watches, &Mutex::new(0), &v, &strikes).await?;
     }
     Ok(())
 }
@@ -517,5 +537,37 @@ mod tests {
                 "{want} is in the default list but cannot be recognised from its bytes"
             );
         }
+    }
+
+    fn label(name: &str, threshold: f32) -> crate::config::VisionLabel {
+        crate::config::VisionLabel { name: name.into(), threshold, gravity: crate::config::Gravity::Grave }
+    }
+
+    /// The answer was cached and the question was not, so a blob classified
+    /// before a label existed was exempt from that label for good.
+    #[test]
+    fn changing_what_is_asked_changes_the_cache_key() {
+        let mut cfg = vision();
+        cfg.labels = vec![label("gore", 0.9)];
+        let one = asked_of("llava", &cfg);
+
+        cfg.labels.push(label("sexual_content", 0.9));
+        let two = asked_of("llava", &cfg);
+        assert_ne!(one, two, "a new label is a new question");
+
+        cfg.labels = vec![label("gore", 0.5)];
+        assert_ne!(asked_of("llava", &cfg), one, "so is a moved threshold");
+
+        assert_ne!(asked_of("other-model", &cfg), asked_of("llava", &cfg), "and so is a different model");
+    }
+
+    /// Order in the file is not part of the question.
+    #[test]
+    fn the_same_labels_in_another_order_are_the_same_question() {
+        let mut a = vision();
+        a.labels = vec![label("gore", 0.9), label("sexual_content", 0.8)];
+        let mut b = vision();
+        b.labels = vec![label("sexual_content", 0.8), label("gore", 0.9)];
+        assert_eq!(asked_of("llava", &a), asked_of("llava", &b));
     }
 }

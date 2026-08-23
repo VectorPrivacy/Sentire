@@ -191,6 +191,9 @@ pub(crate) async fn sweep(
     }
 
     for v in verdicts.unproven() {
+        if v.npub == me {
+            continue;
+        }
         convicted += 1;
         println!(
             "[{id}] INFERRED {} — {} (confidence {}, proven {}) — a second judge decides",

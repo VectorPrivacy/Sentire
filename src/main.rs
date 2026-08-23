@@ -136,6 +136,10 @@ impl Drop for SweepTaskGuard {
 /// as a crash.
 struct ShutdownFlag;
 
+impl ShutdownFlag {
+    fn arm(self) {}
+}
+
 impl Drop for ShutdownFlag {
     fn drop(&mut self) {
         SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -291,8 +295,6 @@ async fn main() -> vector_sdk::Result<()> {
     // half the raid signal and a message handler never sees them.
     {
         let (cfg, store, me, budget) = (cfg.clone(), store.clone(), bot.npub().to_string(), budget.clone());
-        // Anything after the listener returns is a deliberate stop, not a crash.
-    let _shutdown = ShutdownFlag;
     bot.on_event(move |bot, event| {
             let (cfg, store, eyes, wires, me, budget) =
                 (cfg.clone(), store.clone(), eyes.clone(), wires.clone(), me.clone(), budget.clone());
@@ -326,15 +328,21 @@ async fn main() -> vector_sdk::Result<()> {
         })
         .await?;
     }
-    Ok(())
+    // The listener returned. That is not a stop Sentinel asked for — the
+    // notification stream ended under it — and exiting 0 in silence means a
+    // supervisor set to restart-on-failure leaves the community unwatched.
+    ShutdownFlag.arm();
+    Err(vector_sdk::Error::Other(
+        "the event listener stopped: Sentinel is no longer receiving messages".into(),
+    ))
 }
 
 /// Arming is a fresh start.
 ///
-/// A rehearsal records nothing, so a member who racked up twelve points of
-/// "would ban" during a dry run must not be banned the moment the switch flips
-/// — they have never actually been warned. Wiping is the whole reason there is
-/// one ledger rather than two.
+/// A rehearsal records what it WOULD have done, so a member who accrued twelve
+/// points of "would ban" during a dry run must not be banned the moment the
+/// switch flips — they have never actually been warned. Wiping is the whole
+/// reason there is one ledger rather than two.
 fn wipe_on_arming_change(cfg: &Config, community: &Community, store: &Arc<Store>) {
     let p = cfg.for_community(community.id());
     let classes: String = [
