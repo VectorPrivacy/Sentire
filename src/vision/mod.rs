@@ -191,4 +191,57 @@ mod tests {
         let json = serde_json::to_string(&v).unwrap();
         assert_eq!(serde_json::from_str::<Verdict>(&json).unwrap(), v);
     }
+
+    /// A stand-in classifier, so the four answers a real one can give are all
+    /// exercised without a model or a network.
+    struct Fake(Verdict);
+
+    impl Vision for Fake {
+        async fn classify(&self, _bytes: &[u8], _mime: &str) -> Verdict {
+            self.0.clone()
+        }
+        fn model(&self) -> &str {
+            "fake"
+        }
+    }
+
+    /// The four shapes a classification comes back as, and what each means for
+    /// the lane. `Unknown` is the one that must never read as clean.
+    #[tokio::test]
+    async fn every_answer_a_classifier_can_give_is_handled() {
+        let labels = cfg(&[("gore", 0.9, Gravity::Grave)]);
+        let cases = [
+            (Verdict::Clean, 0, "the model looked and found nothing"),
+            (Verdict::Flagged(vec![]), 0, "it looked and nothing cleared the bar"),
+            (Verdict::Flagged(vec![label("gore", 0.95)]), 1, "over the bar"),
+            (Verdict::Unknown("timed out".into()), 0, "a timeout is not an all-clear"),
+        ];
+
+        for (verdict, want_hits, why) in cases {
+            let fake = Fake(verdict.clone());
+            let got = fake.classify(b"bytes", "image/png").await;
+            assert_eq!(got, verdict, "{why}");
+            let hits = match &got {
+                Verdict::Flagged(ls) => over_threshold(ls, &labels).len(),
+                _ => 0,
+            };
+            assert_eq!(hits, want_hits, "{why}");
+            // The distinction the whole lane rests on.
+            assert!(
+                !matches!(got, Verdict::Unknown(_)) || got != Verdict::Clean,
+                "Unknown must never equal Clean"
+            );
+        }
+    }
+
+    /// A timeout and a refusal are both Unknown, and neither is cached — one
+    /// timeout would otherwise retire a blob from classification forever.
+    #[test]
+    fn unknown_carries_its_reason() {
+        for why in ["timed out", "model refused", "cache unreadable: bad json", ""] {
+            let v = Verdict::Unknown(why.into());
+            assert!(matches!(&v, Verdict::Unknown(w) if w == why));
+            assert_ne!(v, Verdict::Clean);
+        }
+    }
 }
