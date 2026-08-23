@@ -27,6 +27,20 @@ pub(crate) struct Charge {
     pub(crate) evidence: String,
 }
 
+/// One finding in the words a member reads.
+///
+/// Both clocks use it, so a warning does not change vocabulary depending on
+/// which one got there first — the sweep used to write `slurs [severe] 8x`
+/// while the live screen wrote English.
+pub(crate) fn evidence_line(f: &vector_sdk::policy::Finding) -> String {
+    if f.detail.is_empty() {
+        format!("Matched the \"{}\" rule", f.rule_id)
+    } else {
+        let words: Vec<String> = f.detail.iter().map(|d| format!("\"{d}\"")).collect();
+        format!("Used {} ({} time{})", words.join(", "), f.hits, if f.hits == 1 { "" } else { "s" })
+    }
+}
+
 /// Whether one finding can earn a strike at all.
 ///
 /// Two conditions, and they answer different questions. The BASIS: inference
@@ -64,7 +78,7 @@ pub(crate) fn charges(v: &vector_sdk::policy::Verdict, policy: &crate::policy::C
             continue;
         }
         let worth = policy.ladder.strikes.worth(policy.gravity_of(&f.rule_id, &f.severity));
-        let evidence = format!("{} [{}] {}×", f.rule_id, f.severity, f.hits);
+        let evidence = evidence_line(f);
         if f.stateless {
             // Under the id the live screen would have used, so whichever clock
             // reached the message first wins and the other is an ignored insert.
@@ -660,6 +674,25 @@ mod tests {
     fn a_finding_that_cites_evidence_still_charges() {
         let v = verdict(vec![f("rate", "per_window", false, "deterministic", 20, &["m1"], 20)]);
         assert_eq!(charges(&v, &base()).len(), 1);
+    }
+
+    /// Both clocks describe an offence the same way, or a member's warning
+    /// changes vocabulary depending on which one reached them first.
+    #[test]
+    fn both_clocks_describe_an_offence_the_same_way() {
+        let mut with_detail = f("slurs", "per_message", true, "deterministic", 1, &["m1"], 1);
+        with_detail.detail = vec!["badword".into()];
+        assert_eq!(evidence_line(&with_detail), "Used \"badword\" (1 time)");
+
+        with_detail.hits = 8;
+        assert_eq!(evidence_line(&with_detail), "Used \"badword\" (8 times)", "plural");
+
+        // Nothing quoted: name the rule rather than print engine vocabulary.
+        let bare = f("rate", "per_window", false, "deterministic", 20, &["m1"], 20);
+        assert_eq!(evidence_line(&bare), "Matched the \"rate\" rule");
+        for machine in ["[", "]", "×"] {
+            assert!(!evidence_line(&bare).contains(machine), "engine vocabulary reached a member");
+        }
     }
 
     #[test]

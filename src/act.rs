@@ -40,7 +40,18 @@ pub(crate) async fn enforce(
     let now = now_ms();
     let id = short(community.id());
     let who = short(&v.npub);
-    let why = v.why();
+    // What SENTINEL charged, not what the engine saw.
+    //
+    // The engine reports over its whole window and knows nothing about a
+    // pardon, so quoting it told a forgiven member about offences that had been
+    // forgiven — "8 times" when two were on record. The ledger filters
+    // tombstones by construction, so reading from it makes the pardon mean
+    // what it says. Falls back to the engine only when the ledger has nothing,
+    // which is the debt lane's empty-record case.
+    let why = match store.evidence(community.id(), &v.npub) {
+        Ok(mine) if !mine.is_empty() => mine.join("; "),
+        _ => v.why(),
+    };
 
     // Permissions only. Whether THIS verdict has anything to hide is not a
     // property of the community, and folding it in here let the ladder walk
@@ -54,13 +65,12 @@ pub(crate) async fn enforce(
         // like a bot that has stopped working. The other reasons — nothing
         // owed, a rung this community withholds — repeat every poll and are
         // already on the boot line and in `/status`.
-        let total = ladder::total(strikes, now, ctx.policy.ladder.decay_half_life_hours);
         if ladder::owed(&ctx.policy.ladder, strikes, [], |r| ctx.powers.can_deliver(r), now, ctx.policy.ladder.decay_half_life_hours)
             .is_some_and(|r| r == Response::Ban)
         {
             println!(
                 "[{id}] TOP     {who} — {}, already at the top rung — a person decides from here",
-                tally(strikes, total)
+                tally(strikes)
             );
         }
         return Ok(Outcome::AlreadyAnswered);
@@ -103,8 +113,7 @@ pub(crate) async fn enforce(
     };
 
     let name = response.name();
-    let total = ladder::total(strikes, now, ctx.policy.ladder.decay_half_life_hours);
-    let tally = tally(strikes, total);
+    let tally = tally(strikes);
     println!("[{id}] {} {name} {who} — {tally} — {why}", if armed { "ENFORCE" } else { "WOULD  " });
 
     // Resolved before the act: a delete removes the very messages the channel
@@ -272,15 +281,17 @@ pub(crate) fn own_finding(rule: &str, detail: &str, message_id: String) -> vecto
     }
 }
 
-/// A member's record in words: how many offences are on file, and what they
-/// are worth after decay.
+/// A member's record in words: how many offences are on file.
 ///
-/// Two different numbers. The total is a SUM OF WORTHS — one grave offence is
-/// twelve points at the default scale — so reporting it as "12 strike(s)" read
-/// as twelve separate offences, which is what `/why` had always said correctly
-/// and this had not.
-fn tally(strikes: &[ladder::Strike], total: u32) -> String {
-    format!("{} strike record(s), worth {total}", strikes.len())
+/// The strike TOTAL is deliberately absent. It is a sum of worths, so it only
+/// means anything to somebody holding this community's ladder thresholds —
+/// and the mod channel is a channel, which members read. `/why` reports the
+/// number to whoever asks for it, with the decay spelled out.
+fn tally(strikes: &[ladder::Strike]) -> String {
+    match strikes.len() {
+        1 => "1 match on record".to_string(),
+        n => format!("{n} matches on record"),
+    }
 }
 
 /// What a warned member reads.
@@ -539,9 +550,28 @@ mod tests {
         assert_eq!(cited_ids(&v), vec!["m1", "m2"]);
     }
 
+    /// The strike total means nothing without this community's ladder
+    /// thresholds in hand — and the mod channel is a channel, which members
+    /// read. Nothing Sentinel says out loud carries a score; `/why` reports it
+    /// to whoever asks.
+    #[test]
+    fn nothing_said_out_loud_carries_a_score() {
+        let one = [ladder::Strike { worth: 12, at_ms: 0 }];
+        assert_eq!(tally(&one), "1 match on record");
+
+        let three = [
+            ladder::Strike { worth: 12, at_ms: 0 },
+            ladder::Strike { worth: 12, at_ms: 0 },
+            ladder::Strike { worth: 4, at_ms: 0 },
+        ];
+        assert_eq!(tally(&three), "3 matches on record");
+        for score in ["12", "28", "worth"] {
+            assert!(!tally(&three).contains(score), "a score reached the channel: {}", tally(&three));
+        }
+    }
+
     /// A member asks two things: what did I do, and how many times. Neither
-    /// answer is a strike total — "worth 12" is the operator's number for
-    /// tuning a ladder, and it reads like twelve accusations.
+    /// answer is a strike total.
     #[test]
     fn a_warning_counts_matches_and_never_shows_a_score() {
         let one = warn_text("Used \"badword\" (1 time)", "Lab", Some("general"), 1);
@@ -554,30 +584,6 @@ mod tests {
         for total in ["12", "48", "worth"] {
             assert!(!many.contains(total), "a score reached the member: {many}");
         }
-    }
-
-    /// Two different numbers, and saying one when you mean the other is how
-    /// "one grave offence" came to read as twelve of them. The total is a SUM
-    /// OF WORTHS; the count is how many offences are on file.
-    #[test]
-    fn a_tally_separates_how_many_from_how_much() {
-        let one_grave = [ladder::Strike { worth: 12, at_ms: 0 }];
-        let line = tally(&one_grave, 12);
-        assert!(line.contains("1 strike record"), "one offence, not twelve: {line}");
-        assert!(line.contains("worth 12"), "and what it is worth: {line}");
-
-        let three = [
-            ladder::Strike { worth: 1, at_ms: 0 },
-            ladder::Strike { worth: 2, at_ms: 0 },
-            ladder::Strike { worth: 4, at_ms: 0 },
-        ];
-        let line = tally(&three, 7);
-        assert!(line.contains("3 strike record"), "{line}");
-        assert!(line.contains("worth 7"), "{line}");
-
-        // Decay moves the worth and never the count.
-        let line = tally(&three, 3);
-        assert!(line.contains("3 strike record") && line.contains("worth 3"), "{line}");
     }
 
     /// The warned member reads this, so it has to say what matched, what

@@ -543,6 +543,24 @@ pub mod tests {
         assert!(s.evidence("c", "npub1a").unwrap().is_empty(), "nor cited for it");
     }
 
+    /// A pardon has to reach the WORDS as well as the score. The engine reports
+    /// over its whole window and knows nothing about one, so a sentence that
+    /// quoted it told a forgiven member about offences that had been forgiven.
+    #[test]
+    fn evidence_never_cites_a_forgiven_offence() {
+        let s = mem();
+        s.record("c", "npub1a", "old-1", 12, 1_000, "Used \"badword\" (8 times)").unwrap();
+        s.record("c", "npub1a", "old-2", 12, 2_000, "Used \"slur\" (3 times)").unwrap();
+        assert_eq!(s.evidence("c", "npub1a").unwrap().len(), 2);
+
+        s.pardon("c", "npub1a").unwrap();
+        assert!(s.evidence("c", "npub1a").unwrap().is_empty(), "a pardon clears the record it cites");
+
+        // And what happens after it stands alone.
+        s.record("c", "npub1a", "new-1", 12, 90_000, "Used \"badword\" (1 time)").unwrap();
+        assert_eq!(s.evidence("c", "npub1a").unwrap(), vec!["Used \"badword\" (1 time)".to_string()]);
+    }
+
     /// A pardon forgives what was done, not what comes next.
     #[test]
     fn a_pardoned_member_can_be_convicted_again() {
