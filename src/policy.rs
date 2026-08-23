@@ -75,9 +75,34 @@ pub struct LimitsOverride {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct LadderOverride {
-    pub strikes: Option<crate::config::Strikes>,
+    pub strikes: Option<StrikesOverride>,
     pub decay_half_life_hours: Option<u64>,
     pub steps: Option<Vec<crate::config::Step>>,
+}
+
+/// Per FIELD, like every other override block.
+///
+/// A whole-struct swap looked like it worked: `Strikes` carries `#[serde(default)]`,
+/// so `strikes = { grave = 60 }` deserialized fine and silently reset note,
+/// minor and serious to the library defaults — an override that only tightened
+/// producing a loosening the validator cannot see, since the result still
+/// ascends.
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[serde(default)]
+pub struct StrikesOverride {
+    pub note: Option<u32>,
+    pub minor: Option<u32>,
+    pub serious: Option<u32>,
+    pub grave: Option<u32>,
+}
+
+impl StrikesOverride {
+    fn fold_into(&self, s: &mut crate::config::Strikes) {
+        s.note = self.note.unwrap_or(s.note);
+        s.minor = self.minor.unwrap_or(s.minor);
+        s.serious = self.serious.unwrap_or(s.serious);
+        s.grave = self.grave.unwrap_or(s.grave);
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Default)]
@@ -128,7 +153,9 @@ impl Config {
             p.limits.halt_if_over_pct = l.halt_if_over_pct.unwrap_or(p.limits.halt_if_over_pct);
         }
         if let Some(l) = &o.ladder {
-            p.ladder.strikes = l.strikes.unwrap_or(p.ladder.strikes);
+            if let Some(o) = &l.strikes {
+                o.fold_into(&mut p.ladder.strikes);
+            }
             p.ladder.decay_half_life_hours = l.decay_half_life_hours.unwrap_or(p.ladder.decay_half_life_hours);
             if let Some(steps) = &l.steps {
                 p.ladder.steps = steps.clone();
@@ -174,6 +201,29 @@ impl Config {
 }
 
 impl CommunityPolicy {
+    /// What is armed HERE, for a log line or an operator's question.
+    ///
+    /// Resolved per community, always. Reading the top-level block answered
+    /// "nothing (dry run)" in a community armed to ban — at boot, which is the
+    /// one place an operator looks before walking away.
+    pub fn armed_line(&self) -> String {
+        let armed: Vec<&str> = [
+            (self.arm.warn, "warn"),
+            (self.arm.delete, "delete"),
+            (self.arm.kick, "kick"),
+            (self.arm.ban, "ban"),
+            (self.arm.raid, "raid"),
+        ]
+        .iter()
+        .filter_map(|(on, name)| on.then_some(*name))
+        .collect();
+        if armed.is_empty() {
+            "nothing (dry run)".into()
+        } else {
+            armed.join(", ")
+        }
+    }
+
     /// The gravity this community assigns a rule, or the engine severity as a
     /// fallback when its operator never named one.
     pub fn gravity_of(&self, rule_id: &str, severity: &str) -> Gravity {
@@ -332,5 +382,42 @@ mod tests {
         let partial = Powers::from_capabilities(&serde_json::json!({ "manage_messages": true, "kick": true }));
         assert!(partial.hide && partial.kick && !partial.ban, "withholding BAN is a normal thing to do");
         assert_eq!(partial.describe(), "can hide, kick");
+    }
+
+    /// The shape that made this a per-field block: `strikes = { grave = 60 }`
+    /// deserialized fine and silently cut the other three to the library
+    /// defaults — a loosening from an override that only tightened, and one
+    /// the validator cannot catch because 1 <= 2 <= 4 <= 60 still ascends.
+    #[test]
+    fn a_partial_strikes_override_keeps_the_rest_of_the_operators_scale() {
+        let cfg: crate::config::Config = toml::from_str(
+            r#"
+[ladder]
+strikes = { note = 4, minor = 8, serious = 16, grave = 48 }
+
+[community."aa".ladder]
+strikes = { grave = 60 }
+"#,
+        )
+        .unwrap();
+
+        let base = cfg.for_community("");
+        assert_eq!((base.ladder.strikes.note, base.ladder.strikes.grave), (4, 48));
+
+        let folded = cfg.for_community("aa").ladder.strikes;
+        assert_eq!(folded.grave, 60, "the field the override named");
+        assert_eq!(folded.note, 4, "and not one it did not");
+        assert_eq!(folded.minor, 8);
+        assert_eq!(folded.serious, 16);
+    }
+
+    /// An override may loosen as well as tighten.
+    #[test]
+    fn a_strikes_override_can_lower_a_worth_too() {
+        let cfg: crate::config::Config = toml::from_str(
+            "[ladder]\nstrikes = { note = 4, minor = 8, serious = 16, grave = 48 }\n\n[community.\"aa\".ladder]\nstrikes = { note = 1 }",
+        )
+        .unwrap();
+        assert_eq!(cfg.for_community("aa").ladder.strikes.note, 1);
     }
 }

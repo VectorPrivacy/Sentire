@@ -175,21 +175,6 @@ async fn main() -> vector_sdk::Result<()> {
 
     let bot = VectorBot::builder().nsec(nsec).public().build().await?;
     println!("Sentinel online as {}", bot.npub());
-    let armed: Vec<&str> = [
-        (cfg.arm.warn, "warn"),
-        (cfg.arm.delete, "delete"),
-        (cfg.arm.kick, "kick"),
-        (cfg.arm.ban, "ban"),
-        (cfg.arm.raid, "raid"),
-    ]
-    .iter()
-    .filter_map(|(on, name)| on.then_some(*name))
-    .collect();
-    if armed.is_empty() {
-        println!("DRY RUN — every action is rehearsed and printed, nobody is touched.\n");
-    } else {
-        println!("ARMED: {} — everything else stays dry.\n", armed.join(", "));
-    }
 
     let me = bot.npub().to_string();
     let communities: Vec<Community> = bot
@@ -208,7 +193,15 @@ async fn main() -> vector_sdk::Result<()> {
         match rules::install(c, &cfg).await {
             Ok(what) => {
                 installed_at_boot.insert(c.id().to_string());
-                println!("watching {} — {what} — {}", short(c.id()), powers.describe());
+                // Arming is per community, so it is reported per community.
+                // One global line said "nobody is touched" in a process that
+                // was about to ban people.
+                println!(
+                    "watching {} — {what} — {} — armed: {}",
+                    short(c.id()),
+                    powers.describe(),
+                    cfg.for_community(c.id()).armed_line()
+                );
             }
             Err(e) => eprintln!("watching {} — rulebook rejected: {e} — retrying next pass", short(c.id())),
         }

@@ -18,23 +18,6 @@ use crate::ladder;
 /// it answers only to someone the community already trusts to moderate — a bot
 /// with no undo is not deployable, and an undo anyone can call is not either.
 pub(crate) fn operator_surface(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<Store>) {
-    /// Resolved where the question was ASKED. Reporting the top-level config
-    /// answered "Armed: nothing (dry run)" in a community armed to ban.
-    fn armed_line(p: &CommunityPolicy) -> String {
-        let armed: String = [
-            (p.arm.warn, "warn "),
-            (p.arm.delete, "delete "),
-            (p.arm.kick, "kick "),
-            (p.arm.ban, "ban "),
-            (p.arm.raid, "raid "),
-        ]
-        .iter()
-        .filter(|(on, _)| *on)
-        .map(|(_, n)| *n)
-        .collect();
-        if armed.trim().is_empty() { "nothing (dry run)".into() } else { armed.trim().to_string() }
-    }
-
     bot.command("status", "What Sentinel is watching, and how much of it it can see").run({
         let cfg = cfg.clone();
         move |ctx| {
@@ -44,7 +27,7 @@ pub(crate) fn operator_surface(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<S
                     let _ = ctx.reply("I am not watching this community.").await;
                     return;
                 };
-                let armed = armed_line(&cfg.for_community(community.id()));
+                let armed = CommunityPolicy::armed_line(&cfg.for_community(community.id()));
                 let powers = powers_of(&community).await;
                 let text = match community.verdicts().await {
                     Ok(v) => {

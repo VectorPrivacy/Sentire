@@ -42,7 +42,15 @@ pub(crate) async fn enforce(
     let who = short(&v.npub);
     let why = v.why();
 
-    let Some(response) = select_rung(&ctx.policy, ctx.powers, store, community.id(), &v.npub, strikes, now)
+    // A delete with nothing to delete is not a delete. The debt lane builds a
+    // verdict with no citations at all, so this rung hid nothing, sent a DM and
+    // was recorded as delivered — the offending message stayed up and the
+    // ladder never came back to it.
+    let can_hide = !cited_ids(v).is_empty();
+    let deliverable = |r: Response| {
+        ctx.powers.can_deliver(r) && (r != Response::DeleteAndWarn || can_hide)
+    };
+    let Some(response) = select_rung(&ctx.policy, deliverable, store, community.id(), &v.npub, strikes, now)
         .map_err(vector_sdk::Error::Other)?
     else {
         return Ok(Outcome::AlreadyAnswered);
@@ -118,13 +126,49 @@ pub(crate) async fn enforce(
     Ok(Outcome::Acted)
 }
 
-/// Hide the messages a conviction cited, once each, capped.
+/// Whose evidence this is. Sentinel's own findings carry no policy hash; the
+/// engine stamps one on everything it reaches.
+fn is_sentinels_own(f: &vector_sdk::policy::Finding) -> bool {
+    f.policy_hash.is_empty()
+}
+
+/// Evidence a ladder rung may act on.
+///
+/// The ENGINE's inference may not: a cohort conviction cites real messages, so
+/// acting on what it cited would pass a sentence on evidence nobody can replay,
+/// with `[arm] raid` off. Sentinel's own findings are a different thing — the
+/// operator armed the lane that produced them, and a model saying an image
+/// breaks a rule is the answer, not evidence toward one.
+fn actionable(f: &vector_sdk::policy::Finding) -> bool {
+    is_sentinels_own(f) || f.is_proven()
+}
+
+/// The messages one sentence hides: deduped, capped, and only what this rung
+/// is entitled to act on.
+pub(crate) fn cited_ids(v: &Verdict) -> Vec<&str> {
+    let mut seen = std::collections::HashSet::new();
+    v.findings
+        .iter()
+        .filter(|f| actionable(f))
+        .flat_map(|f| f.messages.iter())
+        .map(|m| m.as_str())
+        .filter(|m| seen.insert(*m))
+        .take(MAX_HIDES)
+        .collect()
+}
+
+/// Hide what a conviction cited.
 ///
 /// A message already gone is the end state this wanted, not a failure.
 async fn hide_cited(bot: &VectorBot, v: &Verdict, id: &str) {
-    let mut seen = std::collections::HashSet::new();
-    for msg_id in v.findings.iter().flat_map(|f| f.messages.iter()).filter(|m| seen.insert((*m).clone())).take(MAX_HIDES)
-    {
+    let ids = cited_ids(v);
+    let cited = v.findings.iter().filter(|f| actionable(f)).map(|f| f.messages.len()).sum::<usize>();
+    if cited > ids.len() {
+        // Saying so is the point: the rung is spent either way, and the ladder
+        // will not come back to this evidence.
+        println!("[{id}] hid {} of {cited} cited — the rest stay up", ids.len());
+    }
+    for msg_id in ids {
         if let Some(m) = bot.message(msg_id).await {
             if let Err(e) = m.hide().await {
                 eprintln!("[{id}] hide {}: {e}", short(msg_id));
@@ -224,7 +268,7 @@ pub(crate) enum Outcome {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn select_rung(
     policy: &CommunityPolicy,
-    powers: Powers,
+    can_deliver: impl Fn(Response) -> bool,
     store: &Store,
     community: &str,
     npub: &str,
@@ -249,11 +293,13 @@ pub(crate) fn select_rung(
     // Otherwise a kick from March leaves a light offense in October answerable
     // only by a ban — the strikes forgive and the floor never would.
     let floor = prior.as_ref().filter(|_| answered > 0).map(|p| p.response.as_str());
-    Ok(ladder::next_step(&policy.ladder, total, floor, |r| powers.can_deliver(r)))
+    Ok(ladder::next_step(&policy.ladder, total, floor, can_deliver))
 }
 
-/// A member cited across many messages is still one sentence.
-const MAX_HIDES: usize = 10;
+/// A member cited across many messages is still one sentence. Matched to the
+/// engine's own per-conviction citation cap, so the bound that binds is the
+/// evidence rather than an arbitrary number below it.
+const MAX_HIDES: usize = 32;
 
 #[cfg(test)]
 mod tests {
@@ -274,7 +320,7 @@ mod tests {
         let p = policy_with("warn = true\ndelete = true\nkick = true\nban = true");
         let all = Powers { hide: true, kick: true, ban: true };
         let offenses = |n: u32| (0..n).map(|_| ladder::Strike { worth: 12, at_ms: NOW }).collect::<Vec<_>>();
-        let pick = |s: &Store, n: u32| select_rung(&p, all, s, "c", "npub1a", &offenses(n), NOW).unwrap();
+        let pick = |s: &Store, n: u32| select_rung(&p, |r| all.can_deliver(r), s, "c", "npub1a", &offenses(n), NOW).unwrap();
 
         assert_eq!(pick(&store, 1), Some(Response::Warn), "twelve points still starts at a warning");
         store.log_action("c", "npub1a", "warn", NOW, 12, "").unwrap();
@@ -297,14 +343,14 @@ mod tests {
         let all = Powers { hide: true, kick: true, ban: true };
         let one_grave = [ladder::Strike { worth: 12, at_ms: NOW }];
 
-        let first = select_rung(&p, all, &store, "c", "npub1a", &one_grave, NOW).unwrap();
+        let first = select_rung(&p, |r| all.can_deliver(r), &store, "c", "npub1a", &one_grave, NOW).unwrap();
         assert_eq!(first, Some(Response::Warn));
         store.log_action("c", "npub1a", "warn", NOW, 12, "").unwrap();
 
         for poll in 1..=20u64 {
             let later = NOW + poll * 90_000;
             assert_eq!(
-                select_rung(&p, all, &store, "c", "npub1a", &one_grave, later).unwrap(),
+                select_rung(&p, |r| all.can_deliver(r), &store, "c", "npub1a", &one_grave, later).unwrap(),
                 None,
                 "poll {poll} answered an offense that was already answered"
             );
@@ -326,10 +372,77 @@ mod tests {
         let fresh = [ladder::Strike { worth: 4, at_ms: much_later }];
 
         assert_eq!(
-            select_rung(&p, all, &store, "c", "npub1a", &fresh, much_later).unwrap(),
+            select_rung(&p, |r| all.can_deliver(r), &store, "c", "npub1a", &fresh, much_later).unwrap(),
             Some(Response::Warn),
             "a forgiven kick must not make a fresh minor offense unanswerable"
         );
+    }
+
+    /// An ENGINE finding: the engine stamps a policy hash on everything it
+    /// reaches, which is what tells it apart from Sentinel's own.
+    fn cited(basis: &str, msgs: &[&str]) -> vector_sdk::policy::Finding {
+        vector_sdk::policy::Finding {
+            conviction_id: format!("{basis}-{}", msgs.len()),
+            policy_hash: "abc123".into(),
+            rule_id: "rule".into(),
+            scope: "per_message".into(),
+            basis: basis.into(),
+            severity: "severe".into(),
+            stateless: true,
+            rung: 0,
+            hits: msgs.len() as u32,
+            weight: 0,
+            detail: vec![],
+            messages: msgs.iter().map(|m| m.to_string()).collect(),
+            citation_count: msgs.len() as u32,
+        }
+    }
+
+    fn with(findings: Vec<vector_sdk::policy::Finding>) -> Verdict {
+        own_verdict("npub1a", "none".into(), vec![], findings)
+    }
+
+    /// A cohort conviction cites real messages. Hiding what it cited let
+    /// inference reach into a member's history under a rung the ladder chose —
+    /// with `[arm] raid` off.
+    #[test]
+    fn only_proven_citations_are_hidden() {
+        let v = with(vec![
+            cited("deterministic", &["m1", "m2"]),
+            cited("heuristic", &["m3", "m4"]),
+        ]);
+        assert_eq!(cited_ids(&v), vec!["m1", "m2"], "inference cites, it does not sentence");
+    }
+
+    #[test]
+    fn a_message_cited_twice_is_hidden_once() {
+        let v = with(vec![cited("deterministic", &["m1", "m1", "m2", "m1"])]);
+        assert_eq!(cited_ids(&v), vec!["m1", "m2"]);
+    }
+
+    /// Sentinel's own findings are inference by basis and actionable anyway:
+    /// the operator armed the lane, and a model saying an image breaks a rule
+    /// is the answer rather than evidence toward one.
+    #[test]
+    fn sentinels_own_finding_is_acted_on_though_its_basis_is_inference() {
+        let own = own_finding("vision", "gore (98%)", "m9".into());
+        assert!(!own.is_proven(), "it is the model's opinion, and says so");
+        assert_eq!(cited_ids(&with(vec![own])), vec!["m9"], "and Sentinel still acts on its own call");
+    }
+
+    #[test]
+    fn the_hide_cap_bounds_one_sentence() {
+        let many: Vec<String> = (0..100).map(|i| format!("m{i}")).collect();
+        let refs: Vec<&str> = many.iter().map(|s| s.as_str()).collect();
+        let v = with(vec![cited("deterministic", &refs)]);
+        assert_eq!(cited_ids(&v).len(), MAX_HIDES);
+    }
+
+    /// The debt lane builds a verdict with no findings at all. Its rung must
+    /// not silently hide nothing and then be recorded as delivered.
+    #[test]
+    fn a_verdict_with_no_findings_cites_nothing() {
+        assert!(cited_ids(&with(vec![])).is_empty());
     }
 
     #[test]
@@ -343,7 +456,7 @@ mod tests {
             ladder::Strike { worth: 12, at_ms: NOW },
         ];
         assert_eq!(
-            select_rung(&p, no_hiding, &store, "c", "npub1a", &two_grave, NOW).unwrap(),
+            select_rung(&p, |r| no_hiding.can_deliver(r), &store, "c", "npub1a", &two_grave, NOW).unwrap(),
             Some(Response::Kick),
             "delete_and_warn cannot be delivered here, so the ladder goes on"
         );

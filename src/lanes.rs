@@ -106,6 +106,35 @@ pub(crate) async fn screen(
     Ok(())
 }
 
+/// What to do about one attachment, before any byte is fetched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Gate {
+    /// Download it and answer for its bytes.
+    Fetch,
+    /// Not media in any client, so nobody meets it by accident. Quiet.
+    Skip,
+    /// It claims to be media and is refused. A person is told, because a
+    /// refusal to look must never read as a clean answer.
+    Refuse(&'static str),
+}
+
+/// The pre-download decision, on the sender's own claims.
+///
+/// The extension is the SENDER's, so it may only decide whether something
+/// could be media at all — never whether it gets judged. Clients render by
+/// extension, so anything claiming to be an image or a video is fetched and
+/// answered for by its bytes.
+pub(crate) fn gate(extension: &str, declared_size: u64, cfg: &crate::config::VisionCfg) -> Gate {
+    let declared = vector_sdk::vector_core::crypto::mime_from_extension(extension);
+    if !declared.starts_with("image/") && !declared.starts_with("video/") {
+        return Gate::Skip;
+    }
+    if declared_size > cfg.max_bytes {
+        return Gate::Refuse("declared over the size limit");
+    }
+    Gate::Fetch
+}
+
 /// Judge one message's attachments.
 ///
 /// Everything here is Sentinel's own opinion. A model's verdict never reaches
@@ -141,18 +170,16 @@ pub(crate) async fn watch_media(
     let now = now_ms();
 
     for att in &msg.message.attachments {
-        // A pre-filter on the sender's own claims, so it is a REFUSAL to look
-        // rather than a clean answer: declaring an oversize or odd-typed
-        // attachment must not be a way to have it never judged in silence.
-        if att.size > cfg.vision.max_bytes {
-            unclassified(bot, &community, cfg, store, watches, me, now, &att.id, "declared over the size limit").await;
-            continue;
-        }
-        let declared = vector_sdk::vector_core::crypto::mime_from_extension(&att.extension);
-        if !cfg.vision.mimes.iter().any(|m| m == declared) {
-            // Ordinary traffic, not evasion — announcing it floods the channel.
-            println!("[media] {} — a type I do not judge", short(&att.id));
-            continue;
+        match gate(&att.extension, att.size, &cfg.vision) {
+            Gate::Skip => {
+                println!("[media] {} — a type I do not judge", short(&att.id));
+                continue;
+            }
+            Gate::Refuse(why) => {
+                unclassified(bot, &community, cfg, store, watches, me, now, &att.id, why).await;
+                continue;
+            }
+            Gate::Fetch => {}
         }
         // `att.id` is the SENDER's declared hash and is never verified, so the
         // cache keys on what actually downloaded.
@@ -168,12 +195,12 @@ pub(crate) async fn watch_media(
             unclassified(bot, &community, cfg, store, watches, me, now, &att.id, "over the size limit").await;
             continue;
         }
-        // MIME from the bytes, never from a name the uploader chose.
+        // MIME from the bytes, never from a name the uploader chose. Whatever
+        // the operator did not list goes to a person: the name claimed media,
+        // so dropping it in silence is the same hole as a timeout reading clean.
         let actual = vector_sdk::vector_core::crypto::mime_from_magic_bytes(&bytes);
         if !cfg.vision.mimes.iter().any(|m| m == actual) {
-            // The name said one thing and the bytes another. Dropping that in
-            // silence is the same hole as a timeout reading as clean.
-            unclassified(bot, &community, cfg, store, watches, me, now, &att.id, "not a type I can judge").await;
+            unclassified(bot, &community, cfg, store, watches, me, now, &att.id, &format!("not a type I judge ({actual})")).await;
             continue;
         }
         let content_hash = vector_sdk::vector_core::crypto::sha256_hex(&bytes);
@@ -401,5 +428,94 @@ impl Budget {
         }
         spent.1 += 1;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vector_sdk::vector_core::crypto::mime_from_magic_bytes;
+
+    fn vision() -> crate::config::VisionCfg {
+        crate::config::VisionCfg { max_bytes: 8 * 1024 * 1024, ..Default::default() }
+    }
+
+    /// The hole this gate exists for. A client renders by extension, so an
+    /// image named for a type the operator did not list still appears inline
+    /// to every member — and used to be dropped with nothing but a stdout line
+    /// keyed on a hash the sender chose.
+    #[test]
+    fn anything_a_client_renders_inline_is_fetched_whatever_the_operator_listed() {
+        let cfg = vision();
+        for ext in ["bmp", "svg", "tiff", "tif", "ico", "png", "jpg", "jpeg", "gif", "webp"] {
+            assert_eq!(gate(ext, 1024, &cfg), Gate::Fetch, ".{ext} renders inline and must be judged");
+        }
+    }
+
+    #[test]
+    fn video_is_fetched_too() {
+        let cfg = vision();
+        for ext in ["mp4", "webm", "mov", "mkv"] {
+            assert_eq!(gate(ext, 1024, &cfg), Gate::Fetch, ".{ext} is media");
+        }
+    }
+
+    /// A voice note or a document renders as a file nobody meets by accident,
+    /// so skipping it is quiet rather than a mod-channel line every minute.
+    #[test]
+    fn things_no_client_renders_as_an_image_are_skipped_quietly() {
+        let cfg = vision();
+        for ext in ["ogg", "mp3", "pdf", "zip", "txt", "wav", "xyz", ""] {
+            assert_eq!(gate(ext, 1024, &cfg), Gate::Skip, ".{ext} is not media a reader stumbles into");
+        }
+    }
+
+    /// A refusal to LOOK must reach a person. Declaring an absurd size is
+    /// otherwise a way to be skipped in silence.
+    #[test]
+    fn an_oversize_claim_is_refused_out_loud_not_dropped() {
+        let cfg = vision();
+        assert_eq!(gate("png", cfg.max_bytes + 1, &cfg), Gate::Refuse("declared over the size limit"));
+        assert_eq!(gate("png", cfg.max_bytes, &cfg), Gate::Fetch, "the bound itself is allowed");
+        assert_eq!(gate("mp4", u64::MAX, &cfg), Gate::Refuse("declared over the size limit"));
+    }
+
+    /// An oversize claim on something that is not media at all is still quiet:
+    /// the size only matters for what would have been fetched.
+    #[test]
+    fn size_is_only_asked_about_media() {
+        assert_eq!(gate("pdf", u64::MAX, &vision()), Gate::Skip);
+    }
+
+    /// The declared type opens the door; the BYTES decide what it is. These two
+    /// must agree about the same set, or a type passes the gate and then has no
+    /// answer — which is what made every video a download and a discard.
+    #[test]
+    fn every_default_judged_type_is_readable_from_its_bytes() {
+        let cfg = vision();
+        // A real EBML header carries its DocType a little way in, so the
+        // sample is built rather than written out and miscounted.
+        let mut webm = vec![0x1A, 0x45, 0xDF, 0xA3];
+        webm.extend_from_slice(&[0u8; 20]);
+        webm.extend_from_slice(b"webm");
+        webm.resize(80, 0);
+
+        let samples: Vec<(&str, Vec<u8>)> = vec![
+            ("image/png", vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
+            ("image/jpeg", vec![0xFF, 0xD8, 0xFF, 0xE0, 0, 0, 0, 0]),
+            ("image/gif", b"GIF89a\0\0".to_vec()),
+            ("image/webp", b"RIFF\0\0\0\0WEBP\0\0\0\0".to_vec()),
+            ("video/mp4", b"\0\0\0\x20ftypisom".to_vec()),
+            ("video/webm", webm),
+        ];
+        for want in &cfg.mimes {
+            let found = samples.iter().find(|(m, _)| m == want);
+            let (_, bytes) = found.unwrap_or_else(|| panic!("no sample for a default mime: {want}"));
+            assert_eq!(
+                mime_from_magic_bytes(bytes),
+                want.as_str(),
+                "{want} is in the default list but cannot be recognised from its bytes"
+            );
+        }
     }
 }
