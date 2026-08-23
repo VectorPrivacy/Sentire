@@ -159,21 +159,33 @@ fn pardon(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<Store>) {
                         return;
                     }
                     let by = ctx.msg.author().unwrap_or_default();
+                    // The record and the BAN, or it is not an undo: a member
+                    // Sentinel removed is still removed with a clean slate.
+                    // Best-effort and reported — the ban may be somebody
+                    // else's, or Sentinel may hold no BAN permission here.
+                    let unbanned = match community.member(who.clone()).unban().await {
+                        Ok(()) => " and lifted the ban",
+                        Err(_) => "",
+                    };
                     match store.pardon(community.id(), &who) {
                         Ok(0) => {
-                            let _ = ctx.reply(format!("{} had nothing to forgive.", short(&who))).await;
+                            let _ = ctx
+                                .reply(format!("{} had nothing to forgive{unbanned}.", short(&who)))
+                                .await;
                         }
                         Ok(n) => {
                             // The one command that changes anything, and it was
                             // the only one that left no trace: every rehearsed
                             // non-action prints a line, an erased record did not.
                             println!(
-                                "[{}] PARDON {} by {} — {n} strike record(s) cleared",
+                                "[{}] PARDON {} by {} — {n} strike record(s) cleared{unbanned}",
                                 short(community.id()),
                                 short(&who),
                                 short(&by)
                             );
-                            let _ = ctx.reply(format!("Cleared {n} strike record(s) for {}.", short(&who))).await;
+                            let _ = ctx
+                                .reply(format!("Cleared {n} strike record(s) for {}{unbanned}.", short(&who)))
+                                .await;
                         }
                         Err(e) => {
                             eprintln!("[{}] pardon {} failed: {e}", short(community.id()), short(&who));

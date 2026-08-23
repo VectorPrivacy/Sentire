@@ -189,7 +189,9 @@ Inside a community, from any client that renders slash commands:
 
 - `/status` — what it is watching, and how much history it can actually see
 - `/why <member>` — their strike record, decayed, and the next step
-- `/pardon <member>` — clear it. Moderators only; the community's own roles decide.
+- `/pardon <member>` — clear it, and lift the ban. Moderators only; the community's own
+  roles decide. Both halves, or it is not an undo: a member Sentinel removed would otherwise
+  stay removed with a clean slate.
 
 Every armed sentence is **announced before it is carried out**, when a mod channel is named.
 The two want opposite sides of the act: an operator has to see what is about to happen, and
