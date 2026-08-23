@@ -59,6 +59,11 @@ pub(crate) async fn screen(
     let mut fresh = false;
     let mut worst: Option<(Gravity, String)> = None;
     for f in &findings {
+        // Basis only, deliberately — NOT the sweep's `chargeable`. A screened
+        // finding carries no citation count because the caller supplied the
+        // message: it IS the citation. The sweep needs that second condition
+        // because it reads a whole corpus, where a finding can describe a
+        // person rather than an act; here there is only ever one message.
         if !f.is_proven() {
             continue; // inference never earns a strike, on any clock
         }
@@ -597,5 +602,38 @@ mod tests {
         assert!(a.claim() && a.claim(), "its own allowance");
         assert!(!a.claim(), "and then it is spent");
         assert!(b.claim(), "which says nothing about anywhere else");
+    }
+
+    /// The two clocks gate charging differently, and they have to. A screened
+    /// finding is emitted with no citation count (vector-core's
+    /// `screen_message` does not set one — the caller supplied the message, so
+    /// it IS the citation), while the sweep needs that condition because it
+    /// reads a corpus where a finding can describe a person rather than an act.
+    ///
+    /// Unifying them would silently switch the text screen off entirely, so
+    /// this pins the asymmetry rather than leaving it to be tidied away.
+    #[test]
+    fn a_screened_finding_is_charged_on_its_basis_alone() {
+        let screened = vector_sdk::policy::Finding {
+            conviction_id: String::new(),
+            policy_hash: "abc123".into(),
+            rule_id: "slurs".into(),
+            scope: "per_message".into(),
+            basis: "deterministic".into(),
+            severity: "severe".into(),
+            stateless: true,
+            rung: 0,
+            hits: 1,
+            weight: 45,
+            detail: vec!["badword".into()],
+            // Both empty, exactly as screen_message emits them.
+            messages: vec![],
+            citation_count: 0,
+        };
+        assert!(screened.is_proven(), "the live screen charges on this");
+        assert!(
+            !crate::review::chargeable(&screened),
+            "and the sweep's rule would refuse it — so the two must not be merged"
+        );
     }
 }
