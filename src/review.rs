@@ -27,6 +27,17 @@ pub(crate) struct Charge {
     pub(crate) evidence: String,
 }
 
+/// Whether one finding can earn a strike at all.
+///
+/// Two conditions, and they answer different questions. The BASIS: inference
+/// may not sentence, whatever it is convinced of. And a CITATION: a strike
+/// points at something the member did, where the engine's raid aggravators
+/// (an account under a day old, one that has posted twice) describe a person
+/// and cite nothing — a cohort is what arms them.
+pub(crate) fn chargeable(f: &vector_sdk::policy::Finding) -> bool {
+    f.is_proven() && f.citation_count > 0
+}
+
 /// What one verdict charges, decided without touching the store.
 ///
 /// Only the BASIS gates a strike: deterministic evidence charges, inference
@@ -40,22 +51,13 @@ pub(crate) fn charges(v: &vector_sdk::policy::Verdict, policy: &crate::policy::C
     let charged_per_message: std::collections::HashSet<&str> = v
         .findings
         .iter()
-        .filter(|f| f.stateless && f.is_proven() && !f.messages.is_empty() && f.citation_count as usize <= f.messages.len())
+        .filter(|f| f.stateless && chargeable(f) && !f.messages.is_empty() && f.citation_count as usize <= f.messages.len())
         .map(|f| f.rule_id.as_str())
         .collect();
 
     let mut out = Vec::new();
     for f in &v.findings {
-        if !f.is_proven() {
-            continue; // inference never earns a strike
-        }
-        // A strike points at something the member DID. The engine's raid
-        // aggravators — `fresh` (an account under a day old), `quiet` (has
-        // posted at most twice) — cite nothing because they describe a person
-        // rather than an act, and they convict nobody on their own: a cohort
-        // arms them. Charging them meant being new earned ladder strikes for
-        // every member caught in a raid detection, with `[arm] raid` off.
-        if f.citation_count == 0 {
+        if !chargeable(f) {
             continue;
         }
         if !f.stateless && charged_per_message.contains(f.rule_id.as_str()) {
@@ -147,7 +149,7 @@ pub(crate) async fn sweep(
     // question. A note-gravity rule never reaches it at any hit count, so
     // asking it here meant light rules accumulated nothing and a small offense
     // was charged only when an unrelated grave one carried the score.
-    for v in verdicts.all().filter(|v| v.findings.iter().any(|f| f.is_proven())) {
+    for v in verdicts.all().filter(|v| v.findings.iter().any(chargeable)) {
         if v.npub == me {
             continue;
         }
@@ -559,6 +561,24 @@ mod tests {
 
     fn base() -> crate::policy::CommunityPolicy {
         crate::config::Config::default().for_community("")
+    }
+
+    /// The sweep's loop filter and the charging rule must be the same
+    /// question, or the loop admits members it then charges nothing for.
+    #[test]
+    fn the_sweep_only_visits_members_it_can_actually_charge() {
+        let cases = [
+            (f("cohort", "whole", false, "heuristic", 1, &[], 0), false),
+            (f("fresh", "whole", false, "deterministic", 1, &[], 0), false),
+            (f("slurs", "per_message", true, "deterministic", 1, &["m1"], 1), true),
+            (f("rate", "per_window", false, "deterministic", 9, &["m1"], 9), true),
+        ];
+        for (finding, want) in cases {
+            let rule = finding.rule_id.clone();
+            assert_eq!(chargeable(&finding), want, "{rule}");
+            let charged = !charges(&verdict(vec![finding]), &base()).is_empty();
+            assert_eq!(charged, want, "{rule}: the filter and the charge disagree");
+        }
     }
 
     /// The engine's raid aggravators describe a PERSON — an account under a
