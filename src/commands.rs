@@ -55,7 +55,15 @@ pub(crate) fn why_line(
     )
 }
 
+/// Register every command Sentinel answers. One function per command, because
+/// each carries its own clone dance and they share nothing but the bot.
 pub(crate) fn operator_surface(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<Store>) {
+    status(bot, cfg);
+    why(bot, cfg, store);
+    pardon(bot, cfg, store);
+}
+
+fn status(bot: &VectorBot, cfg: &Arc<Config>) {
     bot.command("status", "What Sentinel is watching, and how much of it it can see").run({
         let cfg = cfg.clone();
         move |ctx| {
@@ -95,7 +103,9 @@ pub(crate) fn operator_surface(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<S
             }
         }
     });
+}
 
+fn why(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<Store>) {
     bot.command("why", "Why Sentinel has flagged someone")
         .user("member", "Whose standing to explain", true)
         .run({
@@ -126,7 +136,9 @@ pub(crate) fn operator_surface(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<S
                 }
             }
         });
+}
 
+fn pardon(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<Store>) {
     bot.command("pardon", "Clear someone's strikes with Sentinel")
         .user("member", "Whom to forgive", true)
         .run({
