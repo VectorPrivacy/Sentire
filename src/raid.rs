@@ -166,7 +166,7 @@ mod tests {
     }
 
     fn base() -> CommunityPolicy {
-        Config::default().for_community("aa")
+        Config::default().for_community("fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea")
     }
 
     fn permissive() -> CommunityPolicy {

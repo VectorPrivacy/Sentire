@@ -134,7 +134,7 @@ pub(crate) async fn enforce(
         return Ok(Outcome::Failed);
     }
 
-    if let Err(e) = store.log_action(community.id(), &v.npub, name, now, total, &why) {
+    if let Err(e) = store.log_action(community.id(), &v.npub, name, now, &why) {
         // The act ALREADY happened. Propagating would abort the pass and
         // re-deliver it next poll — and a ban rotates the community's keys
         // every time.
@@ -328,16 +328,14 @@ pub(crate) fn select_rung(
     strikes: &[ladder::Strike],
     now: u64,
 ) -> Result<Option<Response>, String> {
-    let hl = policy.ladder.decay_half_life_hours;
-    let total = ladder::total(strikes, now, hl);
     let answers = store.answers(community, npub)?;
     Ok(ladder::owed(
         &policy.ladder,
-        total,
-        answers.iter().map(|a| (a.response.as_str(), a.at_total, a.at_ms)),
+        strikes,
+        answers.iter().map(|a| (a.response.as_str(), a.at_ms)),
         can_deliver,
         now,
-        hl,
+        policy.ladder.decay_half_life_hours,
     ))
 }
 
@@ -355,7 +353,7 @@ mod tests {
     const NOW: u64 = 10_000;
 
     fn policy_with(arm: &str) -> CommunityPolicy {
-        toml::from_str::<Config>(&format!("[arm]\n{arm}")).unwrap().for_community("aa")
+        toml::from_str::<Config>(&format!("[arm]\n{arm}")).unwrap().for_community("fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea")
     }
 
     /// One strike per offense; the ladder climbs as the total rises.
@@ -364,17 +362,21 @@ mod tests {
         let store = mem();
         let p = policy_with("warn = true\ndelete = true\nkick = true\nban = true");
         let all = Powers { hide: true, kick: true, ban: true };
-        let offenses = |n: u32| (0..n).map(|_| ladder::Strike { worth: 12, at_ms: NOW }).collect::<Vec<_>>();
-        let pick = |s: &Store, n: u32| select_rung(&p, |r| all.can_deliver(r), s, "c", "npub1a", &offenses(n), NOW).unwrap();
+        // One offense a minute, each answered before the next arrives — which
+        // is the order the lanes actually produce.
+        let offenses = |n: u32| (0..n).map(|i| ladder::Strike { worth: 12, at_ms: NOW + i as u64 * 60_000 }).collect::<Vec<_>>();
+        let at = |n: u32| NOW + (n - 1) as u64 * 60_000 + 1;
+        let pick =
+            |s: &Store, n: u32| select_rung(&p, |r| all.can_deliver(r), s, "c", "npub1a", &offenses(n), at(n)).unwrap();
 
         assert_eq!(pick(&store, 1), Some(Response::Warn), "twelve points still starts at a warning");
-        store.log_action("c", "npub1a", "warn", NOW, 12, "").unwrap();
+        store.log_action("c", "npub1a", "warn", at(1), "").unwrap();
         assert_eq!(pick(&store, 2), Some(Response::DeleteAndWarn));
-        store.log_action("c", "npub1a", "delete_and_warn", NOW, 24, "").unwrap();
+        store.log_action("c", "npub1a", "delete_and_warn", at(2), "").unwrap();
         assert_eq!(pick(&store, 3), Some(Response::Kick));
-        store.log_action("c", "npub1a", "kick", NOW, 36, "").unwrap();
+        store.log_action("c", "npub1a", "kick", at(3), "").unwrap();
         assert_eq!(pick(&store, 4), Some(Response::Ban));
-        store.log_action("c", "npub1a", "ban", NOW, 48, "").unwrap();
+        store.log_action("c", "npub1a", "ban", at(4), "").unwrap();
         assert_eq!(pick(&store, 5), None, "and stops at the top rather than repeating it");
     }
 
@@ -390,7 +392,7 @@ mod tests {
 
         let first = select_rung(&p, |r| all.can_deliver(r), &store, "c", "npub1a", &one_grave, NOW).unwrap();
         assert_eq!(first, Some(Response::Warn));
-        store.log_action("c", "npub1a", "warn", NOW, 12, "").unwrap();
+        store.log_action("c", "npub1a", "warn", NOW, "").unwrap();
 
         for poll in 1..=20u64 {
             let later = NOW + poll * 90_000;
@@ -412,7 +414,7 @@ mod tests {
         let all = Powers { hide: true, kick: true, ban: true };
         let hl = p.ladder.decay_half_life_hours * 3_600_000;
 
-        store.log_action("c", "npub1a", "kick", NOW, 12, "").unwrap();
+        store.log_action("c", "npub1a", "kick", NOW, "").unwrap();
         let much_later = NOW + hl * 40;
         let fresh = [ladder::Strike { worth: 4, at_ms: much_later }];
 
@@ -530,13 +532,13 @@ mod tests {
         let store = mem();
         let p = policy_with("warn = true\ndelete = true\nkick = true\nban = true");
         let no_hiding = Powers { hide: false, kick: true, ban: true };
-        store.log_action("c", "npub1a", "warn", NOW, 12, "").unwrap();
+        store.log_action("c", "npub1a", "warn", NOW + 1, "").unwrap();
         let two_grave = [
             ladder::Strike { worth: 12, at_ms: NOW },
-            ladder::Strike { worth: 12, at_ms: NOW },
+            ladder::Strike { worth: 12, at_ms: NOW + 60_000 },
         ];
         assert_eq!(
-            select_rung(&p, |r| no_hiding.can_deliver(r), &store, "c", "npub1a", &two_grave, NOW).unwrap(),
+            select_rung(&p, |r| no_hiding.can_deliver(r), &store, "c", "npub1a", &two_grave, NOW + 60_001).unwrap(),
             Some(Response::Kick),
             "delete_and_warn cannot be delivered here, so the ladder goes on"
         );
@@ -557,13 +559,13 @@ mod tests {
         };
 
         // An old, strong answer, long since forgiven.
-        store.log_action("c", "npub1a", "kick", NOW, 36, "").unwrap();
+        store.log_action("c", "npub1a", "kick", NOW, "").unwrap();
         let much_later = NOW + hl * 8;
         let light = [ladder::Strike { worth: 1, at_ms: much_later }];
 
         // The forgiven kick no longer floors anything, so this is a warning.
         assert_eq!(pick(&store, &light, much_later), Some(Response::Warn));
-        store.log_action("c", "npub1a", "warn", much_later, 1, "").unwrap();
+        store.log_action("c", "npub1a", "warn", much_later, "").unwrap();
 
         // And that warning must be the last word until something new happens.
         for poll in 1..=30u64 {
@@ -584,9 +586,9 @@ mod tests {
         let all = Powers { hide: true, kick: true, ban: true };
         let hl = p.ladder.decay_half_life_hours * 3_600_000;
 
-        store.log_action("c", "npub1a", "warn", NOW, 12, "").unwrap();
+        store.log_action("c", "npub1a", "warn", NOW, "").unwrap();
         let later = NOW + hl * 5;
-        store.log_action("c", "npub1a", "warn", later, 1, "").unwrap();
+        store.log_action("c", "npub1a", "warn", later, "").unwrap();
 
         let light = [ladder::Strike { worth: 1, at_ms: later }];
         assert_eq!(
@@ -603,16 +605,16 @@ mod tests {
         let all = Powers { hide: true, kick: true, ban: true };
         let hl = p.ladder.decay_half_life_hours * 3_600_000;
 
-        store.log_action("c", "npub1a", "kick", NOW, 36, "").unwrap();
+        store.log_action("c", "npub1a", "kick", NOW, "").unwrap();
         let much_later = NOW + hl * 8;
-        store.log_action("c", "npub1a", "warn", much_later, 1, "").unwrap();
+        store.log_action("c", "npub1a", "warn", much_later, "").unwrap();
 
         let worse = [
-            ladder::Strike { worth: 1, at_ms: much_later },
-            ladder::Strike { worth: 12, at_ms: much_later },
+            ladder::Strike { worth: 1, at_ms: much_later - 1 },
+            ladder::Strike { worth: 12, at_ms: much_later + 60_000 },
         ];
         assert_eq!(
-            select_rung(&p, |r| all.can_deliver(r), &store, "c", "npub1a", &worse, much_later).unwrap(),
+            select_rung(&p, |r| all.can_deliver(r), &store, "c", "npub1a", &worse, much_later + 60_001).unwrap(),
             Some(Response::DeleteAndWarn),
             "one rung above the warning that still stands, not above the forgiven kick"
         );

@@ -25,8 +25,8 @@ pub fn validate_policy(p: &crate::policy::CommunityPolicy, whose: &str) -> Resul
             s.note, s.minor, s.serious, s.grave
         ));
     }
-    if [s.note, s.minor, s.serious, s.grave].iter().any(|w| *w > 10_000) {
-        return at("ladder.strikes over 10000: totals are summed, and absurd worths overflow rather than escalate".into());
+    if [s.note, s.minor, s.serious, s.grave].iter().any(|w| *w > 1_000_000) {
+        return at("ladder.strikes over 1000000: a scale that large says nothing a smaller one does not".into());
     }
     if p.ladder.steps.is_empty() {
         return at("ladder.steps is empty: with no steps, no strike total ever answers to anything".into());
@@ -48,13 +48,15 @@ pub fn validate_policy(p: &crate::policy::CommunityPolicy, whose: &str) -> Resul
     if p.ladder.decay_half_life_hours == 0 {
         return at("ladder.decay_half_life_hours = 0: strikes would never be forgiven, and the dedup horizon collapses".into());
     }
-    // A century. Beyond it nothing decays within any real total's lifetime, so
-    // the setting means "never forgive" while looking like a number — and it
-    // takes pruning with it, since the janitor's horizon is 32 half-lives.
-    if p.ladder.decay_half_life_hours > 24 * 365 * 100 {
+    // A year. The janitor keeps 32 half-lives, and once that reaches back past
+    // the epoch the horizon saturates to zero and NOTHING is ever pruned — the
+    // ledger and the classification cache grow for the life of the install,
+    // with a healthy heartbeat beside them. A year is already "we do not
+    // forget"; the ceiling is where the arithmetic stops working, not taste.
+    if p.ladder.decay_half_life_hours > 24 * 365 {
         return at(format!(
-            "ladder.decay_half_life_hours = {}: nothing would decay in any lifetime, and the janitor would never \
-             prune. Say so with a large-but-real half-life, or leave the class unarmed.",
+            "ladder.decay_half_life_hours = {} is over a year. The janitor keeps 32 half-lives, and beyond this \
+             that horizon runs past the epoch and pruning silently stops for every community.",
             p.ladder.decay_half_life_hours
         ));
     }
@@ -76,14 +78,15 @@ pub fn validate_policy(p: &crate::policy::CommunityPolicy, whose: &str) -> Resul
             p.raid.min_confidence
         ));
     }
-    // Report mode touches nobody, so "show me everyone" is a real thing to ask
-    // for; the floor is about what may be ACTED on unattended.
-    if p.raid.min_confidence < 50 && p.raid.response != RaidResponse::Report {
+    // The floor is about what may be REMOVED. A rehearsal and report mode both
+    // touch nobody, so "widen what I am shown" is a real thing to ask for while
+    // watching — which is the rollout the README describes.
+    if p.arm.raid && p.raid.response != RaidResponse::Report && p.raid.min_confidence < 50 {
         return at(format!(
-            "raid.min_confidence = {} is below the engine's own actionable floor of 50. Containment is the one \
-             path that acts on inference, and a bar this low contains members over evidence the engine itself \
-             would not act on.",
-            p.raid.min_confidence
+            "raid.min_confidence = {} with containment armed to {}: a bar this low removes members over evidence \
+             barely distinguishable from none. Widen it while rehearsing, or with response = \"report\".",
+            p.raid.min_confidence,
+            p.raid.response.name()
         ));
     }
     if p.raid.max_batch == 0 || p.raid.max_batch > 500 {
@@ -580,7 +583,38 @@ impl Config {
             validate_policy(&self.for_community(id), &format!("[community.\"{id}\"]"))?;
         }
 
-        if self.bot.communities.is_empty() {
+        // The base policy is folded under the empty id, so a block claiming that
+    // key would replace the defaults' own validation with its own — and every
+    // real community, whose id is 64 hex, would go on getting the unvalidated
+    // base.
+    if let Some(bad) = self
+        .community
+        .keys()
+        .find(|c| c.len() != 64 || !c.chars().all(|ch| ch.is_ascii_hexdigit()))
+    {
+        // A block keyed on a typo applies to nobody and says nothing, which is
+        // the dangerous direction: an override written to PROTECT a community
+        // leaves it judged by the defaults. The empty id is doubly wrong — it
+        // is how the base policy is addressed, so a block there would replace
+        // the defaults' own validation.
+        return Err(format!(
+            "[community.\"{bad}\"] is not a community id (64 hex characters), so the block applies to nobody"
+        ));
+    }
+    // A watch list entry that matches nothing looks exactly like never having
+    // been invited, and the boot line says the same thing for both.
+    if let Some(bad) = self
+        .bot
+        .communities
+        .iter()
+        .find(|c| *c != "*" && (c.len() != 64 || !c.chars().all(|ch| ch.is_ascii_hexdigit())))
+    {
+        return Err(format!(
+            "bot.communities lists '{bad}', which is not a community id (64 hex characters) or \"*\". \
+             Sentinel would watch nothing and say only that it had not been invited."
+        ));
+    }
+    if self.bot.communities.is_empty() {
             return Err("bot.communities is empty: Sentinel would watch nothing. Use [\"*\"] for every community.".into());
         }
         if self.vision.enabled {
@@ -601,11 +635,11 @@ impl Config {
             for l in &self.vision.labels {
                 // `over_threshold` takes the first match, so a second entry's
                 // threshold and gravity are silently ignored.
-                if !seen.insert(l.name.as_str()) {
-                    return Err(format!("vision label '{}' is listed twice; the second is ignored", l.name));
-                }
                 if l.name.trim().is_empty() {
                     return Err("a vision label has no name".into());
+                }
+                if !seen.insert(l.name.as_str()) {
+                    return Err(format!("vision label '{}' is listed twice; the second is ignored", l.name));
                 }
             }
             // Every one of these turns the lane into a machine for announcing
@@ -643,9 +677,6 @@ impl Config {
             }
             if self.vision.model.trim().is_empty() {
                 return Err("vision.model is empty".into());
-            }
-            if self.vision.base_url.trim().is_empty() {
-                return Err("vision.base_url is empty".into());
             }
             if !self.vision.is_local() && !self.vision.allow_remote {
                 return Err(format!(
@@ -701,7 +732,7 @@ mod tests {
     fn every_refusal_names_its_field() {
         let cases: &[(&str, &str)] = &[
             ("[shields]\nrespect_protected = false", "respect_protected"),
-            ("[community.\"x\".shields]\nrespect_protected = false", "respect_protected"),
+            ("[community.\"fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea\".shields]\nrespect_protected = false", "respect_protected"),
             ("[ladder]\nstrikes = { note = 5, minor = 2, serious = 4, grave = 12 }", "strikes"),
             ("[[ladder.steps]]\nat = 4\nresponse = \"warn\"\n[[ladder.steps]]\nat = 1\nresponse = \"kick\"", "ascend"),
             ("[[ladder.steps]]\nat = 1\nresponse = \"kick\"\n[[ladder.steps]]\nat = 4\nresponse = \"warn\"", "de-escalate"),
@@ -715,18 +746,18 @@ mod tests {
             ("[limits]\nmax_actions_per_run = 0", "max_actions_"),
             ("[bot]\ncommunities = []", "communities"),
             ("[[ladder.steps]]\nat = 0\nresponse = \"ban\"", "sentenced on sight"),
-            ("[ladder]\nstrikes = { note = 1, minor = 2, serious = 4, grave = 999999 }", "overflow"),
+            ("[ladder]\nstrikes = { note = 1, minor = 2, serious = 4, grave = 9999999 }", "says nothing a smaller one does not"),
             ("[vision]\nenabled = true\n[[vision.labels]]\nname = \"g\"\nthreshold = 0.0\ngravity = \"grave\"", "greater than 0.0"),
             ("[vision]\nenabled = true", "vision.labels"),
             ("[vision]\nenabled = true\nbase_url = \"https://api.example.com/v1\"\n[[vision.labels]]\nname = \"gore\"\nthreshold = 0.9\ngravity = \"grave\"", "allow_remote"),
             ("[vision]\nenabled = true\n[[vision.labels]]\nname = \"gore\"\nthreshold = 4.0\ngravity = \"grave\"", "threshold"),
             ("[[rules.words]]\nid = \"empty\"\npatterns = []\ngravity = \"note\"", "empty"),
             // An override must not reach what the defaults are refused.
-            ("[community.\"x\".ladder]\nsteps = [{ at = 0, response = \"ban\" }]", "sentenced on sight"),
-            ("[community.\"x\".ladder]\ndecay_half_life_hours = 0", "decay_half_life_hours"),
-            ("[community.\"x\".raid]\nmax_batch = 0", "max_batch"),
-            ("[community.\"x\".limits]\nhalt_if_over_pct = 0", "halt_if_over_pct"),
-            ("[community.\"x\".raid]\ntripwire_accounts = 1", "tripwire_accounts"),
+            ("[community.\"fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea\".ladder]\nsteps = [{ at = 0, response = \"ban\" }]", "sentenced on sight"),
+            ("[community.\"fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea\".ladder]\ndecay_half_life_hours = 0", "decay_half_life_hours"),
+            ("[community.\"fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea\".raid]\nmax_batch = 0", "max_batch"),
+            ("[community.\"fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea\".limits]\nhalt_if_over_pct = 0", "halt_if_over_pct"),
+            ("[community.\"fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea\".raid]\ntripwire_accounts = 1", "tripwire_accounts"),
         ];
         for (toml_text, expect) in cases {
             let cfg: Config = toml::from_str(toml_text).unwrap();
@@ -757,7 +788,7 @@ mod tests {
         assert_eq!(Gravity::from_severity("catastrophic"), Gravity::Note);
         // An unnamed rule defers to the engine's severity, resolved per
         // community — see policy::CommunityPolicy::gravity_of.
-        let p = Config::default().for_community("aa");
+        let p = Config::default().for_community("fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea");
         assert_eq!(p.gravity_of("nonexistent", "severe"), Gravity::Grave);
         assert_eq!(p.gravity_of("nonexistent", "nonsense"), Gravity::Note);
     }
@@ -777,8 +808,8 @@ mod unknown_key_tests {
             ("[arm]\nwarn = true\nvision = false", "vision"),
             ("[limits]\nhalt_if_over_pc = 50", "halt_if_over_pc"),
             ("[ladder]\ndecay_half_life_hour = 72", "decay_half_life_hour"),
-            ("[community.\"aa\".arm]\nraids = true", "raids"),
-            ("[community.\"aa\".vision]\nenabled = false", "vision"),
+            ("[community.\"fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea\".arm]\nraids = true", "raids"),
+            ("[community.\"fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea\".vision]\nenabled = false", "vision"),
             ("[rules]\nwindow_hour = 72", "window_hour"),
         ] {
             let err = toml::from_str::<Config>(text).unwrap_err().to_string();
@@ -792,11 +823,19 @@ mod unknown_key_tests {
     /// ask for — the confidence floor is about what may be ACTED on.
     #[test]
     fn a_low_bar_is_allowed_when_nobody_is_touched() {
-        let reporting: Config = toml::from_str("[raid]\nmin_confidence = 0\nresponse = \"report\"").unwrap();
+        // Rehearsing: nothing is armed, so nobody is contained whatever the bar.
+        let rehearsing: Config = toml::from_str("[raid]\nmin_confidence = 0\nresponse = \"kick\"").unwrap();
+        Config::validate_for_test(&rehearsing).expect("a dry run may look at everyone");
+
+        // Armed to report: still nobody.
+        let reporting: Config =
+            toml::from_str("[arm]\nraid = true\n[raid]\nmin_confidence = 0\nresponse = \"report\"").unwrap();
         Config::validate_for_test(&reporting).expect("report mode may look at everyone");
 
-        let kicking: Config = toml::from_str("[raid]\nmin_confidence = 0\nresponse = \"kick\"").unwrap();
-        assert!(Config::validate_for_test(&kicking).is_err(), "but removal answers to the floor");
+        // Armed to remove: the bar is what stands between evidence and a ban.
+        let kicking: Config =
+            toml::from_str("[arm]\nraid = true\n[raid]\nmin_confidence = 0\nresponse = \"kick\"").unwrap();
+        assert!(Config::validate_for_test(&kicking).is_err(), "removal answers to the floor");
     }
 
     /// The bottom-up refusal used to reject this, on the premise that an
@@ -830,9 +869,9 @@ mod unknown_key_tests {
                 "no scheme",
             ),
             (format!("[vision]\nenabled = true\n{label}\n{label}"), "listed twice"),
-            ("[raid]\nmin_confidence = 0".into(), "min_confidence"),
+            ("[arm]\nraid = true\n[raid]\nmin_confidence = 0\nresponse = \"kick\"".into(), "min_confidence"),
             ("[raid]\ntripwire_cooldown_secs = 0".into(), "tripwire_cooldown_secs"),
-            ("[ladder]\ndecay_half_life_hours = 100000000".into(), "decay_half_life_hours"),
+            ("[ladder]\ndecay_half_life_hours = 90000".into(), "decay_half_life_hours"),
             ("[ladder]\nstrikes = { note = 0, minor = 0, serious = 0, grave = 0 }".into(), "grave = 0"),
             ("[[rules.words]]\nid = \"x\"\npatterns = [\"\"]\ngravity = \"minor\"".into(), "matches nothing"),
             ("[[rules.words]]\nid = \"x\"\npatterns = [\"**\"]\ngravity = \"minor\"".into(), "matches nothing"),

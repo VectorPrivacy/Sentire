@@ -298,7 +298,7 @@ mod tests {
     #[test]
     fn a_community_without_an_override_gets_the_defaults() {
         let cfg = Config::default();
-        let p = cfg.for_community("aa");
+        let p = cfg.for_community("fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea");
         assert_eq!(p.ladder.steps.len(), cfg.ladder.steps.len());
         assert!(!p.arm.kick);
     }
@@ -336,14 +336,14 @@ mod tests {
             max_actions_per_run = 5
             max_actions_per_hour = 10
             halt_if_over_pct = 50
-            [community."x".limits]
+            [community."fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea".limits]
             halt_if_over_pct = 20
-            [community."x".raid]
+            [community."fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea".raid]
             response = "ban"
             "#,
         )
         .unwrap();
-        let p = cfg.for_community("x");
+        let p = cfg.for_community("fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea");
         assert_eq!(p.limits.halt_if_over_pct, 20, "the named field changes");
         assert_eq!(p.limits.max_actions_per_run, 5, "and the operator's others survive");
         assert_eq!(p.limits.max_actions_per_hour, 10);
@@ -360,14 +360,14 @@ mod tests {
             [rules]
             window_hours = 720
             raid_detection = false
-            [[community."x".rules.words]]
+            [[community."fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea".rules.words]]
             id = "theirs"
             patterns = ["blast"]
             gravity = "note"
             "#,
         )
         .unwrap();
-        let p = cfg.for_community("x");
+        let p = cfg.for_community("fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea");
         assert_eq!(p.rules.words.len(), 1, "their own words");
         assert_eq!(p.rules.window_hours, 720, "and the operator's window");
         assert!(!p.rules.raid_detection, "and their decision to turn raid detection off");
@@ -395,7 +395,7 @@ mod tests {
 [ladder]
 strikes = { note = 4, minor = 8, serious = 16, grave = 48 }
 
-[community."aa".ladder]
+[community."fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea".ladder]
 strikes = { grave = 60 }
 "#,
         )
@@ -404,7 +404,7 @@ strikes = { grave = 60 }
         let base = cfg.for_community("");
         assert_eq!((base.ladder.strikes.note, base.ladder.strikes.grave), (4, 48));
 
-        let folded = cfg.for_community("aa").ladder.strikes;
+        let folded = cfg.for_community("fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea").ladder.strikes;
         assert_eq!(folded.grave, 60, "the field the override named");
         assert_eq!(folded.note, 4, "and not one it did not");
         assert_eq!(folded.minor, 8);
@@ -415,9 +415,9 @@ strikes = { grave = 60 }
     #[test]
     fn a_strikes_override_can_lower_a_worth_too() {
         let cfg: crate::config::Config = toml::from_str(
-            "[ladder]\nstrikes = { note = 4, minor = 8, serious = 16, grave = 48 }\n\n[community.\"aa\".ladder]\nstrikes = { note = 1 }",
+            "[ladder]\nstrikes = { note = 4, minor = 8, serious = 16, grave = 48 }\n\n[community.\"fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea\".ladder]\nstrikes = { note = 1 }",
         )
         .unwrap();
-        assert_eq!(cfg.for_community("aa").ladder.strikes.note, 1);
+        assert_eq!(cfg.for_community("fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea").ladder.strikes.note, 1);
     }
 }

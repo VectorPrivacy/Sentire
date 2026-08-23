@@ -38,8 +38,8 @@ pub(crate) fn why_line(
     let total = ladder::total(strikes, now, hl);
     let next = ladder::owed(
         &policy.ladder,
-        total,
-        answers.iter().map(|a| (a.response.as_str(), a.at_total, a.at_ms)),
+        strikes,
+        answers.iter().map(|a| (a.response.as_str(), a.at_ms)),
         |r| powers.can_deliver(r),
         now,
         hl,
@@ -214,8 +214,14 @@ mod tests {
     fn why_respects_what_the_community_permits() {
         let p = policy();
         let no_hiding = Powers { hide: false, kick: true, ban: true };
-        let prior = Answer { response: "warn".into(), at_total: 12, at_ms: NOW };
-        let line = why_line("npub1abcdefghijk", &strikes(&[12, 12]), std::slice::from_ref(&prior), &p, no_hiding, NOW);
+        let prior = Answer { response: "warn".into(), at_ms: NOW };
+        // A second offense after the warning, which is what makes a rung owed.
+        let after = [
+            ladder::Strike { worth: 12, at_ms: NOW - 1 },
+            ladder::Strike { worth: 12, at_ms: NOW + 60_000 },
+        ];
+        let line =
+            why_line("npub1abcdefghijk", &after, std::slice::from_ref(&prior), &p, no_hiding, NOW + 60_001);
         assert!(
             line.contains("next: kick"),
             "delete_and_warn cannot be delivered here, so it is not what comes next: {line}"
@@ -227,7 +233,7 @@ mod tests {
     #[test]
     fn why_says_nothing_is_owed_when_nothing_is() {
         let p = policy();
-        let prior = Answer { response: "warn".into(), at_total: 12, at_ms: NOW };
+        let prior = Answer { response: "warn".into(), at_ms: NOW };
         let line = why_line("npub1abcdefghijk", &strikes(&[12]), std::slice::from_ref(&prior), &p, all(), NOW);
         assert!(line.contains("nothing owed"), "{line}");
     }
@@ -245,11 +251,11 @@ mod tests {
     #[test]
     fn the_armed_line_reads_this_communitys_block() {
         let cfg: Config = toml::from_str(
-            "[arm]\nwarn = false\n[community.\"aa\".arm]\nwarn = true\ndelete = true",
+            "[arm]\nwarn = false\n[community.\"fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea\".arm]\nwarn = true\ndelete = true",
         )
         .unwrap();
         assert_eq!(CommunityPolicy::armed_line(&cfg.for_community("")), "nothing (dry run)");
-        assert_eq!(CommunityPolicy::armed_line(&cfg.for_community("aa")), "warn, delete");
+        assert_eq!(CommunityPolicy::armed_line(&cfg.for_community("fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea")), "warn, delete");
     }
 
     #[test]

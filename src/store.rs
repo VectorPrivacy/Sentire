@@ -10,7 +10,7 @@ use rusqlite::Connection;
 
 use crate::ladder::Strike;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
@@ -34,10 +34,7 @@ CREATE TABLE IF NOT EXISTS actions (
     subject   TEXT NOT NULL,
     response  TEXT NOT NULL,
     at_ms     INTEGER NOT NULL,
-    evidence  TEXT NOT NULL DEFAULT '',
-    -- The total this answered. The ladder climbs per OFFENSE, so a rung is
-    -- owed only once the total rises above the one already answered.
-    at_total  INTEGER NOT NULL DEFAULT 0
+    evidence  TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS classifications (
     content_hash TEXT NOT NULL,
@@ -55,11 +52,10 @@ pub struct Store {
     conn: Mutex<Connection>,
 }
 
-/// One answer already given, and the total it answered.
+/// One answer already given, and when.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Answer {
     pub response: String,
-    pub at_total: u32,
     pub at_ms: u64,
 }
 
@@ -147,22 +143,20 @@ impl Store {
         Ok(rows.flatten().collect())
     }
 
-    /// Record an answer. `at_total` is the decayed total it answered, which is
-    /// what makes the next rung owed only once the total rises above it.
+    /// Record an answer. Its TIME is what the ladder reads: a rung is owed
+    /// again only once a strike lands after it.
     pub fn log_action(
         &self,
         community: &str,
         subject: &str,
         response: &str,
         at_ms: u64,
-        at_total: u32,
         evidence: &str,
     ) -> Result<(), String> {
         self.lock()
             .execute(
-                "INSERT INTO actions (community, subject, response, at_ms, at_total, evidence) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![community, subject, response, at_ms as i64, at_total, evidence],
+                "INSERT INTO actions (community, subject, response, at_ms, evidence) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![community, subject, response, at_ms as i64, evidence],
             )
             .map(|_| ())
             .map_err(|e| e.to_string())
@@ -179,17 +173,12 @@ impl Store {
         let conn = self.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT response, at_total, at_ms FROM actions WHERE community = ?1 AND subject = ?2 \
-                 ORDER BY at_ms, rowid",
+                "SELECT response, at_ms FROM actions WHERE community = ?1 AND subject = ?2 ORDER BY at_ms, rowid",
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map(rusqlite::params![community, subject], |r| {
-                Ok(Answer {
-                    response: r.get::<_, String>(0)?,
-                    at_total: r.get::<_, i64>(1)? as u32,
-                    at_ms: r.get::<_, i64>(2)? as u64,
-                })
+                Ok(Answer { response: r.get::<_, String>(0)?, at_ms: r.get::<_, i64>(1)? as u64 })
             })
             .map_err(|e| e.to_string())?;
         rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
@@ -451,12 +440,12 @@ pub mod tests {
     #[test]
     fn every_answer_is_kept_in_the_order_it_was_given() {
         let s = mem();
-        s.log_action("c", "npub1a", "kick", 1000, 8, "").unwrap();
-        s.log_action("c", "npub1a", "warn", 2000, 1, "").unwrap();
+        s.log_action("c", "npub1a", "kick", 1000, "").unwrap();
+        s.log_action("c", "npub1a", "warn", 2000, "").unwrap();
         let got = s.answers("c", "npub1a").unwrap();
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].response, "kick");
-        assert_eq!(got[0].at_total, 8);
+        assert_eq!(got[0].at_ms, 1000);
         assert_eq!(got[1].response, "warn");
         assert_eq!(got[1].at_ms, 2000);
     }
@@ -466,7 +455,7 @@ pub mod tests {
     #[test]
     fn a_raid_row_is_not_a_ladder_response() {
         let s = mem();
-        s.log_action("c", "npub1a", "raid:kick", 0, 0, "").unwrap();
+        s.log_action("c", "npub1a", "raid:kick", 0, "").unwrap();
         assert!(s.answers("c", "npub1a").unwrap().iter().all(|a| crate::config::Response::rank_of(&a.response) == 0));
         assert_eq!(s.actions_last_hour("c", 1000).unwrap(), 0, "and answers to its own bound");
         assert_eq!(s.contained_last_hour("c", 1000).unwrap(), 1, "which is this one");
@@ -478,10 +467,10 @@ pub mod tests {
     #[test]
     fn the_ladder_and_containment_do_not_share_a_budget() {
         let s = mem();
-        s.log_action("c", "npub1a", "warn", 0, 1, "").unwrap();
-        s.log_action("c", "npub1a", "delete_and_warn", 0, 2, "").unwrap();
-        s.log_action("c", "npub1b", "raid:kick", 0, 0, "").unwrap();
-        s.log_action("c", "npub1c", "raid:kick", 0, 0, "").unwrap();
+        s.log_action("c", "npub1a", "warn", 0, "").unwrap();
+        s.log_action("c", "npub1a", "delete_and_warn", 0, "").unwrap();
+        s.log_action("c", "npub1b", "raid:kick", 0, "").unwrap();
+        s.log_action("c", "npub1c", "raid:kick", 0, "").unwrap();
         s.claim("c", "armed:kick:npub1d", 0, 10_000).unwrap();
 
         assert_eq!(s.actions_last_hour("c", 1000).unwrap(), 2, "the ladder sees only ladder rows");
@@ -489,7 +478,7 @@ pub mod tests {
 
         // A report touches nobody, so it must not spend the removal ceiling —
         // report-then-kick is the documented rollout.
-        s.log_action("c", "npub1e", "raid:report", 0, 0, "").unwrap();
+        s.log_action("c", "npub1e", "raid:report", 0, "").unwrap();
         assert_eq!(s.contained_last_hour("c", 1000).unwrap(), 2, "a report removed nobody");
     }
 
@@ -508,7 +497,7 @@ pub mod tests {
     fn a_pardon_clears_everything_including_a_claim() {
         let s = mem();
         s.record("c", "npub1a", "x", 4, 0, "").unwrap();
-        s.log_action("c", "npub1a", "kick", 0, 0, "").unwrap();
+        s.log_action("c", "npub1a", "kick", 0, "").unwrap();
         s.claim("c", "kick:npub1a", 0, 10_000).unwrap();
 
         assert_eq!(s.pardon("c", "npub1a").unwrap(), 1);
@@ -573,7 +562,7 @@ pub mod tests {
         s.note_armed("c", "warn").unwrap();
         s.note_armed("other", "warn").unwrap();
         s.record("c", "npub1a", "x", 4, 0, "rehearsed").unwrap();
-        s.log_action("c", "npub1a", "warn", 0, 4, "").unwrap();
+        s.log_action("c", "npub1a", "warn", 0, "").unwrap();
         s.record("other", "npub1b", "y", 4, 0, "").unwrap();
 
         assert!(s.note_armed("c", "warn kick").unwrap(), "arming a class is a change");
@@ -608,8 +597,8 @@ pub mod tests {
     #[test]
     fn the_hourly_bounds_are_scoped_per_community() {
         let s = mem();
-        s.log_action("c", "npub1a", "warn", 1000, 0, "").unwrap();
-        s.log_action("other", "npub1b", "kick", 1000, 0, "").unwrap();
+        s.log_action("c", "npub1a", "warn", 1000, "").unwrap();
+        s.log_action("other", "npub1b", "kick", 1000, "").unwrap();
         assert_eq!(s.actions_last_hour("c", 2000).unwrap(), 1, "another community's wave does not starve this one");
         assert_eq!(s.actions_last_hour("c", 3_700_000 + 1000).unwrap(), 0, "and the hour rolls off");
         assert_eq!(s.subjects_actioned_last_hour("c", 2000, "npub1a").unwrap(), 0, "the judged member is excluded");
@@ -630,7 +619,7 @@ pub mod tests {
         let s = mem();
         s.record("c", "npub1a", "old", 4, 1_000, "").unwrap();
         s.record("c", "npub1a", "new", 4, 9_000, "").unwrap();
-        s.log_action("c", "npub1a", "warn", 1_000, 0, "").unwrap();
+        s.log_action("c", "npub1a", "warn", 1_000, "").unwrap();
         assert_eq!(s.prune(5_000).unwrap(), 2, "one strike and one action");
         assert_eq!(s.strikes("c", "npub1a").unwrap().len(), 1, "the live one stays");
     }
@@ -640,7 +629,7 @@ pub mod tests {
     fn nothing_in_the_ledger_crosses_between_communities() {
         let s = mem();
         s.record("one", "npub1a", "x", 4, 0, "ev").unwrap();
-        s.log_action("one", "npub1a", "kick", 0, 4, "").unwrap();
+        s.log_action("one", "npub1a", "kick", 0, "").unwrap();
 
         assert!(s.strikes("two", "npub1a").unwrap().is_empty());
         assert!(s.answers("two", "npub1a").unwrap().is_empty());
@@ -682,7 +671,7 @@ pub mod tests {
     fn a_hidden_hour_boundary_is_not_off_by_one() {
         let s = mem();
         let hour = 3_600_000u64;
-        s.log_action("c", "npub1a", "warn", 1_000, 1, "").unwrap();
+        s.log_action("c", "npub1a", "warn", 1_000, "").unwrap();
         assert_eq!(s.actions_last_hour("c", 1_000 + hour).unwrap(), 1, "exactly an hour old still counts");
         assert_eq!(s.actions_last_hour("c", 1_000 + hour + 1).unwrap(), 0, "a millisecond later it does not");
     }

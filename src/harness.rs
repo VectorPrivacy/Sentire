@@ -218,11 +218,26 @@ pub struct Pipeline {
     pub cfg: crate::config::Config,
     pub store: crate::store::Store,
     pub powers: crate::policy::Powers,
+    /// Successive polls are successive instants. A real sweep runs every 90
+    /// seconds, and the ladder reads WHEN an answer was given.
+    clock: std::cell::Cell<u64>,
 }
 
 impl Pipeline {
     pub fn new(cfg: crate::config::Config) -> Pipeline {
-        Pipeline { cfg, store: crate::store::tests::mem(), powers: crate::policy::Powers { hide: true, kick: true, ban: true } }
+        Pipeline {
+            cfg,
+            store: crate::store::tests::mem(),
+            powers: crate::policy::Powers { hide: true, kick: true, ban: true },
+            clock: std::cell::Cell::new(0),
+        }
+    }
+
+    /// The instant this poll runs at, ninety seconds after the last.
+    fn tick(&self, floor: u64) -> u64 {
+        let next = self.clock.get().max(floor) + 90_000;
+        self.clock.set(next);
+        next
     }
 
     fn policy(&self) -> crate::policy::CommunityPolicy {
@@ -236,7 +251,7 @@ impl Pipeline {
     pub fn poll(&self, w: &World, policy: &Policy, who: &Who) -> Option<crate::config::Response> {
         let vs = w.verdicts(policy);
         let Some(v) = find(&vs, who) else { return None };
-        self.answer(v, w.now_ms)
+        self.answer(v, self.tick(w.now_ms))
     }
 
     /// The same, for a verdict reached some other way (a media lane finding).
@@ -261,8 +276,8 @@ impl Pipeline {
         };
         match crate::adjudicate::adjudicate(&p, powers, &facts, rung) {
             crate::adjudicate::Sentence::Carry { response, .. } => {
-                let total = crate::ladder::total(&strikes, now, p.ladder.decay_half_life_hours);
-                self.store.log_action("c", &v.npub, response.name(), now, total, "").unwrap();
+                // After the strikes it answered, as `enforce` records it.
+                self.store.log_action("c", &v.npub, response.name(), now + 1, "").unwrap();
                 Some(response)
             }
             _ => None,
@@ -980,7 +995,7 @@ pub(crate) mod tests {
                     "seed {seed}: {delivered} answers for {offenses} offenses — the ladder is climbing on the clock"
                 );
 
-                store.log_action("c", "npub1a", rung.name(), now, total, "").unwrap();
+                store.log_action("c", "npub1a", rung.name(), now, "").unwrap();
             }
         }
     }

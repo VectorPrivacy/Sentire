@@ -398,7 +398,7 @@ pub(crate) async fn contain(
     // against warn, delete and kick — permanently, on evidence nobody acted on.
     for npub in &done {
         store
-            .log_action(community.id(), npub, &format!("raid:{verb}"), now, 0, "raid cohort")
+            .log_action(community.id(), npub, &format!("raid:{verb}"), now, "raid cohort")
             .map_err(vector_sdk::Error::Other)?;
     }
     if armed {

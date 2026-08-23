@@ -165,7 +165,7 @@ mod tests {
     }
 
     fn policy() -> CommunityPolicy {
-        Config::default().for_community("aa")
+        Config::default().for_community("fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea")
     }
 
     /// The property the whole restructure exists for: no lane can reach an

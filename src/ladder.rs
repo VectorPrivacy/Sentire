@@ -47,41 +47,45 @@ pub fn decide(ladder: &Ladder, total: u32) -> Option<Response> {
 /// never be told about a ladder different from the one that will run.
 pub fn owed<'a>(
     l: &Ladder,
-    total: u32,
-    answers: impl IntoIterator<Item = (&'a str, u32, u64)>,
+    strikes: &[Strike],
+    answers: impl IntoIterator<Item = (&'a str, u64)>,
     can_deliver: impl Fn(Response) -> bool,
     now_ms: u64,
     half_life_hours: u64,
 ) -> Option<Response> {
-    // Each answer aged the same way the strikes it answered are, so an answer
-    // is forgiven on the same schedule as its evidence rather than sealing the
-    // member off for the life of the row.
-    let mut answered = 0u32;
-    let mut floor: Option<(&str, u8)> = None;
-    for (name, at_total, at_ms) in answers {
-        let standing = decay(at_total, now_ms.saturating_sub(at_ms), half_life_hours);
-        answered = answered.max(standing);
-        // An answer whose evidence is fully forgiven stops flooring the ladder:
-        // a kick from March must not leave a light offense in October
-        // answerable only by a ban.
-        if standing > 0 {
-            let rank = Response::rank_of(name);
-            if floor.is_none_or(|(_, best)| rank > best) {
-                floor = Some((name, rank));
-            }
+    let answers: Vec<(&str, u64)> = answers.into_iter().collect();
+
+    // Has anything happened SINCE the last answer? Times, not totals: a
+    // re-reported conviction keeps its original timestamp, so it is never
+    // newer, while a comparison of magnitudes has to age the answered total
+    // the same way the strikes age — and it cannot, because that total was a
+    // sum and `>>` floors a sum more kindly than it floors its parts. Twenty
+    // four notes answered with a warning silently swallowed a grave offense a
+    // week later, exactly and forever.
+    if let Some(last) = answers.iter().map(|(_, at)| *at).max() {
+        if !strikes.iter().any(|s| s.at_ms > last) {
+            return None;
         }
     }
-    // The ladder climbs per OFFENSE, not per poll. A verdict re-reports every
-    // standing conviction, so without this one message walks the whole ladder
-    // on the clock: warn, delete, kick, ban, one poll apart.
-    //
-    // The HIGHEST still-standing answer, over every row. Reading only the
-    // strongest meant a later, lighter answer never closed the gate it opened,
-    // and the same rung was re-delivered every poll until its strike decayed.
-    if total <= answered {
-        return None;
-    }
-    next_step(l, total, floor.map(|(name, _)| name), can_deliver)
+
+    // Nothing to answer with below the first step.
+    decide(l, total(strikes, now_ms, half_life_hours))?;
+
+    // An answer outlives its evidence exactly as long as that evidence stands.
+    // Without this a kick from March leaves a light offense in October
+    // answerable only by a ban; with it, a member whose whole record has
+    // decayed away starts again at a warning.
+    let floor = answers
+        .iter()
+        .filter(|(_, at)| {
+            strikes
+                .iter()
+                .any(|s| s.at_ms <= *at && decay(s.worth, now_ms.saturating_sub(s.at_ms), half_life_hours) > 0)
+        })
+        .max_by_key(|(name, _)| Response::rank_of(name))
+        .map(|(name, _)| *name);
+
+    next_step(l, total(strikes, now_ms, half_life_hours), floor, can_deliver)
 }
 
 /// The NEXT rung to answer with, given what this member has already received.
@@ -226,43 +230,120 @@ mod tests {
         assert_eq!(decide(&l, total(&spread, hl_ms, l.decay_half_life_hours)), Some(Response::DeleteAndWarn));
     }
 
-    fn answer(name: &str, at_total: u32, at_ms: u64) -> (&str, u32, u64) {
-        (name, at_total, at_ms)
-    }
-
     const HL: u64 = 168;
     const HOUR: u64 = 3_600_000;
 
-    /// The whole decision, as a table. Each row is (total, prior, now) -> rung.
+    fn at(worth: u32, at_ms: u64) -> Strike {
+        Strike { worth, at_ms }
+    }
+
+    /// The whole decision, as a table: strikes and answers in, a rung out.
     #[test]
     fn owed_answers_the_same_way_every_time() {
         let l = ladder();
-        let cases: &[(u32, Option<(&str, u32, u64)>, u64, Option<Response>)] = &[
-            // Nothing on file: the first answer is the bottom rung.
-            (12, None, 0, Some(Response::Warn)),
-            (1, None, 0, Some(Response::Warn)),
-            (0, None, 0, None),
-            // Answered, and nothing new has happened.
-            (12, Some(answer("warn", 12, 0)), 0, None),
-            (11, Some(answer("warn", 12, 0)), 0, None),
-            // A new offense, so it climbs one rung.
-            (24, Some(answer("warn", 12, 0)), 0, Some(Response::DeleteAndWarn)),
-            (36, Some(answer("delete_and_warn", 24, 0)), 0, Some(Response::Kick)),
-            (48, Some(answer("kick", 36, 0)), 0, Some(Response::Ban)),
-            // Nothing above the top.
-            (60, Some(answer("ban", 48, 0)), 0, None),
-            // Decay closes the gate as the total falls with it.
-            (6, Some(answer("warn", 12, 0)), HL * HOUR, None),
-            // And opens it once the old answer is fully forgiven.
-            (4, Some(answer("kick", 12, 0)), HL * HOUR * 40, Some(Response::Warn)),
-            // A prior no ladder configures floors nothing.
-            (12, Some(answer("raid:kick", 0, 0)), 0, Some(Response::Warn)),
+        let hl = HL * HOUR;
+
+        struct Case {
+            what: &'static str,
+            strikes: Vec<Strike>,
+            answers: Vec<(&'static str, u64)>,
+            now: u64,
+            want: Option<Response>,
+        }
+
+        let cases = vec![
+            Case {
+                what: "nothing on file: the first answer is the bottom rung",
+                strikes: vec![at(12, 0)],
+                answers: vec![],
+                now: 0,
+                want: Some(Response::Warn),
+            },
+            Case {
+                what: "below the first step, nothing answers to anything",
+                strikes: vec![],
+                answers: vec![],
+                now: 0,
+                want: None,
+            },
+            Case {
+                what: "answered, and nothing new has happened",
+                strikes: vec![at(12, 0)],
+                answers: vec![("warn", 10)],
+                now: 20,
+                want: None,
+            },
+            Case {
+                what: "a re-reported conviction keeps its time, so it is never new",
+                strikes: vec![at(12, 0)],
+                answers: vec![("warn", 10)],
+                now: 90_000_000,
+                want: None,
+            },
+            Case {
+                what: "a new offense climbs one rung",
+                strikes: vec![at(12, 0), at(12, 20)],
+                answers: vec![("warn", 10)],
+                now: 30,
+                want: Some(Response::DeleteAndWarn),
+            },
+            Case {
+                what: "and again",
+                strikes: vec![at(12, 0), at(12, 20), at(12, 40)],
+                answers: vec![("warn", 10), ("delete_and_warn", 30)],
+                now: 50,
+                want: Some(Response::Kick),
+            },
+            Case {
+                what: "nothing above the top rung",
+                strikes: vec![at(12, 0), at(12, 60)],
+                answers: vec![("warn", 10), ("delete_and_warn", 20), ("kick", 30), ("ban", 40)],
+                now: 70,
+                want: None,
+            },
+            Case {
+                what: "the grave offense that a light history used to swallow",
+                strikes: {
+                    let mut v: Vec<Strike> = (0..24).map(|_| at(1, 0)).collect();
+                    v.push(at(12, hl));
+                    v
+                },
+                answers: vec![("warn", 1)],
+                now: hl,
+                // A warning, because the notes it answered have decayed to
+                // nothing and the floor goes with them. The point is that the
+                // offense IS answered: it used to be swallowed for good.
+                want: Some(Response::Warn),
+            },
+            Case {
+                what: "a forgiven kick stops flooring a light offense",
+                strikes: vec![at(12, 0), at(1, hl * 40)],
+                answers: vec![("kick", 1)],
+                now: hl * 40,
+                want: Some(Response::Warn),
+            },
+            Case {
+                what: "a standing kick still floors one",
+                strikes: vec![at(12, 0), at(12, 10)],
+                answers: vec![("kick", 5)],
+                now: 20,
+                want: Some(Response::Ban),
+            },
+            Case {
+                what: "a prior no ladder configures floors nothing",
+                strikes: vec![at(12, 0), at(12, 20)],
+                answers: vec![("raid:kick", 10)],
+                now: 30,
+                want: Some(Response::Warn),
+            },
         ];
-        for (total, prior, now, want) in cases {
+
+        for c in cases {
             assert_eq!(
-                owed(&l, *total, *prior, all_powers, *now, HL),
-                *want,
-                "total {total}, prior {prior:?}, at {now}"
+                owed(&l, &c.strikes, c.answers.iter().copied(), all_powers, c.now, HL),
+                c.want,
+                "{}",
+                c.what
             );
         }
     }
@@ -280,25 +361,69 @@ mod tests {
                 4 => Some("ban"),
                 _ => None,
             };
-            for total in [1u32, 4, 8, 12, 50, 1000, u32::MAX / 2] {
-                let prior = name.map(|n| answer(n, 1, 0));
-                if let Some(got) = owed(&l, total, prior, all_powers, 0, HL) {
+            for worth in [1u32, 4, 8, 12, 50, 1000, u32::MAX / 4] {
+                // A standing answer, then a fresh offense after it.
+                let strikes = [at(worth, 0), at(worth, 20)];
+                let answers: Vec<(&str, u64)> = name.map(|n| (n, 10u64)).into_iter().collect();
+                if let Some(got) = owed(&l, &strikes, answers.iter().copied(), all_powers, 30, HL) {
                     assert!(
                         got.rank() <= prior_rank.max(1) + 1,
-                        "prior {name:?} at total {total} answered {got:?}, which skips a rung"
+                        "prior {name:?} at worth {worth} answered {got:?}, which skips a rung"
                     );
                 }
             }
         }
     }
 
-    /// An absurd total must not panic or wrap.
+    /// Absurd inputs must not panic or wrap.
     #[test]
-    fn extreme_totals_are_answered_without_arithmetic_trouble() {
+    fn extreme_inputs_are_answered_without_arithmetic_trouble() {
         let l = ladder();
-        for total in [0, 1, u32::MAX - 1, u32::MAX] {
-            let _ = owed(&l, total, None, all_powers, u64::MAX, HL);
-            let _ = owed(&l, total, Some(answer("warn", u32::MAX, 0)), all_powers, u64::MAX, 1);
+        for worth in [0, 1, u32::MAX - 1, u32::MAX] {
+            for now in [0u64, 1, u64::MAX] {
+                let _ = owed(&l, &[at(worth, 0)], [], all_powers, now, HL);
+                let _ = owed(&l, &[at(worth, 0)], [("warn", 0u64)], all_powers, now, 1);
+                let _ = owed(&l, &[at(worth, u64::MAX)], [("ban", u64::MAX)], all_powers, now, u64::MAX);
+            }
+        }
+        // Many strikes, so the summed total saturates rather than wraps.
+        let many: Vec<Strike> = (0..64).map(|_| at(u32::MAX, 0)).collect();
+        let _ = owed(&l, &many, [("warn", 0u64)], all_powers, 1, HL);
+    }
+
+    /// The exact shape that used to be swallowed: an answer recorded over many
+    /// small strikes ages more kindly as a SUM than its parts do individually,
+    /// so comparing magnitudes silently ate a later, heavier offense — forever,
+    /// because the two stayed equal at every half-life boundary.
+    #[test]
+    fn a_light_history_does_not_swallow_a_later_grave_offense() {
+        let l = ladder();
+        let hl = HL * HOUR;
+        for notes in [4u32, 8, 24, 100] {
+            let mut strikes: Vec<Strike> = (0..notes).map(|_| at(1, 0)).collect();
+            strikes.push(at(12, hl));
+            assert!(
+                owed(&l, &strikes, [("warn", 1u64)], all_powers, hl, HL).is_some(),
+                "{notes} notes swallowed a grave offense a week later"
+            );
+        }
+    }
+
+    /// And the property behind it: whatever the record, a strike that lands
+    /// after the last answer is always answered by something.
+    #[test]
+    fn an_offense_after_the_last_answer_is_always_answered() {
+        let l = ladder();
+        let hl = HL * HOUR;
+        for prior in ["warn", "delete_and_warn", "kick"] {
+            for history in [1usize, 3, 20] {
+                let mut strikes: Vec<Strike> = (0..history).map(|_| at(1, 0)).collect();
+                strikes.push(at(12, hl * 2));
+                assert!(
+                    owed(&l, &strikes, [(prior, 1u64)], all_powers, hl * 2, HL).is_some(),
+                    "prior {prior} over {history} strikes swallowed a later grave offense"
+                );
+            }
         }
     }
 
@@ -323,3 +448,4 @@ mod tests {
         assert_eq!(decay(12, 1_000_000, 0), 12, "nothing decays, and nothing panics");
     }
 }
+
