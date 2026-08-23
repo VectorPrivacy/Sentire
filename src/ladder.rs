@@ -41,6 +41,36 @@ pub fn decide(ladder: &Ladder, total: u32) -> Option<Response> {
     ladder.steps.iter().rev().find(|s| total >= s.at).map(|s| s.response)
 }
 
+/// What this member is owed right now, given everything on file.
+///
+/// The ONE answer. The enforcer and `/why` both read it, so an operator can
+/// never be told about a ladder different from the one that will run.
+pub fn owed(
+    l: &Ladder,
+    total: u32,
+    prior: Option<(&str, u32, u64)>,
+    can_deliver: impl Fn(Response) -> bool,
+    now_ms: u64,
+    half_life_hours: u64,
+) -> Option<Response> {
+    // The ladder climbs per OFFENSE, not per poll. A verdict re-reports every
+    // standing conviction, so without this one message walks the whole ladder
+    // on the clock: warn, delete, kick, ban, four polls apart.
+    //
+    // The answered total is aged the same way the strikes are, so the gate
+    // opens again as the evidence behind it is forgiven rather than sealing the
+    // member off for the life of the row.
+    let answered = prior.map(|(_, at_total, at_ms)| decay(at_total, now_ms.saturating_sub(at_ms), half_life_hours));
+    if total <= answered.unwrap_or(0) {
+        return None;
+    }
+    // An answer whose evidence is fully forgiven stops flooring the ladder.
+    // Otherwise a kick from March leaves a light offense in October answerable
+    // only by a ban — the strikes forgive and the floor never would.
+    let floor = prior.filter(|_| answered.unwrap_or(0) > 0).map(|(name, _, _)| name);
+    next_step(l, total, floor, can_deliver)
+}
+
 /// The NEXT rung to answer with, given what this member has already received.
 ///
 /// A ladder that jumps straight to the rung a total has reached is not a

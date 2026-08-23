@@ -17,6 +17,44 @@ use crate::ladder;
 /// Read-only by default. `pardon` is the one command that changes anything, and
 /// it answers only to someone the community already trusts to moderate — a bot
 /// with no undo is not deployable, and an undo anyone can call is not either.
+/// What `/why` answers.
+///
+/// Reads `ladder::owed`, the same function the enforcer does, so an operator is
+/// never told about a ladder different from the one that will run: the naive
+/// answer ("the next step above your total") ignored what they had already
+/// received and every rung this community grants no permission for.
+pub(crate) fn why_line(
+    who: &str,
+    strikes: &[ladder::Strike],
+    prior: Option<&crate::store::Answer>,
+    policy: &CommunityPolicy,
+    powers: crate::policy::Powers,
+    now: u64,
+) -> String {
+    if strikes.is_empty() {
+        return format!("{} has no strikes with me.", short(who));
+    }
+    let hl = policy.ladder.decay_half_life_hours;
+    let total = ladder::total(strikes, now, hl);
+    let next = ladder::owed(
+        &policy.ladder,
+        total,
+        prior.map(|p| (p.response.as_str(), p.at_total, p.at_ms)),
+        |r| powers.can_deliver(r),
+        now,
+        hl,
+    );
+    let owed = match next {
+        Some(r) => format!("next: {}", r.name()),
+        None => "nothing owed".into(),
+    };
+    format!(
+        "{} carries {} strike record(s), worth {total} after decay — {owed}.",
+        short(who),
+        strikes.len()
+    )
+}
+
 pub(crate) fn operator_surface(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<Store>) {
     bot.command("status", "What Sentinel is watching, and how much of it it can see").run({
         let cfg = cfg.clone();
@@ -71,24 +109,20 @@ pub(crate) fn operator_surface(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<S
                         let _ = ctx.reply("I am not watching this community.").await;
                         return;
                     };
-                    // This community's ladder, not the defaults.
-                    let ladder = cfg.for_community(community.id()).ladder;
-                    let half_life = ladder.decay_half_life_hours;
-                    let strikes = store.strikes(community.id(), &who).unwrap_or_default();
-                    if strikes.is_empty() {
-                        let _ = ctx.reply(format!("{} has no strikes with me.", short(&who))).await;
-                        return;
-                    }
-                    let total = ladder::total(&strikes, now_ms(), half_life);
-                    let next = ladder.steps.iter().find(|s| s.at > total).map(|s| format!(", next step at {}", s.at));
-                    let _ = ctx
-                        .reply(format!(
-                            "{} carries {} strike record(s), worth {total} after decay{}.",
-                            short(&who),
-                            strikes.len(),
-                            next.unwrap_or_default()
-                        ))
-                        .await;
+                    // This community's ladder and powers, not the defaults.
+                    let policy = cfg.for_community(community.id());
+                    let strikes = match store.strikes(community.id(), &who) {
+                        Ok(s) => s,
+                        // A read that failed is not a clean record, and saying
+                        // so is the difference between the two.
+                        Err(e) => {
+                            let _ = ctx.reply(format!("I could not read that record: {e}")).await;
+                            return;
+                        }
+                    };
+                    let prior = store.strongest_response(community.id(), &who).ok().flatten();
+                    let powers = crate::powers_of(&community).await;
+                    let _ = ctx.reply(why_line(&who, &strikes, prior.as_ref(), &policy, powers, now_ms())).await;
                 }
             }
         });
@@ -112,18 +146,123 @@ pub(crate) fn operator_surface(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<S
                         let _ = ctx.reply("Only a moderator can pardon.").await;
                         return;
                     }
+                    let by = ctx.msg.author().unwrap_or_default();
                     match store.pardon(community.id(), &who) {
                         Ok(0) => {
                             let _ = ctx.reply(format!("{} had nothing to forgive.", short(&who))).await;
                         }
                         Ok(n) => {
+                            // The one command that changes anything, and it was
+                            // the only one that left no trace: every rehearsed
+                            // non-action prints a line, an erased record did not.
+                            println!(
+                                "[{}] PARDON {} by {} — {n} strike record(s) cleared",
+                                short(community.id()),
+                                short(&who),
+                                short(&by)
+                            );
                             let _ = ctx.reply(format!("Cleared {n} strike record(s) for {}.", short(&who))).await;
                         }
                         Err(e) => {
+                            eprintln!("[{}] pardon {} failed: {e}", short(community.id()), short(&who));
                             let _ = ctx.reply(format!("Could not pardon: {e}")).await;
                         }
                     }
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, Response};
+    use crate::policy::Powers;
+    use crate::store::Answer;
+
+    const NOW: u64 = 10_000_000;
+
+    fn policy() -> CommunityPolicy {
+        Config::default().for_community("")
+    }
+
+    fn strikes(worths: &[u32]) -> Vec<ladder::Strike> {
+        worths.iter().map(|w| ladder::Strike { worth: *w, at_ms: NOW }).collect()
+    }
+
+    fn all() -> Powers {
+        Powers { hide: true, kick: true, ban: true }
+    }
+
+    #[test]
+    fn a_clean_member_is_said_to_be_clean() {
+        let line = why_line("npub1abcdefghijk", &[], None, &policy(), all(), NOW);
+        assert!(line.contains("no strikes"), "{line}");
+    }
+
+    /// The naive answer read the ladder's steps directly and ignored both what
+    /// the member had already received and what this community permits — so it
+    /// described a ladder that was never going to run.
+    #[test]
+    fn why_names_the_rung_that_will_actually_be_delivered() {
+        let p = policy();
+        let line = why_line("npub1abcdefghijk", &strikes(&[12]), None, &p, all(), NOW);
+        assert!(line.contains("next: warn"), "twelve points still starts at a warning: {line}");
+    }
+
+    #[test]
+    fn why_respects_what_the_community_permits() {
+        let p = policy();
+        let no_hiding = Powers { hide: false, kick: true, ban: true };
+        let prior = Answer { response: "warn".into(), at_total: 12, at_ms: NOW };
+        let line = why_line("npub1abcdefghijk", &strikes(&[12, 12]), Some(&prior), &p, no_hiding, NOW);
+        assert!(
+            line.contains("next: kick"),
+            "delete_and_warn cannot be delivered here, so it is not what comes next: {line}"
+        );
+    }
+
+    /// An offense already answered owes nothing, and saying "next step at 4"
+    /// while nothing is owed is the answer that sent operators looking.
+    #[test]
+    fn why_says_nothing_is_owed_when_nothing_is() {
+        let p = policy();
+        let prior = Answer { response: "warn".into(), at_total: 12, at_ms: NOW };
+        let line = why_line("npub1abcdefghijk", &strikes(&[12]), Some(&prior), &p, all(), NOW);
+        assert!(line.contains("nothing owed"), "{line}");
+    }
+
+    #[test]
+    fn why_reports_the_decayed_total_not_the_raw_one() {
+        let p = policy();
+        let hl = p.ladder.decay_half_life_hours * 3_600_000;
+        let old = vec![ladder::Strike { worth: 12, at_ms: NOW }];
+        let line = why_line("npub1abcdefghijk", &old, None, &p, all(), NOW + hl);
+        assert!(line.contains("worth 6 "), "one half-life halves it: {line}");
+    }
+
+    /// Arming is resolved where the question was asked.
+    #[test]
+    fn the_armed_line_reads_this_communitys_block() {
+        let cfg: Config = toml::from_str(
+            "[arm]\nwarn = false\n[community.\"aa\".arm]\nwarn = true\ndelete = true",
+        )
+        .unwrap();
+        assert_eq!(CommunityPolicy::armed_line(&cfg.for_community("")), "nothing (dry run)");
+        assert_eq!(CommunityPolicy::armed_line(&cfg.for_community("aa")), "warn, delete");
+    }
+
+    #[test]
+    fn every_response_name_appears_in_the_armed_line() {
+        let cfg: Config = toml::from_str(
+            "[arm]\nwarn = true\ndelete = true\nkick = true\nban = true\nraid = true",
+        )
+        .unwrap();
+        let line = CommunityPolicy::armed_line(&cfg.for_community(""));
+        for r in [Response::Warn, Response::DeleteAndWarn, Response::Kick, Response::Ban] {
+            let word = r.name().split('_').next().unwrap();
+            assert!(line.contains(word), "{} must appear in {line}", r.name());
+        }
+        assert!(line.contains("raid"));
+    }
 }

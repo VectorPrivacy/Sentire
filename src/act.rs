@@ -291,22 +291,14 @@ pub(crate) fn select_rung(
     let hl = policy.ladder.decay_half_life_hours;
     let total = ladder::total(strikes, now, hl);
     let prior = store.strongest_response(community, npub)?;
-    // The ladder climbs per OFFENSE, not per poll. A verdict re-reports every
-    // standing conviction forever, so without this one message walks the whole
-    // ladder on the clock: warn, delete, kick, ban, four polls apart.
-    //
-    // The answered total is aged the same way the strikes are, so the gate
-    // opens again as the evidence behind it is forgiven rather than sealing
-    // the member off for the life of the row.
-    let answered = prior.as_ref().map(|p| ladder::decay(p.at_total, now.saturating_sub(p.at_ms), hl)).unwrap_or(0);
-    if total <= answered {
-        return Ok(None);
-    }
-    // An answer whose evidence is fully forgiven stops flooring the ladder.
-    // Otherwise a kick from March leaves a light offense in October answerable
-    // only by a ban — the strikes forgive and the floor never would.
-    let floor = prior.as_ref().filter(|_| answered > 0).map(|p| p.response.as_str());
-    Ok(ladder::next_step(&policy.ladder, total, floor, can_deliver))
+    Ok(ladder::owed(
+        &policy.ladder,
+        total,
+        prior.as_ref().map(|p| (p.response.as_str(), p.at_total, p.at_ms)),
+        can_deliver,
+        now,
+        hl,
+    ))
 }
 
 /// A member cited across many messages is still one sentence. Matched to the
