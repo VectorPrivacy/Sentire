@@ -907,5 +907,117 @@ pub(crate) mod tests {
             assert_eq!(p.answer(v, w.now_ms), None);
         }
     }
+
+    /// A tiny deterministic generator. `Math::random` has no place in a test
+    /// that has to fail the same way twice.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            // xorshift64*, chosen for being four lines and reproducible.
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn upto(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// Thousands of arbitrary histories, checked against the invariants that
+    /// must hold whatever happened: never more than one rung per answer, never
+    /// above what the total has earned, never anything the community cannot
+    /// deliver, and never twice for the same evidence.
+    #[test]
+    fn the_ladder_holds_its_invariants_over_arbitrary_histories() {
+        let cfg = armed();
+        let p = cfg.for_community("");
+        let hl = p.ladder.decay_half_life_hours;
+        let hour = 3_600_000u64;
+
+        for seed in 1..=400u64 {
+            let mut rng = Rng(seed);
+            let store = crate::store::tests::mem();
+            let powers = crate::policy::Powers {
+                hide: rng.next() % 2 == 0,
+                kick: rng.next() % 2 == 0,
+                ban: rng.next() % 2 == 0,
+            };
+            let mut strikes: Vec<crate::ladder::Strike> = Vec::new();
+            let mut now = 1_000_000u64;
+            let mut offenses = 0usize;
+            let mut delivered = 0usize;
+
+            for _ in 0..40 {
+                now += rng.upto(hl * hour * 3) + 1;
+                // Sometimes a new offense, sometimes just another poll over the
+                // same evidence — which is what every poll actually is.
+                if rng.upto(3) > 0 {
+                    let worth = [1u32, 2, 4, 12][rng.upto(4) as usize];
+                    strikes.push(crate::ladder::Strike { worth, at_ms: now });
+                    offenses += 1;
+                }
+                let rung = crate::act::select_rung(&p, |r| powers.can_deliver(r), &store, "c", "npub1a", &strikes, now)
+                    .unwrap();
+                let Some(rung) = rung else { continue };
+
+                assert!(powers.can_deliver(rung), "seed {seed}: proposed {rung:?} without the permission for it");
+
+                let total = crate::ladder::total(&strikes, now, hl);
+                let reached = crate::ladder::decide(&p.ladder, total).expect("a rung implies a step was reached");
+                assert!(
+                    rung.rank() <= reached.rank(),
+                    "seed {seed}: answered {rung:?} for a total of {total}, which has only reached {reached:?}"
+                );
+
+                delivered += 1;
+                assert!(
+                    delivered <= offenses,
+                    "seed {seed}: {delivered} answers for {offenses} offenses — the ladder is climbing on the clock"
+                );
+
+                store.log_action("c", "npub1a", rung.name(), now, total, "").unwrap();
+            }
+        }
+    }
+
+    /// The same, from the other side: nothing may ever answer for a member the
+    /// community has vouched for, whatever the ledger says.
+    #[test]
+    fn a_shielded_member_is_never_answered_however_the_history_runs() {
+        let cfg = armed();
+        let p = cfg.for_community("");
+        for seed in 1..=200u64 {
+            let mut rng = Rng(seed);
+            let shield = ["protected", "trusted", "unknown", "absent"][rng.upto(4) as usize];
+            let facts = crate::adjudicate::Facts {
+                shield,
+                acted_this_pass: rng.upto(50) as usize,
+                acted_this_hour: rng.upto(200) as usize,
+                subjects_this_hour: rng.upto(50) as usize,
+                roster: rng.upto(500) as usize,
+                is_me: false,
+            };
+            let powers = crate::policy::Powers { hide: true, kick: true, ban: true };
+            for rung in [
+                crate::config::Response::Warn,
+                crate::config::Response::DeleteAndWarn,
+                crate::config::Response::Kick,
+                crate::config::Response::Ban,
+            ] {
+                assert!(
+                    matches!(
+                        crate::adjudicate::adjudicate(&p, powers, &facts, rung),
+                        crate::adjudicate::Sentence::Spare { .. }
+                    ),
+                    "seed {seed}: {shield} was not spared for {rung:?}"
+                );
+            }
+        }
+    }
 }
 
