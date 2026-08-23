@@ -22,6 +22,12 @@ use crate::policy::CommunityPolicy;
 ///
 /// `raid_detected` is community-wide: it means a cohort exists SOMEWHERE. A
 /// member's own cohort finding is the only thing that puts them in it.
+///
+/// This is the id the SHIPPED defaults use. A community that forks the default
+/// policy and renames its cohort rule still produces cohort evidence — so
+/// `raid_detected` stays true while nobody matches here and containment goes
+/// quiet on a real raid. Failing to Quiet is the safe direction, and a verdict
+/// exposes no cohort flag to key on instead; it is a limit, not a choice.
 const COHORT_RULE: &str = "cohort";
 
 /// Is this member part of the wave, rather than merely a high score?

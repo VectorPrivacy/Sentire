@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS classifications (
     PRIMARY KEY (content_hash, model)
 );
 CREATE INDEX IF NOT EXISTS idx_strikes_prune ON strikes(at_ms);
+CREATE INDEX IF NOT EXISTS idx_classifications_prune ON classifications(at_ms);
 CREATE INDEX IF NOT EXISTS idx_actions_subject ON actions(community, subject, at_ms);
 CREATE INDEX IF NOT EXISTS idx_actions_hour ON actions(community, at_ms);";
 
@@ -402,7 +403,13 @@ impl Store {
         let b = conn
             .execute("DELETE FROM actions WHERE at_ms < ?1", [before_ms as i64])
             .map_err(|e| e.to_string())?;
-        Ok(a + b)
+        // Classifications too. It is a cache, not a record: nothing reads its
+        // timestamp, and every threshold edit forks the table again, so
+        // unpruned it grows for the life of the install.
+        let c = conn
+            .execute("DELETE FROM classifications WHERE at_ms < ?1", [before_ms as i64])
+            .map_err(|e| e.to_string())?;
+        Ok(a + b + c)
     }
 }
 
@@ -752,6 +759,19 @@ pub mod tests {
         assert_eq!(s.cached_verdict("hash", "llava").as_deref(), Some("{}"), "classifications are not");
         assert!(!s.note_armed("c", "warn").unwrap(), "and neither is what is armed");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The cache is not a record. Nothing reads its timestamp and every
+    /// threshold edit forks it, so unpruned it grows for the life of the
+    /// install.
+    #[test]
+    fn pruning_reaches_the_classification_cache_too() {
+        let s = mem();
+        s.cache_verdict("old", "llava?gore@0.9", "{}", 1_000).unwrap();
+        s.cache_verdict("new", "llava?gore@0.9", "{}", 9_000).unwrap();
+        assert_eq!(s.prune(5_000).unwrap(), 1);
+        assert!(s.cached_verdict("old", "llava?gore@0.9").is_none());
+        assert!(s.cached_verdict("new", "llava?gore@0.9").is_some());
     }
 
     #[test]

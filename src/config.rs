@@ -76,7 +76,9 @@ pub fn validate_policy(p: &crate::policy::CommunityPolicy, whose: &str) -> Resul
             p.raid.min_confidence
         ));
     }
-    if p.raid.min_confidence < 50 {
+    // Report mode touches nobody, so "show me everyone" is a real thing to ask
+    // for; the floor is about what may be ACTED on unattended.
+    if p.raid.min_confidence < 50 && p.raid.response != RaidResponse::Report {
         return at(format!(
             "raid.min_confidence = {} is below the engine's own actionable floor of 50. Containment is the one \
              path that acts on inference, and a bar this low contains members over evidence the engine itself \
@@ -786,6 +788,17 @@ mod unknown_key_tests {
 
     /// Values that parse, validate today, and then make the thing they
     /// configure structurally unable to do its job.
+    /// Report mode touches nobody, so "show me everyone" is a real thing to
+    /// ask for — the confidence floor is about what may be ACTED on.
+    #[test]
+    fn a_low_bar_is_allowed_when_nobody_is_touched() {
+        let reporting: Config = toml::from_str("[raid]\nmin_confidence = 0\nresponse = \"report\"").unwrap();
+        Config::validate_for_test(&reporting).expect("report mode may look at everyone");
+
+        let kicking: Config = toml::from_str("[raid]\nmin_confidence = 0\nresponse = \"kick\"").unwrap();
+        assert!(Config::validate_for_test(&kicking).is_err(), "but removal answers to the floor");
+    }
+
     /// The bottom-up refusal used to reject this, on the premise that an
     /// unarmed rung is never answered. A rehearsal records, so it is — the
     /// ladder climbs past the rehearsed warning and delivers the kick.
