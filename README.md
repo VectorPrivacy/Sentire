@@ -93,9 +93,13 @@ a member escalates once, not twice.
    past it. Arming `kick` while `warn` is off is a real configuration: the warning is
    rehearsed and the kick is delivered.
 
-Only *proven* convictions earn strikes from the engine, on either clock. Windowed inference is
-reported to the mod channel for a person to answer, never sentenced — except raid containment,
-which an operator arms explicitly with `[arm] raid`.
+Two things have to be true before a conviction earns a strike, and they answer different
+questions. Its **basis** must be deterministic: windowed inference is reported to the mod
+channel for a person to answer, never sentenced — except raid containment, which an operator
+arms explicitly with `[arm] raid`. And it must **cite** something. The engine's raid
+aggravators describe a person rather than an act — an account under a day old, one that has
+posted twice — and cite nothing; a cohort is what arms them. Without that second condition,
+being new was an offense for everyone caught in a raid detection, with the raid switch off.
 
 ## One decision, four lanes
 
@@ -206,6 +210,10 @@ Engine inference does not sentence: a windowed heuristic is reported to the mod 
 person to answer. Sentinel's own lanes are a different matter. When the model says an image or
 video breaks a rule, that is the answer — it earns a strike and climbs the ladder like any
 other offense.
+
+The two are told apart by a marker Sentinel stamps on its own findings, never by the absence
+of the engine's. A field that goes missing upstream must not be able to promote inference into
+something a ladder rung acts on.
 
 ## Coverage is not a detail
 
