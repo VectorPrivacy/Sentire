@@ -45,43 +45,52 @@ pub fn decide(ladder: &Ladder, total: u32) -> Option<Response> {
 ///
 /// The ONE answer. The enforcer and `/why` both read it, so an operator can
 /// never be told about a ladder different from the one that will run.
-pub fn owed(
+pub fn owed<'a>(
     l: &Ladder,
     total: u32,
-    prior: Option<(&str, u32, u64)>,
+    answers: impl IntoIterator<Item = (&'a str, u32, u64)>,
     can_deliver: impl Fn(Response) -> bool,
     now_ms: u64,
     half_life_hours: u64,
 ) -> Option<Response> {
+    // Each answer aged the same way the strikes it answered are, so an answer
+    // is forgiven on the same schedule as its evidence rather than sealing the
+    // member off for the life of the row.
+    let mut answered = 0u32;
+    let mut floor: Option<(&str, u8)> = None;
+    for (name, at_total, at_ms) in answers {
+        let standing = decay(at_total, now_ms.saturating_sub(at_ms), half_life_hours);
+        answered = answered.max(standing);
+        // An answer whose evidence is fully forgiven stops flooring the ladder:
+        // a kick from March must not leave a light offense in October
+        // answerable only by a ban.
+        if standing > 0 {
+            let rank = Response::rank_of(name);
+            if floor.is_none_or(|(_, best)| rank > best) {
+                floor = Some((name, rank));
+            }
+        }
+    }
     // The ladder climbs per OFFENSE, not per poll. A verdict re-reports every
     // standing conviction, so without this one message walks the whole ladder
-    // on the clock: warn, delete, kick, ban, four polls apart.
+    // on the clock: warn, delete, kick, ban, one poll apart.
     //
-    // The answered total is aged the same way the strikes are, so the gate
-    // opens again as the evidence behind it is forgiven rather than sealing the
-    // member off for the life of the row.
-    let answered = prior.map(|(_, at_total, at_ms)| decay(at_total, now_ms.saturating_sub(at_ms), half_life_hours));
-    if total <= answered.unwrap_or(0) {
+    // The HIGHEST still-standing answer, over every row. Reading only the
+    // strongest meant a later, lighter answer never closed the gate it opened,
+    // and the same rung was re-delivered every poll until its strike decayed.
+    if total <= answered {
         return None;
     }
-    // An answer whose evidence is fully forgiven stops flooring the ladder.
-    // Otherwise a kick from March leaves a light offense in October answerable
-    // only by a ban — the strikes forgive and the floor never would.
-    let floor = prior.filter(|_| answered.unwrap_or(0) > 0).map(|(name, _, _)| name);
-    next_step(l, total, floor, can_deliver)
+    next_step(l, total, floor.map(|(name, _)| name), can_deliver)
 }
 
 /// The NEXT rung to answer with, given what this member has already received.
 ///
 /// A ladder that jumps straight to the rung a total has reached is not a
-/// ladder: someone who accrued twelve points before Sentinel was armed would be
-/// banned without ever having been warned, and the same is true of anyone whose
-/// first observed offense is a grave one. Climbing one rung per answer means
-/// every step is actually delivered, and a total that keeps rising keeps
-/// climbing.
-/// One ledger, so one prior: the rung above whatever they last received, no
-/// higher than their total has earned, skipping anything this community grants
-/// no permission to deliver.
+/// ladder: anyone whose first observed offense is a grave one would be banned
+/// without ever having been warned. So this is the rung above whatever they
+/// last received, no higher than their total has earned, skipping anything this
+/// community grants no permission to deliver.
 pub fn next_step(
     ladder: &Ladder,
     total: u32,

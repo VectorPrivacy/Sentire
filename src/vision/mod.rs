@@ -116,4 +116,79 @@ mod tests {
             Label { name: "spam_graphic".into(), score: 0.0 },
         ]));
     }
+
+    fn cfg(pairs: &[(&str, f32, Gravity)]) -> Vec<crate::config::VisionLabel> {
+        pairs
+            .iter()
+            .map(|(n, t, g)| crate::config::VisionLabel { name: (*n).into(), threshold: *t, gravity: *g })
+            .collect()
+    }
+
+    fn label(name: &str, score: f32) -> Label {
+        Label { name: name.into(), score }
+    }
+
+    /// A model can say anything. Nothing it invents may become a conviction:
+    /// the operator's list is the only vocabulary that counts.
+    #[test]
+    fn a_label_the_operator_never_named_is_ignored() {
+        let c = cfg(&[("gore", 0.9, Gravity::Grave)]);
+        let hits = over_threshold(&[label("something_the_model_made_up", 1.0)], &c);
+        assert!(hits.is_empty(), "the model does not get to name the offense");
+    }
+
+    #[test]
+    fn the_threshold_is_a_bound_and_the_bound_itself_counts() {
+        let c = cfg(&[("gore", 0.9, Gravity::Grave)]);
+        assert!(over_threshold(&[label("gore", 0.89)], &c).is_empty(), "under the bar is under");
+        assert_eq!(over_threshold(&[label("gore", 0.9)], &c).len(), 1, "the bar itself is met");
+        assert_eq!(over_threshold(&[label("gore", 1.0)], &c).len(), 1);
+    }
+
+    /// The gravest hit speaks for the blob, and ties break on the score — so
+    /// the answer does not depend on the order a model happened to list them.
+    #[test]
+    fn the_worst_hit_comes_first_whatever_order_the_model_used() {
+        let c = cfg(&[("mild", 0.1, Gravity::Note), ("awful", 0.1, Gravity::Grave)]);
+        let forwards = over_threshold(&[label("mild", 0.99), label("awful", 0.2)], &c);
+        let backwards = over_threshold(&[label("awful", 0.2), label("mild", 0.99)], &c);
+        assert_eq!(forwards[0].1, Gravity::Grave, "gravity outranks confidence");
+        assert_eq!(forwards, backwards, "and order in the answer changes nothing");
+    }
+
+    #[test]
+    fn equal_gravity_breaks_on_the_higher_score() {
+        let c = cfg(&[("a", 0.1, Gravity::Serious), ("b", 0.1, Gravity::Serious)]);
+        let hits = over_threshold(&[label("a", 0.3), label("b", 0.8)], &c);
+        assert_eq!(hits[0].0.name, "b");
+    }
+
+    /// A model answering nonsense must not become a conviction by arithmetic.
+    #[test]
+    fn absurd_scores_do_not_produce_absurd_answers() {
+        let c = cfg(&[("gore", 0.9, Gravity::Grave)]);
+        for score in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1.0, 5.0] {
+            let hits = over_threshold(&[label("gore", score)], &c);
+            // Whatever it decides, it must not panic and must stay sortable.
+            assert!(hits.len() <= 1, "score {score} produced {hits:?}");
+        }
+        assert!(over_threshold(&[label("gore", f32::NAN)], &c).is_empty(), "NaN is not over a threshold");
+    }
+
+    #[test]
+    fn nothing_configured_flags_nothing() {
+        assert!(over_threshold(&[label("gore", 1.0)], &[]).is_empty());
+        assert!(over_threshold(&[], &cfg(&[("gore", 0.9, Gravity::Grave)])).is_empty());
+    }
+
+    /// The distinction the whole lane rests on, asserted as a type property.
+    #[test]
+    fn unknown_is_never_clean() {
+        assert_ne!(Verdict::Unknown("timeout".into()), Verdict::Clean);
+        assert_ne!(Verdict::Flagged(vec![]), Verdict::Clean);
+        // And it round-trips, because it is cached and read back.
+        let v = Verdict::Flagged(vec![label("gore", 0.95)]);
+        let json = serde_json::to_string(&v).unwrap();
+        assert_eq!(serde_json::from_str::<Verdict>(&json).unwrap(), v);
+    }
 }

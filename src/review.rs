@@ -323,7 +323,6 @@ pub(crate) async fn contain(
         }
     }
 
-    let verb = response.name();
     let line = format!(
         "RAID {} — {} account(s), {verb}",
         match (armed, response) {

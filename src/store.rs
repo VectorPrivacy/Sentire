@@ -70,9 +70,13 @@ impl Store {
     pub fn open(path: &str) -> Result<Store, String> {
         let conn = Connection::open(path).map_err(|e| format!("{path}: {e}"))?;
         conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
+        // Zero, not the current version. A read that FAILED — a missing row, a
+        // bad value, a locked database — is not evidence that the schema is
+        // current: taking it as such skipped the rebuild AND the newer-build
+        // guard, and stamped the file as current on the way out.
         let stored: i64 = conn
             .query_row("SELECT value FROM meta WHERE key = 'schema'", [], |r| r.get(0))
-            .unwrap_or(SCHEMA_VERSION);
+            .unwrap_or(0);
         if stored > SCHEMA_VERSION {
             return Err(format!("{path} was written by a newer Sentinel (schema {stored} > {SCHEMA_VERSION})"));
         }
@@ -163,16 +167,20 @@ impl Store {
             .map_err(|e| e.to_string())
     }
 
-    /// The strongest answer this member has already had, with the total it
-    /// answered and when.
+    /// Every answer this member has already had here.
     ///
-    /// Strongest, not latest: ordering by time let a later, lesser response
-    /// reopen them to everything above it. Ranking happens in Rust so the
-    /// severity order lives in exactly one place.
-    pub fn strongest_response(&self, community: &str, subject: &str) -> Result<Option<Answer>, String> {
+    /// All of them, not the strongest: the ladder needs two different facts —
+    /// how much has already been answered for, and the strongest rung still
+    /// standing — and one row cannot supply both. Reading only the strongest
+    /// meant a later, lighter answer never closed the gate it opened, so the
+    /// same rung was re-delivered every poll for as long as the strike lived.
+    pub fn answers(&self, community: &str, subject: &str) -> Result<Vec<Answer>, String> {
         let conn = self.lock();
         let mut stmt = conn
-            .prepare("SELECT response, at_total, at_ms FROM actions WHERE community = ?1 AND subject = ?2")
+            .prepare(
+                "SELECT response, at_total, at_ms FROM actions WHERE community = ?1 AND subject = ?2 \
+                 ORDER BY at_ms, rowid",
+            )
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map(rusqlite::params![community, subject], |r| {
@@ -183,14 +191,7 @@ impl Store {
                 })
             })
             .map_err(|e| e.to_string())?;
-        let mut best: Option<Answer> = None;
-        for a in rows.flatten() {
-            let rank = crate::config::Response::rank_of(&a.response);
-            if rank > best.as_ref().map(|b| crate::config::Response::rank_of(&b.response)).unwrap_or(0) {
-                best = Some(a);
-            }
-        }
-        Ok(best)
+        rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
     }
 
     /// Distinct people actioned here in the last hour, excluding one.
@@ -434,14 +435,20 @@ pub mod tests {
         assert!(s.strikes("c2", "npub1a").unwrap().is_empty(), "a strike elsewhere is not a strike here");
     }
 
-    /// Ordering by time let a later, lesser response reopen a member to
-    /// everything above it.
+    /// Every answer is kept, oldest first — the ladder needs the whole record,
+    /// not a summary of it, because "how much has been answered for" and "what
+    /// is the strongest rung still standing" are different questions.
     #[test]
-    fn the_strongest_response_wins_not_the_latest() {
+    fn every_answer_is_kept_in_the_order_it_was_given() {
         let s = mem();
-        s.log_action("c", "npub1a", "kick", 1000, 0, "").unwrap();
-        s.log_action("c", "npub1a", "warn", 2000, 0, "").unwrap();
-        assert_eq!(s.strongest_response("c", "npub1a").unwrap().map(|a| a.response).as_deref(), Some("kick"));
+        s.log_action("c", "npub1a", "kick", 1000, 8, "").unwrap();
+        s.log_action("c", "npub1a", "warn", 2000, 1, "").unwrap();
+        let got = s.answers("c", "npub1a").unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].response, "kick");
+        assert_eq!(got[0].at_total, 8);
+        assert_eq!(got[1].response, "warn");
+        assert_eq!(got[1].at_ms, 2000);
     }
 
     /// Raid rows share the table and must never read as a ladder response: an
@@ -450,7 +457,7 @@ pub mod tests {
     fn a_raid_row_is_not_a_ladder_response() {
         let s = mem();
         s.log_action("c", "npub1a", "raid:kick", 0, 0, "").unwrap();
-        assert_eq!(s.strongest_response("c", "npub1a").unwrap(), None);
+        assert!(s.answers("c", "npub1a").unwrap().iter().all(|a| crate::config::Response::rank_of(&a.response) == 0));
         assert_eq!(s.actions_last_hour("c", 1000).unwrap(), 0, "and answers to its own bound");
         assert_eq!(s.contained_last_hour("c", 1000).unwrap(), 1, "which is this one");
     }
@@ -479,7 +486,7 @@ pub mod tests {
         assert!(!s.claim("c", "kick:npub1a", 5_000, ttl).unwrap(), "and holds inside the wave");
         assert!(s.claim("c", "kick:npub1b", 0, ttl).unwrap(), "another member is their own claim");
         assert!(s.claim("c", "kick:npub1a", 20_000, ttl).unwrap(), "next week's raid is a new event");
-        assert_eq!(s.strongest_response("c", "kick:npub1a").unwrap(), None, "a claim is not a response");
+        assert!(s.answers("c", "kick:npub1a").unwrap().iter().all(|a| crate::config::Response::rank_of(&a.response) == 0), "a claim is not a response");
     }
 
     #[test]
@@ -492,8 +499,8 @@ pub mod tests {
         assert_eq!(s.pardon("c", "npub1a").unwrap(), 1);
         assert!(s.strikes("c", "npub1a").unwrap().is_empty());
         assert_eq!(
-            s.strongest_response("c", "npub1a").unwrap(),
-            None,
+            s.answers("c", "npub1a").unwrap().len(),
+            0,
             "a pardoned member who kept a kick on file could only ever be banned next"
         );
         assert!(s.claim("c", "kick:npub1a", 0, 10_000).unwrap(), "and is containable again");
@@ -556,7 +563,7 @@ pub mod tests {
 
         assert!(s.note_armed("c", "warn kick").unwrap(), "arming a class is a change");
         assert!(s.strikes("c", "npub1a").unwrap().is_empty());
-        assert_eq!(s.strongest_response("c", "npub1a").unwrap(), None);
+        assert!(s.answers("c", "npub1a").unwrap().iter().all(|a| crate::config::Response::rank_of(&a.response) == 0));
         assert_eq!(s.strikes("other", "npub1b").unwrap().len(), 1, "and only that community");
     }
 
@@ -621,7 +628,7 @@ pub mod tests {
         s.log_action("one", "npub1a", "kick", 0, 4, "").unwrap();
 
         assert!(s.strikes("two", "npub1a").unwrap().is_empty());
-        assert_eq!(s.strongest_response("two", "npub1a").unwrap(), None);
+        assert!(s.answers("two", "npub1a").unwrap().is_empty());
         assert!(s.subjects_with_strikes("two").unwrap().is_empty());
         assert!(s.evidence("two", "npub1a").unwrap().is_empty());
         assert_eq!(s.actions_last_hour("two", 1000).unwrap(), 0);

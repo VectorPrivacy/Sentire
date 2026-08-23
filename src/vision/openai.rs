@@ -195,4 +195,56 @@ mod tests {
         let labels = parse_labels(r#"{"gore": 4.0, "spam_graphic": -1.0}"#).unwrap();
         assert!(labels.iter().all(|l| (0.0..=1.0).contains(&l.score)));
     }
+
+    /// The model's text is the least controlled input in the bot. Every shape
+    /// below either parses to exactly what it says, or refuses — and refusing
+    /// routes to a person, which is the safe direction.
+    #[test]
+    fn the_parser_reads_what_models_actually_send() {
+        let cases: &[(&str, Option<&[(&str, f32)]>)] = &[
+            (r#"{"gore":0.9}"#, Some(&[("gore", 0.9)])),
+            ("Sure! Here you go:\n```json\n{\"gore\": 0.1}\n```", Some(&[("gore", 0.1)])),
+            ("I think:\n{\"gore\": 0.5, \"spam\": 0.25}\nHope that helps!", Some(&[("gore", 0.5), ("spam", 0.25)])),
+            ("{}", Some(&[])),
+            (r#"{"nested":{"a":1}}"#, None),
+            (r#"{"gore":"high"}"#, None),
+            (r#"{"gore":0.5,"spam":"lots"}"#, None),
+            ("no json at all", None),
+            ("{unclosed", None),
+            ("", None),
+            ("}{", None),
+        ];
+        for (text, want) in cases {
+            let got = parse_labels(text);
+            match want {
+                None => assert!(got.is_none(), "{text:?} must refuse, got {got:?}"),
+                Some(pairs) => {
+                    let got = got.unwrap_or_else(|| panic!("{text:?} must parse"));
+                    assert_eq!(got.len(), pairs.len(), "{text:?}");
+                    for (name, score) in *pairs {
+                        let l = got.iter().find(|l| l.name == *name).unwrap_or_else(|| panic!("{name} missing"));
+                        assert!((l.score - score).abs() < 1e-6, "{name}: {} vs {score}", l.score);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Multi-byte text before the JSON must not slice mid-character.
+    #[test]
+    fn a_multibyte_preamble_does_not_panic() {
+        for text in ["日本語です {\"gore\": 0.5}", "😀😀😀{\"gore\":0.5}", "日本語"] {
+            let _ = parse_labels(text);
+        }
+        assert!(parse_labels("日本語です {\"gore\": 0.5}").is_some());
+    }
+
+    /// Deeply nested junk must terminate rather than run away.
+    #[test]
+    fn pathological_input_terminates() {
+        let deep = "{".repeat(10_000);
+        assert!(parse_labels(&deep).is_none());
+        let balanced = format!("{}{}", "{".repeat(500), "}".repeat(500));
+        let _ = parse_labels(&balanced);
+    }
 }

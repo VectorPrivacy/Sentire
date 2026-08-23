@@ -26,7 +26,7 @@ use crate::ladder;
 pub(crate) fn why_line(
     who: &str,
     strikes: &[ladder::Strike],
-    prior: Option<&crate::store::Answer>,
+    answers: &[crate::store::Answer],
     policy: &CommunityPolicy,
     powers: crate::policy::Powers,
     now: u64,
@@ -39,7 +39,7 @@ pub(crate) fn why_line(
     let next = ladder::owed(
         &policy.ladder,
         total,
-        prior.map(|p| (p.response.as_str(), p.at_total, p.at_ms)),
+        answers.iter().map(|a| (a.response.as_str(), a.at_total, a.at_ms)),
         |r| powers.can_deliver(r),
         now,
         hl,
@@ -120,9 +120,9 @@ pub(crate) fn operator_surface(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<S
                             return;
                         }
                     };
-                    let prior = store.strongest_response(community.id(), &who).ok().flatten();
+                    let answers = store.answers(community.id(), &who).unwrap_or_default();
                     let powers = crate::powers_of(&community).await;
-                    let _ = ctx.reply(why_line(&who, &strikes, prior.as_ref(), &policy, powers, now_ms())).await;
+                    let _ = ctx.reply(why_line(&who, &strikes, &answers, &policy, powers, now_ms())).await;
                 }
             }
         });
@@ -196,7 +196,7 @@ mod tests {
 
     #[test]
     fn a_clean_member_is_said_to_be_clean() {
-        let line = why_line("npub1abcdefghijk", &[], None, &policy(), all(), NOW);
+        let line = why_line("npub1abcdefghijk", &[], &[], &policy(), all(), NOW);
         assert!(line.contains("no strikes"), "{line}");
     }
 
@@ -206,7 +206,7 @@ mod tests {
     #[test]
     fn why_names_the_rung_that_will_actually_be_delivered() {
         let p = policy();
-        let line = why_line("npub1abcdefghijk", &strikes(&[12]), None, &p, all(), NOW);
+        let line = why_line("npub1abcdefghijk", &strikes(&[12]), &[], &p, all(), NOW);
         assert!(line.contains("next: warn"), "twelve points still starts at a warning: {line}");
     }
 
@@ -215,7 +215,7 @@ mod tests {
         let p = policy();
         let no_hiding = Powers { hide: false, kick: true, ban: true };
         let prior = Answer { response: "warn".into(), at_total: 12, at_ms: NOW };
-        let line = why_line("npub1abcdefghijk", &strikes(&[12, 12]), Some(&prior), &p, no_hiding, NOW);
+        let line = why_line("npub1abcdefghijk", &strikes(&[12, 12]), std::slice::from_ref(&prior), &p, no_hiding, NOW);
         assert!(
             line.contains("next: kick"),
             "delete_and_warn cannot be delivered here, so it is not what comes next: {line}"
@@ -228,7 +228,7 @@ mod tests {
     fn why_says_nothing_is_owed_when_nothing_is() {
         let p = policy();
         let prior = Answer { response: "warn".into(), at_total: 12, at_ms: NOW };
-        let line = why_line("npub1abcdefghijk", &strikes(&[12]), Some(&prior), &p, all(), NOW);
+        let line = why_line("npub1abcdefghijk", &strikes(&[12]), std::slice::from_ref(&prior), &p, all(), NOW);
         assert!(line.contains("nothing owed"), "{line}");
     }
 
@@ -237,7 +237,7 @@ mod tests {
         let p = policy();
         let hl = p.ladder.decay_half_life_hours * 3_600_000;
         let old = vec![ladder::Strike { worth: 12, at_ms: NOW }];
-        let line = why_line("npub1abcdefghijk", &old, None, &p, all(), NOW + hl);
+        let line = why_line("npub1abcdefghijk", &old, &[], &p, all(), NOW + hl);
         assert!(line.contains("worth 6 "), "one half-life halves it: {line}");
     }
 

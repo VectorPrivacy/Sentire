@@ -359,20 +359,23 @@ async fn main() -> vector_sdk::Result<()> {
 /// points of "would ban" during a dry run must not be banned the moment the
 /// switch flips — they have never actually been warned. Wiping is the whole
 /// reason there is one ledger rather than two.
+/// What a wipe keys on: the LADDER's classes, in a stable order.
+///
+/// Raid containment keeps no strikes and no rung, and its claims are already
+/// scoped by armed-ness — so including it meant switching containment on wiped
+/// every member's strike history and replayed the ladder for the whole
+/// community from the bottom.
+fn ladder_classes(p: &crate::policy::CommunityPolicy) -> String {
+    [(p.arm.warn, "warn"), (p.arm.delete, "delete"), (p.arm.kick, "kick"), (p.arm.ban, "ban")]
+        .iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, n)| *n)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn wipe_on_arming_change(cfg: &Config, community: &Community, store: &Arc<Store>) {
-    let p = cfg.for_community(community.id());
-    let classes: String = [
-        (p.arm.warn, "warn"),
-        (p.arm.delete, "delete"),
-        (p.arm.kick, "kick"),
-        (p.arm.ban, "ban"),
-        (p.arm.raid, "raid"),
-    ]
-    .iter()
-    .filter(|(on, _)| *on)
-    .map(|(_, n)| *n)
-    .collect::<Vec<_>>()
-    .join(" ");
+    let classes = ladder_classes(&cfg.for_community(community.id()));
     match store.note_armed(community.id(), &classes) {
         Ok(true) => println!("{} — arming changed, starting from a clean slate", short(community.id())),
         Ok(false) => {}
@@ -420,29 +423,6 @@ mod tests {
     /// Every gate now lives in `adjudicate`, which is a pure function tested
     /// against itself rather than against a restatement of its rules. What is
     /// left here is the glue those gates depend on.
-    use crate::config::Config;
-    use crate::store::tests::mem;
-
-    const HORIZON: u64 = 0;
-    const NOW: u64 = 10_000;
-
-    /// Every regression in five review passes lived in this glue rather than in
-    /// the rules underneath it. These drive the real selection against a real
-    /// store, so a rung the code picks and a rung it records cannot drift.
-    /// The bug that silenced the whole ladder: with `[arm]` not uniform, a
-    /// single lookup read one `dry` space for rungs recorded in another, so it
-    /// proposed a rung that was always already answered.
-    ///
-    /// Validation now refuses this shape at boot (arming a class above an
-    /// unarmed one makes the first real sentence the armed rung). This stays as
-    /// the second line: the selection has to be right even if the config ever
-
-    /// A rung the community withheld must be climbed past, not stopped at.
-    /// Provenance follows the EVIDENCE. A total built from a model's opinion is
-    /// inference wherever it is answered from — the sweep used to answer it
-
-    /// A rung the PROVABLE points already reach answers under the text
-    /// switches; one only the full total reaches leans on a model and answers
 
     #[test]
     fn a_short_string_never_panics_however_a_peer_supplies_it() {
@@ -530,5 +510,39 @@ mod tests {
         // Ids the two clocks mint for the same message must match, or one
         // offense is charged twice.
         assert!(a.starts_with("msg:"), "the shape the live screen mints too");
+    }
+
+    /// Raid containment keeps no strikes and no rung, and its claims are
+    /// already scoped by armed-ness — so switching it on must not wipe the
+    /// text ladder's history for the whole community.
+    #[test]
+    fn arming_raid_does_not_wipe_the_ladders_record() {
+        let store = Arc::new(crate::store::tests::mem());
+        let base = "[arm]\nwarn = true\n";
+        let cfg: Config = toml::from_str(base).unwrap();
+        let p = cfg.for_community("c");
+        let classes = ladder_classes(&p);
+
+        store.note_armed("c", &classes).unwrap();
+        store.record("c", "npub1a", "x", 4, 0, "").unwrap();
+
+        let with_raid: Config = toml::from_str("[arm]\nwarn = true\nraid = true\n").unwrap();
+        let after = ladder_classes(&with_raid.for_community("c"));
+        assert_eq!(classes, after, "raid is not one of the ladder's classes");
+        assert!(!store.note_armed("c", &after).unwrap(), "so nothing is wiped");
+        assert_eq!(store.strikes("c", "npub1a").unwrap().len(), 1);
+    }
+
+    /// And arming a ladder class still does wipe.
+    #[test]
+    fn arming_a_ladder_class_still_wipes() {
+        let store = Arc::new(crate::store::tests::mem());
+        let before: Config = toml::from_str("[arm]\nwarn = true\n").unwrap();
+        store.note_armed("c", &ladder_classes(&before.for_community("c"))).unwrap();
+        store.record("c", "npub1a", "x", 4, 0, "").unwrap();
+
+        let after: Config = toml::from_str("[arm]\nwarn = true\nkick = true\n").unwrap();
+        assert!(store.note_armed("c", &ladder_classes(&after.for_community("c"))).unwrap());
+        assert!(store.strikes("c", "npub1a").unwrap().is_empty());
     }
 }

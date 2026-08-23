@@ -42,21 +42,20 @@ pub(crate) async fn enforce(
     let who = short(&v.npub);
     let why = v.why();
 
-    // A delete with nothing to delete is not a delete. The debt lane builds a
-    // verdict with no citations at all, so this rung hid nothing, sent a DM and
-    // was recorded as delivered — the offending message stayed up and the
-    // ladder never came back to it.
-    let can_hide = !cited_ids(v).is_empty();
-    let deliverable = |r: Response| {
-        ctx.powers.can_deliver(r) && (r != Response::DeleteAndWarn || can_hide)
-    };
-    let Some(response) = select_rung(&ctx.policy, deliverable, store, community.id(), &v.npub, strikes, now)
+    // Permissions only. Whether THIS verdict has anything to hide is not a
+    // property of the community, and folding it in here let the ladder walk
+    // past delete_and_warn into a kick for any verdict without citations — the
+    // debt lane builds exactly those.
+    let Some(response) = select_rung(&ctx.policy, |r| ctx.powers.can_deliver(r), store, community.id(), &v.npub, strikes, now)
         .map_err(vector_sdk::Error::Other)?
     else {
         // Three states used to collapse into one wordless return: nothing owed,
         // already answered, and every remaining rung undeliverable here. The
         // last is the one a stuck bot spends its life in.
-        if !ctx.powers.any() {
+        // Only when powerlessness is the REASON: with any ladder that has a
+        // warn step, `Warn` is always deliverable, so this would otherwise fire
+        // for every already-answered member of a permissionless community.
+        if !ctx.powers.any() && ladder::decide(&ctx.policy.ladder, ladder::total(strikes, now, ctx.policy.ladder.decay_half_life_hours)).is_some_and(|r| r != Response::Warn) {
             println!("[{id}] CANNOT answer {who} — this community grants Sentinel no moderation powers");
         }
         return Ok(Outcome::AlreadyAnswered);
@@ -117,7 +116,16 @@ pub(crate) async fn enforce(
         match response {
             Response::Warn => bot.dm(&v.npub).send(&warn_text(&why)).await.map(|_| ()),
             Response::DeleteAndWarn => {
-                hide_cited(bot, v, id).await;
+                // A rung with nothing to hide is still spent: the warning is
+                // delivered and the ladder moves on. Skipping it instead walked
+                // straight to a kick, and re-proposing it forever would pin the
+                // member below one. The debt lane rebuilds a verdict from the
+                // ledger, which never kept the message ids.
+                if cited_ids(v).is_empty() {
+                    println!("[{id}] {name} {who} — nothing left to hide; the warning stands alone");
+                } else {
+                    hide_cited(bot, v, id).await;
+                }
                 bot.dm(&v.npub).send(&warn_text(&why)).await.map(|_| ())
             }
             Response::Kick => community.member(v.npub.clone()).kick().await,
@@ -131,7 +139,12 @@ pub(crate) async fn enforce(
         return Ok(Outcome::Failed);
     }
 
-    store.log_action(community.id(), &v.npub, name, now, total, &why).map_err(vector_sdk::Error::Other)?;
+    if let Err(e) = store.log_action(community.id(), &v.npub, name, now, total, &why) {
+        // The act ALREADY happened. Propagating would abort the pass and
+        // re-deliver it next poll — and a ban rotates the community's keys
+        // every time.
+        eprintln!("[{id}] {name} {who} happened but could not be recorded: {e}");
+    }
     if armed {
         announce(bot, community, ctx, &format!("{name} {who} — {total} strike(s) — {why}")).await;
     }
@@ -139,10 +152,18 @@ pub(crate) async fn enforce(
     Ok(Outcome::Acted)
 }
 
-/// Whose evidence this is. Sentinel's own findings carry no policy hash; the
-/// engine stamps one on everything it reaches.
+/// Stamped on the findings Sentinel reaches itself, in the field the engine
+/// uses for the law a conviction came under.
+///
+/// A POSITIVE marker, not the absence of one. The SDK parses `policy_hash` with
+/// `unwrap_or_default`, so a renamed or restructured field upstream would read
+/// every engine finding as Sentinel's own — promoting inference to something a
+/// ladder rung may act on, which is the one direction drift must not take.
+pub(crate) const OWN_POLICY: &str = "sentinel:own";
+
+/// Whose evidence this is.
 fn is_sentinels_own(f: &vector_sdk::policy::Finding) -> bool {
-    f.policy_hash.is_empty()
+    f.policy_hash == OWN_POLICY
 }
 
 /// Evidence a ladder rung may act on.
@@ -175,7 +196,9 @@ pub(crate) fn cited_ids(v: &Verdict) -> Vec<&str> {
 /// A message already gone is the end state this wanted, not a failure.
 async fn hide_cited(bot: &VectorBot, v: &Verdict, id: &str) {
     let ids = cited_ids(v);
-    let cited = v.findings.iter().filter(|f| actionable(f)).map(|f| f.messages.len()).sum::<usize>();
+    let cited: std::collections::HashSet<&str> =
+        v.findings.iter().filter(|f| actionable(f)).flat_map(|f| f.messages.iter()).map(|m| m.as_str()).collect();
+    let cited = cited.len();
     if cited > ids.len() {
         // Saying so is the point: the rung is spent either way, and the ladder
         // will not come back to this evidence.
@@ -214,7 +237,7 @@ pub(crate) fn own_verdict(npub: &str, shield: String, reasons: Vec<String>, find
 pub(crate) fn own_finding(rule: &str, detail: &str, message_id: String) -> vector_sdk::policy::Finding {
     vector_sdk::policy::Finding {
         conviction_id: String::new(),
-        policy_hash: String::new(),
+        policy_hash: OWN_POLICY.into(),
         rule_id: rule.into(),
         scope: "whole".into(),
         basis: "heuristic".into(),
@@ -290,11 +313,11 @@ pub(crate) fn select_rung(
 ) -> Result<Option<Response>, String> {
     let hl = policy.ladder.decay_half_life_hours;
     let total = ladder::total(strikes, now, hl);
-    let prior = store.strongest_response(community, npub)?;
+    let answers = store.answers(community, npub)?;
     Ok(ladder::owed(
         &policy.ladder,
         total,
-        prior.as_ref().map(|p| (p.response.as_str(), p.at_total, p.at_ms)),
+        answers.iter().map(|a| (a.response.as_str(), a.at_total, a.at_ms)),
         can_deliver,
         now,
         hl,
@@ -425,6 +448,25 @@ mod tests {
         assert_eq!(cited_ids(&v), vec!["m1", "m2"]);
     }
 
+    /// Upstream drift must not promote engine findings to Sentinel's own. The
+    /// SDK parses this field with `unwrap_or_default`, so an absence test would
+    /// read a renamed field as "mine" for everything the engine ever reached.
+    #[test]
+    fn an_engine_finding_with_no_policy_hash_is_still_the_engines() {
+        let mut f = cited("heuristic", &["m1"]);
+        f.policy_hash = String::new();
+        assert!(cited_ids(&with(vec![f])).is_empty(), "an empty hash is not a claim of ownership");
+    }
+
+    #[test]
+    fn sentinels_own_marker_is_what_makes_a_finding_its_own() {
+        let own = own_finding("vision", "gore", "m1".into());
+        assert_eq!(own.policy_hash, OWN_POLICY);
+        let mut forged = own.clone();
+        forged.policy_hash = "abc123".into();
+        assert!(cited_ids(&with(vec![forged])).is_empty(), "and it is the marker, not the shape");
+    }
+
     /// Sentinel's own findings are inference by basis and actionable anyway:
     /// the operator armed the lane, and a model saying an image breaks a rule
     /// is the answer rather than evidence toward one.
@@ -466,4 +508,81 @@ mod tests {
             "delete_and_warn cannot be delivered here, so the ladder goes on"
         );
     }
+
+    /// Write-then-read, which is the cycle the ladder actually runs in. A gate
+    /// that reads only the STRONGEST answer never sees the row a lighter answer
+    /// wrote, so it stays open and re-delivers the same rung every poll — for
+    /// as long as the strike lives.
+    #[test]
+    fn an_answer_closes_the_gate_it_opened_even_when_a_stronger_one_is_on_file() {
+        let store = mem();
+        let p = policy_with("warn = true\ndelete = true\nkick = true\nban = true");
+        let all = Powers { hide: true, kick: true, ban: true };
+        let hl = p.ladder.decay_half_life_hours * 3_600_000;
+        let pick = |s: &Store, strikes: &[ladder::Strike], now: u64| {
+            select_rung(&p, |r| all.can_deliver(r), s, "c", "npub1a", strikes, now).unwrap()
+        };
+
+        // An old, strong answer, long since forgiven.
+        store.log_action("c", "npub1a", "kick", NOW, 36, "").unwrap();
+        let much_later = NOW + hl * 8;
+        let light = [ladder::Strike { worth: 1, at_ms: much_later }];
+
+        // The forgiven kick no longer floors anything, so this is a warning.
+        assert_eq!(pick(&store, &light, much_later), Some(Response::Warn));
+        store.log_action("c", "npub1a", "warn", much_later, 1, "").unwrap();
+
+        // And that warning must be the last word until something new happens.
+        for poll in 1..=30u64 {
+            assert_eq!(
+                pick(&store, &light, much_later + poll * 120_000),
+                None,
+                "poll {poll} re-delivered an answer already given"
+            );
+        }
+    }
+
+    /// The same shape with equal ranks, where the tie-break used to keep the
+    /// oldest row and the new one was never read at all.
+    #[test]
+    fn two_answers_of_the_same_rung_do_not_reopen_each_other() {
+        let store = mem();
+        let p = policy_with("warn = true\ndelete = true\nkick = true\nban = true");
+        let all = Powers { hide: true, kick: true, ban: true };
+        let hl = p.ladder.decay_half_life_hours * 3_600_000;
+
+        store.log_action("c", "npub1a", "warn", NOW, 12, "").unwrap();
+        let later = NOW + hl * 5;
+        store.log_action("c", "npub1a", "warn", later, 1, "").unwrap();
+
+        let light = [ladder::Strike { worth: 1, at_ms: later }];
+        assert_eq!(
+            select_rung(&p, |r| all.can_deliver(r), &store, "c", "npub1a", &light, later + 120_000).unwrap(),
+            None
+        );
+    }
+
+    /// And a genuinely new offense still climbs from the answer that stands.
+    #[test]
+    fn a_new_offense_after_a_forgiven_kick_climbs_from_the_warning() {
+        let store = mem();
+        let p = policy_with("warn = true\ndelete = true\nkick = true\nban = true");
+        let all = Powers { hide: true, kick: true, ban: true };
+        let hl = p.ladder.decay_half_life_hours * 3_600_000;
+
+        store.log_action("c", "npub1a", "kick", NOW, 36, "").unwrap();
+        let much_later = NOW + hl * 8;
+        store.log_action("c", "npub1a", "warn", much_later, 1, "").unwrap();
+
+        let worse = [
+            ladder::Strike { worth: 1, at_ms: much_later },
+            ladder::Strike { worth: 12, at_ms: much_later },
+        ];
+        assert_eq!(
+            select_rung(&p, |r| all.can_deliver(r), &store, "c", "npub1a", &worse, much_later).unwrap(),
+            Some(Response::DeleteAndWarn),
+            "one rung above the warning that still stands, not above the forgiven kick"
+        );
+    }
 }
+
