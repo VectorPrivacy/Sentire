@@ -317,17 +317,20 @@ async fn main() -> vector_sdk::Result<()> {
             async move {
                 match event {
                     BotEvent::Message(msg) => {
-                        // The tripwire FIRST. These three run in order in one
-                        // task, and the media lane waits on a per-community
-                        // permit held across a download — so behind it the
-                        // tripwire's arrivals were stamped at release time,
-                        // one classification apart, and a wave of images could
-                        // never look like a wave.
-                        if let (Some(community), Some(author)) = (msg.community(), msg.author()) {
-                            if !msg.is_mine() {
-                                lanes::trip(&bot, &community, &cfg, &store, &wires, &author, &me).await;
+                        // COUNTED first, EVALUATED last. The three lanes run in
+                        // order in one task and the media lane waits on a
+                        // permit held across a download, so an arrival counted
+                        // after it would be stamped at release time — one
+                        // classification apart, and a wave of images could
+                        // never look like a wave. The evaluation a trip asks
+                        // for reads a whole corpus, so it goes at the end where
+                        // it delays nothing.
+                        let tripped = match (msg.community(), msg.author()) {
+                            (Some(community), Some(author)) if !msg.is_mine() => {
+                                lanes::observe_arrival(&cfg, &wires, &community, &author)
                             }
-                        }
+                            _ => false,
+                        };
                         let sentenced = match lanes::screen(&bot, &msg, &cfg, &store, &wires, &me).await {
                             Ok(sentenced) => sentenced,
                             Err(e) => {
@@ -349,12 +352,19 @@ async fn main() -> vector_sdk::Result<()> {
                         {
                             eprintln!("media: {e}");
                         }
+                        if tripped {
+                            if let Some(community) = msg.community() {
+                                lanes::evaluate_now(&bot, &community, &cfg, &store, &wires, &me).await;
+                            }
+                        }
                     }
                     // A join flood is the other half of the raid shape, and it
                     // arrives before anyone has said anything at all.
                     BotEvent::MemberJoin { channel_id, npub } => {
                         if let Some(community) = bot.channel(channel_id).community() {
-                            lanes::trip(&bot, &community, &cfg, &store, &wires, &npub, &me).await;
+                            if lanes::observe_arrival(&cfg, &wires, &community, &npub) {
+                                lanes::evaluate_now(&bot, &community, &cfg, &store, &wires, &me).await;
+                            }
                         }
                     }
                     _ => {}

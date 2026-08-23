@@ -318,38 +318,41 @@ pub(crate) async fn watch_media(
 /// verdict and asks the engine, which judges exactly as it would have on the
 /// next sweep. Keeping those separate is what stops a second, sloppier detector
 /// growing beside the real one.
-pub(crate) async fn trip(
+pub(crate) fn observe_arrival(cfg: &Config, wires: &Watches, community: &Community, who: &str) -> bool {
+    // The only path that was not scoped. Anyone can invite Sentinel (it builds
+    // `.public()`), and a join flood there reached the whole ladder against
+    // policies Sentinel never installed.
+    if !cfg.watches(community.id()) {
+        return false;
+    }
+    let cid = community.id().to_string();
+    let mut guard = wires.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .entry(cid.clone())
+        .or_default()
+        .tripwire
+        .get_or_insert_with(|| {
+            let r = cfg.for_community(&cid).raid;
+            Tripwire::new(r.tripwire_accounts, r.tripwire_secs, r.tripwire_cooldown_secs)
+        })
+        .observe(who, now_ms())
+}
+
+/// Evaluate a community NOW, because its tripwire went off.
+///
+/// Split from the counting deliberately. `observe_arrival` is a lock and a
+/// push, so it runs at arrival and the timestamps are the truth; this reads a
+/// whole corpus and sentences, so it runs after the per-message lanes and
+/// blocks nothing that has to be quick.
+pub(crate) async fn evaluate_now(
     bot: &VectorBot,
     community: &Community,
     cfg: &Config,
     store: &Arc<Store>,
     wires: &Watches,
-    who: &str,
     me: &str,
 ) {
-    // The only path that was not scoped. Anyone can invite Sentinel (it builds
-    // `.public()`), and a join flood there reached the whole ladder against
-    // policies Sentinel never installed.
-    if !cfg.watches(community.id()) {
-        return;
-    }
     let cid = community.id().to_string();
-    let tripped = {
-        let mut guard = wires.lock().unwrap_or_else(|e| e.into_inner());
-        guard
-            .entry(cid.clone())
-            .or_default()
-            .tripwire
-            .get_or_insert_with(|| {
-                let r = cfg.for_community(&cid).raid;
-                Tripwire::new(r.tripwire_accounts, r.tripwire_secs, r.tripwire_cooldown_secs)
-            })
-            .observe(who, now_ms())
-    };
-    if !tripped {
-        return;
-    }
-
     let r = cfg.for_community(&cid).raid;
     println!(
         "[{}] TRIPWIRE — {} distinct accounts inside {}s, evaluating now",
