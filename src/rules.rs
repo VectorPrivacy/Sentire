@@ -29,12 +29,26 @@ pub fn compile(cfg: &CommunityPolicy) -> Option<Policy> {
     let mut policy = Policy::named("Sentinel");
     let mut any = false;
 
+    // Shields gate BEFORE conviction, so a community that has chosen to reach
+    // its regulars has to say so in the RULEBOOK — otherwise the engine spares
+    // them upstream and `respect_trusted = false` decides nothing at all. The
+    // engine allows this only for the gravest rungs, which is its call to make.
+    let reach = |rule: PolicyRule| {
+        if cfg.shields.respect_trusted {
+            rule
+        } else {
+            rule.even_for_trusted()
+        }
+    };
+
     for w in &r.words {
-        policy = policy.rule(PolicyRule::words(&w.id, w.patterns.iter().cloned()).seriousness(seriousness(w.gravity)));
+        policy = policy
+            .rule(reach(PolicyRule::words(&w.id, w.patterns.iter().cloned()).seriousness(seriousness(w.gravity))));
         any = true;
     }
     for l in &r.links {
-        policy = policy.rule(PolicyRule::links(&l.id, l.domains.iter().cloned()).seriousness(seriousness(l.gravity)));
+        policy = policy
+            .rule(reach(PolicyRule::links(&l.id, l.domains.iter().cloned()).seriousness(seriousness(l.gravity))));
         any = true;
     }
     if let Some(rate) = &r.rate {

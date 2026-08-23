@@ -208,6 +208,73 @@ impl World {
     }
 }
 
+/// Everything Sentinel would do about one member, with no network anywhere:
+/// the real engine, the real charging rule, a real ledger, the real ladder.
+///
+/// The only thing missing is the act itself, which is the one part that needs
+/// a relay. A test that says "three slurs reach a kick" is a test that ran
+/// every step between the words and the kick.
+pub struct Pipeline {
+    pub cfg: crate::config::Config,
+    pub store: crate::store::Store,
+    pub powers: crate::policy::Powers,
+}
+
+impl Pipeline {
+    pub fn new(cfg: crate::config::Config) -> Pipeline {
+        Pipeline { cfg, store: crate::store::tests::mem(), powers: crate::policy::Powers { hide: true, kick: true, ban: true } }
+    }
+
+    fn policy(&self) -> crate::policy::CommunityPolicy {
+        self.cfg.for_community("")
+    }
+
+    /// Feed one evaluation in: charge what it convicts, and answer for it.
+    ///
+    /// Returns the rung, having recorded it — so calling this twice models two
+    /// polls, and a second call with no new evidence must answer nothing.
+    pub fn poll(&self, w: &World, policy: &Policy, who: &Who) -> Option<crate::config::Response> {
+        let vs = w.verdicts(policy);
+        let Some(v) = find(&vs, who) else { return None };
+        self.answer(v, w.now_ms)
+    }
+
+    /// The same, for a verdict reached some other way (a media lane finding).
+    pub fn answer(&self, v: &vector_sdk::policy::Verdict, now: u64) -> Option<crate::config::Response> {
+        let p = self.policy();
+        for c in crate::review::charges(v, &p) {
+            self.store.record("c", &v.npub, &c.conviction, c.worth, now, &c.evidence).unwrap();
+        }
+        let strikes = self.store.strikes("c", &v.npub).unwrap();
+        let powers = self.powers;
+        let rung = crate::act::select_rung(&p, |r| powers.can_deliver(r), &self.store, "c", &v.npub, &strikes, now)
+            .unwrap()?;
+
+        // The gate every lane passes through, with the facts a live pass has.
+        let facts = crate::adjudicate::Facts {
+            shield: &v.shield,
+            acted_this_pass: 0,
+            acted_this_hour: self.store.actions_last_hour("c", now).unwrap(),
+            subjects_this_hour: self.store.subjects_actioned_last_hour("c", now, &v.npub).unwrap(),
+            roster: 50,
+            is_me: false,
+        };
+        match crate::adjudicate::adjudicate(&p, powers, &facts, rung) {
+            crate::adjudicate::Sentence::Carry { response, .. } => {
+                let total = crate::ladder::total(&strikes, now, p.ladder.decay_half_life_hours);
+                self.store.log_action("c", &v.npub, response.name(), now, total, "").unwrap();
+                Some(response)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn total(&self, npub: &str, now: u64) -> u32 {
+        let strikes = self.store.strikes("c", npub).unwrap();
+        crate::ladder::total(&strikes, now, self.policy().ladder.decay_half_life_hours)
+    }
+}
+
 /// The npub of a verdict, shortened the way the logs do.
 pub fn find<'a>(vs: &'a Verdicts, who: &Who) -> Option<&'a vector_sdk::policy::Verdict> {
     let npub = who.npub();
@@ -428,5 +495,300 @@ mod tests {
         let ids: std::collections::HashSet<&str> = charged.iter().map(|c| c.conviction.as_str()).collect();
         assert_eq!(ids.len(), charged.len(), "no id is charged twice");
         assert_eq!(charged.len(), 3, "three messages, three charges — not three plus a window rung");
+    }
+
+    fn armed() -> Config {
+        toml::from_str("[arm]\nwarn = true\ndelete = true\nkick = true\nban = true").unwrap()
+    }
+
+    /// The headline claim, end to end and offline: words in, a sentence out.
+    #[test]
+    fn a_word_rule_reaches_a_warning_through_the_whole_pipeline() {
+        let mut w = World::new();
+        let who = w.stranger();
+        w.says(who, "badword");
+
+        let p = Pipeline::new(armed());
+        let rung = p.poll(&w, &word_policy("rude", &["badword"], Gravity::Grave), &who);
+        assert_eq!(rung, Some(crate::config::Response::Warn), "the first answer is always a warning");
+    }
+
+    /// The bug three reviews found, proven through the real engine rather than
+    /// a hand-built verdict: re-reading the same message must answer nothing.
+    #[test]
+    fn twenty_polls_over_one_message_produce_one_sentence() {
+        let mut w = World::new();
+        let who = w.stranger();
+        w.says(who, "badword");
+        let policy = word_policy("rude", &["badword"], Gravity::Grave);
+
+        let p = Pipeline::new(armed());
+        assert_eq!(p.poll(&w, &policy, &who), Some(crate::config::Response::Warn));
+        for poll in 1..=20 {
+            assert_eq!(p.poll(&w, &policy, &who), None, "poll {poll} answered an answered offense");
+        }
+    }
+
+    /// And offending again does climb.
+    #[test]
+    fn offending_again_climbs_one_rung() {
+        let policy = word_policy("rude", &["badword"], Gravity::Grave);
+        let p = Pipeline::new(armed());
+        let mut w = World::new();
+        let who = w.stranger();
+
+        w.says(who, "badword");
+        assert_eq!(p.poll(&w, &policy, &who), Some(crate::config::Response::Warn));
+        w.says(who, "badword again");
+        assert_eq!(p.poll(&w, &policy, &who), Some(crate::config::Response::DeleteAndWarn));
+        w.says(who, "badword once more");
+        assert_eq!(p.poll(&w, &policy, &who), Some(crate::config::Response::Kick));
+    }
+
+    /// Forgiveness is built in: the same offenses spread out do not reach the
+    /// rung they reach in a burst.
+    #[test]
+    fn the_same_offenses_a_month_apart_do_not_reach_a_kick() {
+        let policy = word_policy("rude", &["badword"], Gravity::Minor);
+        let p = Pipeline::new(armed());
+
+        // Three in a burst.
+        let mut burst = World::new();
+        let a = burst.stranger();
+        for _ in 0..3 {
+            burst.says(a, "badword");
+        }
+        let hot = p.poll(&burst, &policy, &a);
+
+        // The same three, decayed by a month of half-lives.
+        let cold = Pipeline::new(armed());
+        let mut old = World::new();
+        let b = old.stranger();
+        for i in 0..3u64 {
+            let at = old.now_ms - (30 - i * 7) * 24 * HOUR;
+            old.said_at(b, "badword", at, 0);
+        }
+        let cool = cold.poll(&old, &policy, &b);
+
+        assert!(hot.is_some(), "a burst answers to something");
+        assert!(
+            cool.is_none() || cool <= hot,
+            "the same words spread out must never answer harder: {cool:?} vs {hot:?}"
+        );
+    }
+
+    /// A shielded member is spared at the gate, however loud the evidence.
+    #[test]
+    fn the_owner_is_spared_by_the_gate_not_merely_unconvicted() {
+        let mut w = World::new();
+        let owner = w.owner();
+        for _ in 0..10 {
+            w.says(owner, "badword");
+        }
+        let p = Pipeline::new(armed());
+        assert_eq!(p.poll(&w, &word_policy("rude", &["badword"], Gravity::Grave), &owner), None);
+    }
+
+    /// Nothing armed means nothing decided, but the ledger still fills — which
+    /// is what lets an operator watch the run they are about to arm.
+    #[test]
+    fn a_dry_run_records_what_it_would_have_done() {
+        let mut w = World::new();
+        let who = w.stranger();
+        w.says(who, "badword");
+
+        let p = Pipeline::new(Config::default());
+        let rung = p.poll(&w, &word_policy("rude", &["badword"], Gravity::Grave), &who);
+        assert_eq!(rung, Some(crate::config::Response::Warn), "the decision is reached either way");
+        assert!(p.total(&who.npub(), w.now_ms) > 0, "and the strike is on file");
+    }
+
+    /// Two members are two ledgers.
+    #[test]
+    fn one_members_strikes_never_answer_for_another() {
+        let mut w = World::new();
+        let noisy = w.stranger();
+        let quiet = w.stranger();
+        for _ in 0..5 {
+            w.says(noisy, "badword");
+        }
+        w.says(quiet, "good morning");
+
+        let policy = word_policy("rude", &["badword"], Gravity::Grave);
+        let p = Pipeline::new(armed());
+        assert!(p.poll(&w, &policy, &noisy).is_some());
+        assert_eq!(p.poll(&w, &policy, &quiet), None, "saying nothing wrong answers to nothing");
+        assert_eq!(p.total(&quiet.npub(), w.now_ms), 0);
+    }
+
+    fn rules_policy(f: impl FnOnce(&mut crate::config::Rules)) -> Policy {
+        let mut cfg = Config::default();
+        f(&mut cfg.rules);
+        rules::compile(&cfg.for_community("")).expect("a rule is a rule")
+    }
+
+    /// Every rule type the operator can switch on has to actually convict, or
+    /// the config field is decoration.
+    #[test]
+    fn a_rate_rule_convicts_a_burst() {
+        let mut w = World::new();
+        let who = w.stranger();
+        let start = w.now_ms - HOUR;
+        for i in 0..20u64 {
+            w.said_at(who, &format!("message {i}"), start + i * 100, 0);
+        }
+        let policy = rules_policy(|r| {
+            r.rate = Some(crate::config::RateRule { enabled: true, per_secs: 60, gravity: Gravity::Minor })
+        });
+        let vs = w.verdicts(&policy);
+        let v = find(&vs, &who).expect("reported");
+        assert!(v.findings.iter().any(|f| f.rule_id == "rate"), "twenty messages in two seconds is a rate");
+    }
+
+    #[test]
+    fn a_repetition_rule_convicts_the_same_line_over_and_over() {
+        let mut w = World::new();
+        let who = w.stranger();
+        let start = w.now_ms - HOUR;
+        for i in 0..10u64 {
+            w.said_at(who, "buy my coin", start + i * 1000, 0);
+        }
+        let policy =
+            rules_policy(|r| r.repetition = Some(crate::config::ToggleRule { enabled: true, gravity: Gravity::Minor }));
+        let vs = w.verdicts(&policy);
+        let v = find(&vs, &who).expect("reported");
+        assert!(v.findings.iter().any(|f| f.rule_id == "repetition"), "ten identical lines is repetition");
+    }
+
+    #[test]
+    fn a_mass_tagging_rule_convicts_one_message_naming_a_crowd() {
+        let mut w = World::new();
+        let who = w.stranger();
+        w.says_tagging(who, "everyone look at this", 30);
+        let policy = rules_policy(|r| {
+            r.mass_tagging = Some(crate::config::ToggleRule { enabled: true, gravity: Gravity::Serious })
+        });
+        let vs = w.verdicts(&policy);
+        let v = find(&vs, &who).expect("reported");
+        assert!(v.findings.iter().any(|f| f.rule_id == "mass-tagging"), "thirty p-tags is a crowd");
+    }
+
+    /// A rule that is switched OFF must convict nobody.
+    #[test]
+    fn a_disabled_rule_convicts_nobody() {
+        let mut w = World::new();
+        let who = w.stranger();
+        let start = w.now_ms - HOUR;
+        for i in 0..20u64 {
+            w.said_at(who, "buy my coin", start + i * 100, 0);
+        }
+        for policy in [
+            rules_policy(|r| {
+                r.rate = Some(crate::config::RateRule { enabled: false, per_secs: 60, gravity: Gravity::Minor });
+                r.words = vec![WordRule { id: "x".into(), patterns: vec!["zzz".into()], gravity: Gravity::Note }];
+            }),
+            rules_policy(|r| {
+                r.repetition = Some(crate::config::ToggleRule { enabled: false, gravity: Gravity::Minor });
+                r.words = vec![WordRule { id: "x".into(), patterns: vec!["zzz".into()], gravity: Gravity::Note }];
+            }),
+        ] {
+            let vs = w.verdicts(&policy);
+            let v = find(&vs, &who).expect("reported");
+            assert!(v.findings.is_empty(), "a switched-off rule is off: {:?}", v.findings);
+        }
+    }
+
+    /// Standing is earned from history, and the engine hands it to Sentinel as
+    /// the shield the whole gate turns on.
+    #[test]
+    fn a_long_standing_regular_reads_as_trusted() {
+        let mut w = World::new();
+        let regular = w.regular(60 * 24 * HOUR, 500);
+        for i in 0..10u64 {
+            w.said_at(regular, &format!("morning {i}"), w.now_ms - (20 - i) * HOUR, 0);
+        }
+        w.says(regular, "badword");
+
+        let vs = w.verdicts(&word_policy("rude", &["badword"], Gravity::Grave));
+        let v = find(&vs, &regular).expect("reported");
+        assert_eq!(v.shield, "trusted", "two months and five hundred messages is standing");
+    }
+
+    /// And a community that says so can still reach them.
+    #[test]
+    fn respect_trusted_decides_whether_a_regular_is_answerable() {
+        let mut w = World::new();
+        let regular = w.regular(60 * 24 * HOUR, 500);
+        for i in 0..10u64 {
+            w.said_at(regular, &format!("morning {i}"), w.now_ms - (20 - i) * HOUR, 0);
+        }
+        w.says(regular, "badword");
+
+        // The rulebook is compiled from the SAME config the gate reads, because
+        // shields gate before conviction: a community that has chosen to reach
+        // its regulars has to say so in the rules or the engine spares them
+        // upstream and the setting decides nothing.
+        let rulebook = |cfg: &Config| {
+            let mut c = cfg.clone();
+            c.rules.words =
+                vec![WordRule { id: "rude".into(), patterns: vec!["badword".into()], gravity: Gravity::Grave }];
+            rules::compile(&c.for_community("")).expect("a rule is a rule")
+        };
+
+        let default = armed();
+        let sparing = Pipeline::new(default.clone());
+        assert_eq!(
+            sparing.poll(&w, &rulebook(&default), &regular),
+            None,
+            "a regular is left to a person by default"
+        );
+
+        let mut cfg = armed();
+        cfg.shields.respect_trusted = false;
+        let reaching = Pipeline::new(cfg.clone());
+        assert!(
+            reaching.poll(&w, &rulebook(&cfg), &regular).is_some(),
+            "unless the community says otherwise"
+        );
+    }
+
+    /// Switching the shield off applies to every rule, not only the grave ones.
+    /// Worth pinning: it is the widest thing that setting does, and the engine
+    /// still has to accept the rulebook it produces.
+    #[test]
+    fn reaching_regulars_applies_to_every_rule_and_still_validates() {
+        let mut w = World::new();
+        let regular = w.regular(60 * 24 * HOUR, 500);
+        for i in 0..10u64 {
+            w.said_at(regular, &format!("morning {i}"), w.now_ms - (20 - i) * HOUR, 0);
+        }
+        w.says(regular, "badword");
+
+        for gravity in [Gravity::Note, Gravity::Minor, Gravity::Serious, Gravity::Grave] {
+            let mut cfg = armed();
+            cfg.shields.respect_trusted = false;
+            cfg.rules.words =
+                vec![WordRule { id: "rude".into(), patterns: vec!["badword".into()], gravity }];
+            Config::validate_for_test(&cfg)
+                .unwrap_or_else(|e| panic!("{gravity:?} with respect_trusted off must still boot: {e}"));
+
+            let policy = rules::compile(&cfg.for_community("")).expect("a rule is a rule");
+            let vs = w.verdicts(&policy);
+            let v = find(&vs, &regular).expect("reported");
+            assert!(!v.findings.is_empty(), "{gravity:?} must reach a regular once the shield is off");
+        }
+    }
+
+    /// The window is a real bound: what fell out of it convicts nobody.
+    #[test]
+    fn evidence_older_than_the_window_is_not_evidence() {
+        let mut w = World::new();
+        let who = w.stranger();
+        // The default window is 168 hours.
+        w.said_at(who, "badword", w.now_ms - 200 * HOUR, 0);
+
+        let vs = w.verdicts(&word_policy("rude", &["badword"], Gravity::Grave));
+        let v = find(&vs, &who).expect("reported");
+        assert!(v.findings.is_empty(), "a week and a half ago is outside a one-week window");
     }
 }
