@@ -212,4 +212,114 @@ mod tests {
         assert!(!t.observe("c", 11_000));
         assert!(t.observe("d", 12_000), "b, c and d are three inside the window");
     }
+
+    /// The wave shapes it must catch, and the ordinary traffic it must not,
+    /// as one table. Each row is a run of (who, at_ms) arrivals.
+    #[test]
+    fn it_trips_on_waves_and_holds_for_conversation() {
+        let strangers = |n: usize, spacing: u64| -> Vec<(String, u64)> {
+            (0..n).map(|i| (format!("npub1raider{i:03}"), i as u64 * spacing)).collect()
+        };
+
+        // Five distinct strangers inside thirty seconds.
+        let mut t = Tripwire::new(5, 30, 60);
+        let mut tripped = false;
+        for (who, at) in strangers(5, 1000) {
+            tripped |= t.observe(&who, at);
+        }
+        assert!(tripped, "five strangers in five seconds is a wave");
+
+        // The same five, spread over an hour.
+        let mut t = Tripwire::new(5, 30, 60);
+        let mut tripped = false;
+        for (who, at) in strangers(5, 15 * 60_000) {
+            tripped |= t.observe(&who, at);
+        }
+        assert!(!tripped, "five strangers over an hour is a quiet afternoon");
+
+        // One stranger talking a great deal.
+        let mut t = Tripwire::new(5, 30, 60);
+        let mut tripped = false;
+        for i in 0..50u64 {
+            tripped |= t.observe("npub1chatty", i * 100);
+        }
+        assert!(!tripped, "one member talking is a conversation, however fast");
+    }
+
+    /// Regulars are not a wave, and the sweep is what tells the tripwire who
+    /// they are. Counting them fires a full corpus read a minute for as long
+    /// as the room stays lively.
+    #[test]
+    fn vouched_members_do_not_count_toward_a_wave() {
+        let mut t = Tripwire::new(3, 30, 60);
+        let regulars: Vec<String> = (0..10).map(|i| format!("npub1regular{i}")).collect();
+        t.trust(regulars.iter().map(|s| s.as_str()).collect::<Vec<&str>>());
+
+        let mut tripped = false;
+        for (i, who) in regulars.iter().enumerate() {
+            tripped |= t.observe(who, i as u64 * 500);
+        }
+        assert!(!tripped, "ten regulars talking is the least raid-shaped thing there is");
+
+        // And three strangers among them still do.
+        assert!(!t.observe("npub1stranger1", 6_000));
+        assert!(!t.observe("npub1stranger2", 6_500));
+        assert!(t.observe("npub1stranger3", 7_000), "strangers still count");
+    }
+
+    /// A sustained wave must not ask for one full corpus read per message.
+    #[test]
+    fn the_cooldown_rations_the_evaluations_a_wave_can_ask_for() {
+        let mut t = Tripwire::new(3, 30, 60);
+        let mut trips = 0;
+        for i in 0..300u64 {
+            // A fresh identity every message, arriving every second.
+            if t.observe(&format!("npub1raider{i:04}"), i * 1000) {
+                trips += 1;
+            }
+        }
+        // 300 seconds at a 60-second cooldown.
+        assert!(trips <= 6, "{trips} evaluations for a five-minute wave");
+        assert!(trips >= 4, "and it must keep asking: {trips}");
+    }
+
+    /// A refunded trip may fire again at once — that is the whole point of
+    /// giving it back when a sweep was already in flight.
+    #[test]
+    fn a_refunded_trip_can_fire_again_immediately() {
+        let mut t = Tripwire::new(3, 30, 600);
+        assert!(!t.observe("npub1a", 0));
+        assert!(!t.observe("npub1b", 100));
+        assert!(t.observe("npub1c", 200));
+        assert!(!t.observe("npub1d", 300), "the cooldown holds");
+
+        t.forget_last_trip();
+        assert!(t.observe("npub1e", 400), "and a refund releases it");
+    }
+
+    /// Arrivals that predate the window must not be counted, and the count
+    /// must not underflow as they age out.
+    #[test]
+    fn arrivals_age_out_of_the_window_without_underflowing() {
+        let mut t = Tripwire::new(5, 10, 0);
+        for i in 0..4u64 {
+            assert!(!t.observe(&format!("npub1a{i}"), i * 1000));
+        }
+        // Long after the window, the earlier four no longer count.
+        for i in 0..4u64 {
+            assert!(!t.observe(&format!("npub1b{i}"), 100_000 + i * 1000), "the old four have aged out");
+        }
+        assert!(t.observe("npub1b4", 104_000), "and the new five trip it");
+    }
+
+    /// A clock that steps backwards must not panic or wedge the tripwire.
+    #[test]
+    fn a_backward_clock_does_not_panic() {
+        let mut t = Tripwire::new(3, 30, 60);
+        t.observe("npub1a", 100_000);
+        t.observe("npub1b", 50_000);
+        t.observe("npub1c", 0);
+        t.observe("npub1d", u64::MAX);
+        t.observe("npub1e", 0);
+    }
 }
