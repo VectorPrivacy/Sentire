@@ -270,6 +270,28 @@ pub(crate) async fn announce(bot: &VectorBot, community: &Community, ctx: &Ctx, 
     }
 }
 
+impl Ctx {
+    /// Everything one community's turn depends on, gathered in one place.
+    ///
+    /// The roster is the caller's, because the two clocks count it differently:
+    /// the sweep has just counted it, and a live lane reads what the last sweep
+    /// published. Everything else is the same question asked the same way.
+    pub(crate) async fn of(
+        cfg: &crate::config::Config,
+        community: &Community,
+        me: &str,
+        roster: usize,
+    ) -> Ctx {
+        Ctx {
+            policy: cfg.for_community(community.id()),
+            powers: crate::powers_of(community).await,
+            roster,
+            me: me.to_string(),
+            mod_channel: cfg.bot.mod_channel.clone(),
+        }
+    }
+}
+
 /// One community, as this pass sees it: its own rulebook, its own powers, its
 /// own roster. Nothing about judging one community may leak into another.
 pub(crate) struct Ctx {

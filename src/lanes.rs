@@ -14,7 +14,7 @@ use crate::review::sweep;
 use tokio::sync::Semaphore;
 use crate::act::{announce, enforce, own_finding, own_verdict, Ctx, Outcome};
 use crate::{
-    conviction_id, now_ms, powers_of, resolve_absent, roster_size, short, standing_of, untrip, Pass,
+    conviction_id, now_ms, resolve_absent, roster_size, short, standing_of, untrip, Pass,
     Watches,
 };
 use crate::{ladder, vision};
@@ -53,7 +53,7 @@ pub(crate) async fn screen(
     // Standing BEFORE recording: the live screen sees one message, so a
     // long-tenured regular reads as untrusted here.
     let shield = resolve_absent(standing_of(watches, community.id(), &author), msg);
-    if matches!(shield.as_str(), "protected" | "unknown") || (shield == "trusted" && policy.shields.respect_trusted) {
+    if crate::adjudicate::spared_by_standing(&policy, &shield).is_some() {
         return Ok(false);
     }
     let mut fresh = false;
@@ -172,9 +172,7 @@ pub(crate) async fn watch_media(
     // that is then thrown away.
     let shield = resolve_absent(standing_of(watches, community.id(), &author), msg);
     let policy = cfg.for_community(community.id());
-    if matches!(shield.as_str(), "protected" | "unknown")
-        || (shield == "trusted" && policy.shields.respect_trusted)
-    {
+    if crate::adjudicate::spared_by_standing(&policy, &shield).is_some() {
         return Ok(());
     }
     let now = now_ms();
@@ -422,13 +420,9 @@ pub(crate) fn media_lane(cfg: &Config) -> vector_sdk::Result<Arc<Option<vision::
 /// as the sweep resolves — a message arriving is not a reason to judge it by
 /// somebody else's standards.
 pub(crate) async fn live_ctx(cfg: &Config, community: &Community, watches: &Watches, me: &str) -> Ctx {
-    Ctx {
-        policy: cfg.for_community(community.id()),
-        powers: powers_of(community).await,
-        roster: roster_size(watches, community.id()),
-        me: me.to_string(),
-        mod_channel: cfg.bot.mod_channel.clone(),
-    }
+    // The roster as the LAST SWEEP counted it: a live lane has no corpus, and a
+    // ceiling measured against nothing bounds nothing.
+    Ctx::of(cfg, community, me, roster_size(watches, community.id())).await
 }
 
 /// One blob at a time per community, and no more than the operator allows per

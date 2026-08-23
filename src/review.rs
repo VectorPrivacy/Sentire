@@ -13,7 +13,7 @@ use crate::store::Store;
 use crate::tripwire::Tripwire;
 use crate::act::{announce, enforce, own_verdict, Ctx, Outcome};
 use crate::{
-    conviction_id, now_ms, powers_of, roster_map, short, Pass,
+    conviction_id, now_ms, roster_map, short, Pass,
     Watches,
 };
 use crate::raid;
@@ -123,13 +123,7 @@ pub(crate) async fn sweep(
     }
     let id = short(community.id());
     let now = now_ms();
-    let ctx = Ctx {
-        policy: cfg.for_community(community.id()),
-        powers: powers_of(community).await,
-        roster: verdicts.all().count(),
-        me: me.to_string(),
-        mod_channel: cfg.bot.mod_channel.clone(),
-    };
+    let ctx = Ctx::of(cfg, community, me, verdicts.all().count()).await;
     let pass = Mutex::new(0usize);
     let mut convicted = 0usize;
     let mut halted = false;
@@ -153,8 +147,8 @@ pub(crate) async fn sweep(
         // built a silent backlog on members `enforce` would always spare —
         // ammunition for the day `respect_trusted` was turned off, or for any
         // path that failed to read their standing.
-        if v.shield == "protected" || (v.shield == "trusted" && ctx.policy.shields.respect_trusted) {
-            println!("[{id}] QUEUED  {} — {} ({})", short(&v.npub), v.why(), v.shield);
+        if let Some(why) = adjudicate::spared_by_standing(&ctx.policy, &v.shield) {
+            println!("[{id}] QUEUED  {} — {} ({why})", short(&v.npub), v.why());
             // Handled: without this their older strikes keep them in the debt
             // loop, which names a moderator in the log every single pass.
             handled.insert(v.npub.clone());

@@ -66,6 +66,33 @@ pub fn armed_for(cfg: &CommunityPolicy, response: Response) -> bool {
     }
 }
 
+/// Does standing alone put this member out of reach here?
+///
+/// The ONE place the shield vocabulary lives. Every lane pre-filters before it
+/// records anything, and three hand-written copies of this rule had already
+/// drifted apart — the sweep's omitted `unknown` and `absent`, so it built a
+/// silent backlog on members the gate would always spare.
+pub fn spared_by_standing(cfg: &CommunityPolicy, shield: &str) -> Option<&'static str> {
+    match shield {
+        "protected" => Some("protected"),
+        "trusted" if cfg.shields.respect_trusted => Some("trusted"),
+        // Not knowing is not the same as knowing they are ordinary.
+        "unknown" => Some("standing not yet established"),
+        // The roster was read and does not list them. A caller that CAN resolve
+        // this — a live lane, which has the member in hand — passes the resolved
+        // value; one that cannot gets a refusal rather than a default.
+        "absent" => Some("not on the roster"),
+        // Known vocabulary that is not a shield here: `indeterminate` means
+        // tenure could not be established, and `trusted` has already passed the
+        // guard above in a community that chose to reach its regulars.
+        "none" | "indeterminate" | "trusted" => None,
+        // Anything else is the engine's vocabulary having moved. Falling
+        // through would read a renamed shield as "not shielded", which is a
+        // removal — the one direction upstream drift must never take.
+        _ => Some("standing not recognised"),
+    }
+}
+
 /// The decision. Order matters and is the order below.
 pub fn adjudicate(cfg: &CommunityPolicy, powers: Powers, facts: &Facts, response: Response) -> Sentence {
     // Sentinel is not its own subject.
@@ -81,23 +108,8 @@ pub fn adjudicate(cfg: &CommunityPolicy, powers: Powers, facts: &Facts, response
     }
 
     // Standing, first and unconditional.
-    match facts.shield {
-        "protected" => return Sentence::Spare { why: "protected" },
-        "trusted" if cfg.shields.respect_trusted => return Sentence::Spare { why: "trusted" },
-        // Not knowing is not the same as knowing they are ordinary.
-        "unknown" => return Sentence::Spare { why: "standing not yet established" },
-        // The roster was read and does not list them. A caller that CAN resolve
-        // this — a live lane, which has the member in hand — passes the resolved
-        // value; one that cannot gets a refusal rather than a default.
-        "absent" => return Sentence::Spare { why: "not on the roster" },
-        // Known vocabulary that is not a shield here: `indeterminate` means
-        // tenure could not be established, and `trusted` has already passed the
-        // guard above in a community that chose to reach its regulars.
-        "none" | "indeterminate" | "trusted" => {}
-        // Anything else is the engine's vocabulary having moved. Falling
-        // through would read a renamed shield as "not shielded", which is a
-        // removal — the one direction upstream drift must never take.
-        _ => return Sentence::Spare { why: "standing not recognised" },
+    if let Some(why) = spared_by_standing(cfg, facts.shield) {
+        return Sentence::Spare { why };
     }
 
     // Can Sentinel even do this here? Being a member is not being a moderator,
@@ -293,6 +305,30 @@ mod tests {
             adjudicate(&cfg, all_powers(), &facts(), Response::Ban),
             Sentence::Carry { response: Response::Ban, armed: false }
         );
+    }
+
+    /// The pre-filters every lane runs before recording anything must be the
+    /// same rule as the gate that follows them. Three hand-written copies had
+    /// already drifted: the sweep's omitted `unknown` and `absent`, so it built
+    /// a backlog on members the gate would always spare.
+    #[test]
+    fn the_lane_pre_filter_and_the_gate_agree_on_every_shield() {
+        let cfg = policy();
+        for shield in ["protected", "trusted", "unknown", "absent", "none", "indeterminate", "renamed", ""] {
+            let pre = spared_by_standing(&cfg, shield).is_some();
+            let f = Facts { shield, ..facts() };
+            let gate = matches!(adjudicate(&cfg, all_powers(), &f, Response::Warn), Sentence::Spare { .. });
+            assert_eq!(pre, gate, "{shield}: pre-filter says {pre}, the gate says {gate}");
+        }
+    }
+
+    #[test]
+    fn a_community_that_reaches_its_regulars_reaches_them_in_every_lane() {
+        let mut cfg = policy();
+        assert!(spared_by_standing(&cfg, "trusted").is_some());
+        cfg.shields.respect_trusted = false;
+        assert!(spared_by_standing(&cfg, "trusted").is_none());
+        assert!(spared_by_standing(&cfg, "protected").is_some(), "protected is never negotiable");
     }
 
     /// The whole vocabulary, in one place. A shield the gate does not know used
