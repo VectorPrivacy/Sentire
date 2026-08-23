@@ -468,4 +468,67 @@ mod tests {
         // NOT keyed on the rulebook version.
         assert!(!a.contains("policy"), "the rulebook version is not part of the offense");
     }
+
+    fn watches_with(pairs: &[(&str, &str)], known: bool) -> Watches {
+        let w = Watch {
+            standing: pairs.iter().map(|(n, s)| (n.to_string(), s.to_string())).collect(),
+            known,
+            ..Default::default()
+        };
+        Arc::new(Mutex::new([("c".to_string(), w)].into_iter().collect()))
+    }
+
+    /// Before any sweep has run, Sentinel knows nothing — and "nothing" must
+    /// not read as "ordinary", which is the unshielded path.
+    #[test]
+    fn standing_is_unknown_until_a_sweep_has_filled_it() {
+        let w = watches_with(&[("npub1a", "trusted")], false);
+        assert_eq!(standing_of(&w, "c", "npub1a"), "unknown");
+        assert_eq!(standing_of(&w, "c", "npub1nobody"), "unknown");
+        // And a community nothing has ever watched.
+        assert_eq!(standing_of(&w, "other", "npub1a"), "unknown");
+    }
+
+    #[test]
+    fn a_filled_roster_answers_with_what_it_lists() {
+        let w = watches_with(&[("npub1a", "trusted"), ("npub1b", "none")], true);
+        assert_eq!(standing_of(&w, "c", "npub1a"), "trusted");
+        assert_eq!(standing_of(&w, "c", "npub1b"), "none");
+        assert_eq!(standing_of(&w, "c", "npub1c"), "absent", "read, and not listed");
+    }
+
+    /// The roster is what bounds the percentage ceiling, so an unfilled one
+    /// must count as zero — which `adjudicate` reads as a failed read and
+    /// spares, rather than as a community with no members and no ceiling.
+    #[test]
+    fn an_unknown_roster_counts_as_zero() {
+        assert_eq!(roster_size(&watches_with(&[("a", "none")], false), "c"), 0);
+        assert_eq!(roster_size(&watches_with(&[("a", "none")], true), "c"), 1);
+        assert_eq!(roster_size(&watches_with(&[], true), "c"), 0);
+        assert_eq!(roster_size(&watches_with(&[("a", "none")], true), "other"), 0);
+    }
+
+    /// Every community's state is its own.
+    #[test]
+    fn one_communitys_roster_never_answers_for_another() {
+        let a = Watch { standing: [("npub1a".to_string(), "trusted".to_string())].into_iter().collect(), known: true, ..Default::default() };
+        let b = Watch { standing: [("npub1a".to_string(), "none".to_string())].into_iter().collect(), known: true, ..Default::default() };
+        let w: Watches = Arc::new(Mutex::new([("one".to_string(), a), ("two".to_string(), b)].into_iter().collect()));
+
+        assert_eq!(standing_of(&w, "one", "npub1a"), "trusted");
+        assert_eq!(standing_of(&w, "two", "npub1a"), "none", "the same member, judged where they are");
+    }
+
+    /// The conviction id is the line between an offense and an echo of one.
+    #[test]
+    fn a_conviction_id_names_exactly_one_offense() {
+        let a = conviction_id("slurs", "msg1");
+        assert_eq!(a, conviction_id("slurs", "msg1"), "and is stable");
+        assert_ne!(a, conviction_id("slurs", "msg2"));
+        assert_ne!(a, conviction_id("links", "msg1"));
+        assert!(!a.contains("policy"), "the rulebook version is not part of the offense");
+        // Ids the two clocks mint for the same message must match, or one
+        // offense is charged twice.
+        assert!(a.starts_with("msg:"), "the shape the live screen mints too");
+    }
 }

@@ -350,4 +350,114 @@ mod tests {
             }
         }
     }
+
+    /// The community-emptying guard, across every roster size that rounds
+    /// badly. A ceiling of zero halted the ladder forever; a ceiling that
+    /// counted the current subject halted it on the first sentence of the hour.
+    #[test]
+    fn the_roster_ceiling_is_at_least_one_and_never_counts_the_subject() {
+        let cfg = policy();
+        for roster in 1..=200usize {
+            let ceiling = roster_ceiling(&cfg, roster).expect("a non-empty roster has a ceiling");
+            assert!(ceiling >= 1, "roster {roster} allows nothing at all");
+            assert!(ceiling <= roster, "roster {roster} allows more than everyone");
+
+            // The first person of the hour is always reachable.
+            let f = Facts { roster, subjects_this_hour: 0, ..facts() };
+            assert!(
+                matches!(adjudicate(&cfg, all_powers(), &f, Response::Warn), Sentence::Carry { .. }),
+                "roster {roster} cannot answer anybody"
+            );
+
+            // And someone already inside the bound can still be escalated,
+            // because the ladder climbs and one member spends several rows.
+            let f = Facts { roster, subjects_this_hour: ceiling - 1, ..facts() };
+            assert!(
+                matches!(adjudicate(&cfg, all_powers(), &f, Response::Kick), Sentence::Carry { .. }),
+                "roster {roster} cannot escalate a member already inside the bound"
+            );
+
+            // One distinct person past it halts.
+            let f = Facts { roster, subjects_this_hour: ceiling, ..facts() };
+            assert!(
+                matches!(adjudicate(&cfg, all_powers(), &f, Response::Kick), Sentence::Halt { .. }),
+                "roster {roster} does not halt at its own ceiling"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_roster_is_a_failed_read_not_an_empty_community() {
+        let cfg = policy();
+        assert_eq!(roster_ceiling(&cfg, 0), None);
+        let f = Facts { roster: 0, ..facts() };
+        assert_eq!(adjudicate(&cfg, all_powers(), &f, Response::Warn), Sentence::Spare { why: "roster unknown" });
+    }
+
+    /// The ceilings answer in a fixed order, and each one names itself.
+    #[test]
+    fn each_ceiling_is_reported_as_itself() {
+        let cfg = policy();
+        let f = Facts { acted_this_pass: cfg.limits.max_actions_per_run, ..facts() };
+        assert_eq!(adjudicate(&cfg, all_powers(), &f, Response::Warn), Sentence::Held { why: "run ceiling" });
+
+        let f = Facts { acted_this_hour: cfg.limits.max_actions_per_hour, ..facts() };
+        assert_eq!(adjudicate(&cfg, all_powers(), &f, Response::Warn), Sentence::Held { why: "hourly ceiling" });
+    }
+
+    /// Standing outranks every ceiling: a shielded member is spared whatever
+    /// else is true, so no ordering change can turn a shield into a removal.
+    #[test]
+    fn standing_is_answered_before_anything_else() {
+        let cfg = policy();
+        for shield in ["protected", "trusted", "unknown", "absent"] {
+            let f = Facts {
+                shield,
+                acted_this_pass: 9999,
+                acted_this_hour: 9999,
+                subjects_this_hour: 9999,
+                roster: 1,
+                is_me: false,
+            };
+            assert!(
+                matches!(adjudicate(&cfg, Powers::default(), &f, Response::Ban), Sentence::Spare { .. }),
+                "{shield} must be spared before any other answer"
+            );
+        }
+    }
+
+    /// And Sentinel outranks even that.
+    #[test]
+    fn sentinel_is_spared_before_standing_is_even_read() {
+        let cfg = policy();
+        let f = Facts { is_me: true, shield: "none", roster: 0, ..facts() };
+        assert_eq!(adjudicate(&cfg, all_powers(), &f, Response::Ban), Sentence::Spare { why: "self" });
+    }
+
+    /// A permission this community never granted is named, not attempted.
+    #[test]
+    fn every_response_reports_the_permission_it_needs() {
+        let cfg = policy();
+        let none = Powers::default();
+        assert_eq!(
+            adjudicate(&cfg, none, &facts(), Response::DeleteAndWarn),
+            Sentence::Powerless { needs: "MANAGE_MESSAGES" }
+        );
+        assert_eq!(adjudicate(&cfg, none, &facts(), Response::Kick), Sentence::Powerless { needs: "KICK" });
+        assert_eq!(adjudicate(&cfg, none, &facts(), Response::Ban), Sentence::Powerless { needs: "BAN" });
+        // A warning needs nothing but a DM.
+        assert!(matches!(adjudicate(&cfg, none, &facts(), Response::Warn), Sentence::Carry { .. }));
+    }
+
+    /// Arming decides only whether it happens, never whether it is decided.
+    #[test]
+    fn arming_is_the_last_word_and_changes_nothing_else() {
+        let mut cfg = policy();
+        let dry = adjudicate(&cfg, all_powers(), &facts(), Response::Warn);
+        assert_eq!(dry, Sentence::Carry { response: Response::Warn, armed: false });
+
+        cfg.arm.warn = true;
+        let live = adjudicate(&cfg, all_powers(), &facts(), Response::Warn);
+        assert_eq!(live, Sentence::Carry { response: Response::Warn, armed: true });
+    }
 }
