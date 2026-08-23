@@ -146,13 +146,16 @@ respect_protected = true        # the owner and moderators are never Sentinel's 
 # and nothing about how Sentinel judges one community reaches another: separate
 # rulebooks, ladders, arming, tripwires and strike history.
 #
+# A key Sentinel does not know is refused at boot rather than ignored, so a
+# typo names itself instead of quietly leaving the default in place.
+#
 # Sentinel also reads what each community actually PERMITS it to do. Being a
 # member is not being a moderator: a community can grant MANAGE_MESSAGES and
 # withhold BAN, and a sentence it cannot carry out is reported as such rather
 # than attempted. The boot line says which powers it has where.
 #
 # [community."fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea"]
-# arm = { warn = true, delete = true, kick = true, ban = false, raid = false, vision = false }
+# arm = { warn = true, delete = true, kick = true, ban = false, raid = false }
 #
 # Overrides fold FIELD by field, so naming one thing leaves the rest of your
 # settings alone:

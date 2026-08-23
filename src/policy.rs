@@ -28,7 +28,7 @@ pub struct CommunityPolicy {
 /// A per-community override block. Every field is optional and falls back to
 /// the top-level default, so an operator names only what differs.
 #[derive(Debug, Clone, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Overrides {
     pub arm: Option<ArmOverride>,
     pub limits: Option<LimitsOverride>,
@@ -42,7 +42,7 @@ pub struct Overrides {
 /// operator had customised globally back to library defaults — naming one
 /// tighter limit silently loosened the other two.
 #[derive(Debug, Clone, Copy, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ArmOverride {
     pub warn: Option<bool>,
     pub delete: Option<bool>,
@@ -52,7 +52,7 @@ pub struct ArmOverride {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RulesOverride {
     pub window_hours: Option<u64>,
     pub window_messages: Option<usize>,
@@ -65,7 +65,7 @@ pub struct RulesOverride {
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LimitsOverride {
     pub max_actions_per_run: Option<usize>,
     pub max_actions_per_hour: Option<usize>,
@@ -73,7 +73,7 @@ pub struct LimitsOverride {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LadderOverride {
     pub strikes: Option<StrikesOverride>,
     pub decay_half_life_hours: Option<u64>,
@@ -88,7 +88,7 @@ pub struct LadderOverride {
 /// producing a loosening the validator cannot see, since the result still
 /// ascends.
 #[derive(Debug, Clone, Copy, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct StrikesOverride {
     pub note: Option<u32>,
     pub minor: Option<u32>,
@@ -106,14 +106,14 @@ impl StrikesOverride {
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ShieldsOverride {
     pub respect_trusted: Option<bool>,
     pub respect_protected: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RaidOverride {
     pub min_confidence: Option<u32>,
     pub response: Option<crate::config::RaidResponse>,

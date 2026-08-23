@@ -48,6 +48,19 @@ pub fn validate_policy(p: &crate::policy::CommunityPolicy, whose: &str) -> Resul
     if p.ladder.decay_half_life_hours == 0 {
         return at("ladder.decay_half_life_hours = 0: strikes would never be forgiven, and the dedup horizon collapses".into());
     }
+    // A century. Beyond it nothing decays within any real total's lifetime, so
+    // the setting means "never forgive" while looking like a number — and it
+    // takes pruning with it, since the janitor's horizon is 32 half-lives.
+    if p.ladder.decay_half_life_hours > 24 * 365 * 100 {
+        return at(format!(
+            "ladder.decay_half_life_hours = {}: nothing would decay in any lifetime, and the janitor would never \
+             prune. Say so with a large-but-real half-life, or leave the class unarmed.",
+            p.ladder.decay_half_life_hours
+        ));
+    }
+    if s.grave == 0 {
+        return at("ladder.strikes.grave = 0: every offense is worth nothing, so no total ever answers to anything".into());
+    }
     // A rehearsal records nothing, so an unarmed rung is never answered and the
     // ladder cannot climb past it. Arming kick while warn is off therefore
     // rehearses a warning forever and never kicks anybody.
@@ -81,6 +94,14 @@ pub fn validate_policy(p: &crate::policy::CommunityPolicy, whose: &str) -> Resul
             p.raid.min_confidence
         ));
     }
+    if p.raid.min_confidence < 50 {
+        return at(format!(
+            "raid.min_confidence = {} is below the engine's own actionable floor of 50. Containment is the one \
+             path that acts on inference, and a bar this low contains members over evidence the engine itself \
+             would not act on.",
+            p.raid.min_confidence
+        ));
+    }
     if p.raid.max_batch == 0 || p.raid.max_batch > 500 {
         return at(format!(
             "raid.max_batch = {}: must be 1..=500 (the wire rejects an over-cap banlist whole)",
@@ -93,8 +114,12 @@ pub fn validate_policy(p: &crate::policy::CommunityPolicy, whose: &str) -> Resul
     if p.raid.tripwire_secs == 0 || p.raid.tripwire_secs > 86_400 {
         return at("raid.tripwire_secs must be 1..=86400".into());
     }
-    if p.raid.tripwire_cooldown_secs > 86_400 {
-        return at("raid.tripwire_cooldown_secs must be at most 86400".into());
+    if p.raid.tripwire_cooldown_secs == 0 || p.raid.tripwire_cooldown_secs > 86_400 {
+        return at(
+            "raid.tripwire_cooldown_secs must be 1..=86400: with no cooldown every message of a wave trips a full \
+             evaluation, which is the cost the tripwire exists to ration"
+                .into(),
+        );
     }
     if p.raid.claim_ttl_secs == 0 || p.raid.claim_ttl_secs > 30 * 86_400 {
         return at("raid.claim_ttl_secs must be 1..=2592000 (0 would re-contain the same wave every sweep)".into());
@@ -103,10 +128,28 @@ pub fn validate_policy(p: &crate::policy::CommunityPolicy, whose: &str) -> Resul
         if r.patterns.is_empty() {
             return at(format!("rules.words '{}' has no patterns", r.id));
         }
+        // The matcher drops an empty needle, so the rule is configured, armed
+        // and silently matches nothing.
+        if let Some(bad) = r.patterns.iter().find(|pat| pat.trim().is_empty() || pat.trim() == "*") {
+            return at(format!("rules.words '{}' has the pattern {bad:?}, which matches nothing", r.id));
+        }
     }
     for r in &p.rules.links {
         if r.domains.is_empty() {
             return at(format!("rules.links '{}' has no domains", r.id));
+        }
+        if let Some(bad) = r.domains.iter().find(|d| d.trim().is_empty()) {
+            return at(format!("rules.links '{}' has the domain {bad:?}, which matches nothing", r.id));
+        }
+    }
+    // The rulebook the ENGINE will accept, not the one Sentinel can describe.
+    // A window over the cap, a duplicate or over-long rule id, or too many
+    // patterns is rejected whole at install time — which surfaced as one
+    // stderr line per pass, beside a healthy heartbeat, with the community
+    // running no custom rulebook at all.
+    if let Some(policy) = crate::rules::compile(p) {
+        if let Err(e) = policy.build() {
+            return at(format!("the engine refuses this rulebook: {e}"));
         }
     }
     Ok(())
@@ -141,7 +184,7 @@ impl Gravity {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub bot: Bot,
     pub arm: Arm,
@@ -157,7 +200,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Bot {
     /// Env var holding the nsec — never the key itself, in any file.
     pub nsec_env: String,
@@ -181,7 +224,7 @@ impl Default for Bot {
 /// of them clears that community's slate, so a rehearsal never becomes a
 /// backlog the armed run discharges at once.
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Arm {
     pub warn: bool,
     pub delete: bool,
@@ -191,7 +234,7 @@ pub struct Arm {
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Limits {
     pub max_actions_per_run: usize,
     pub max_actions_per_hour: usize,
@@ -207,7 +250,7 @@ impl Default for Limits {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Rules {
     pub window_hours: u64,
     pub window_messages: usize,
@@ -238,6 +281,7 @@ impl Default for Rules {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WordRule {
     pub id: String,
     pub patterns: Vec<String>,
@@ -245,6 +289,7 @@ pub struct WordRule {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LinkRule {
     pub id: String,
     pub domains: Vec<String>,
@@ -252,6 +297,7 @@ pub struct LinkRule {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RateRule {
     pub enabled: bool,
     pub per_secs: u64,
@@ -259,13 +305,14 @@ pub struct RateRule {
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToggleRule {
     pub enabled: bool,
     pub gravity: Gravity,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Ladder {
     /// What one offense of each gravity is worth.
     pub strikes: Strikes,
@@ -276,7 +323,7 @@ pub struct Ladder {
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Strikes {
     pub note: u32,
     pub minor: u32,
@@ -302,6 +349,7 @@ impl Strikes {
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Step {
     pub at: u32,
     pub response: Response,
@@ -363,7 +411,7 @@ impl Default for Ladder {
 /// The media lane. Off by default: it ships bytes to a model, and that is a
 /// decision an operator makes rather than inherits.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct VisionCfg {
     pub enabled: bool,
     /// llama.cpp's server speaks the OpenAI-compatible shape, so local and
@@ -389,6 +437,7 @@ pub struct VisionCfg {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VisionLabel {
     pub name: String,
     /// 0.0..=1.0. A label with no threshold would flag everything.
@@ -441,7 +490,7 @@ impl VisionCfg {
 /// one event, and escalating through warnings while a hundred accounts post the
 /// same line is the wrong shape.
 #[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Raid {
     /// Confidence a suspect must reach to be contained. 75 is the Alert band's
     /// floor — the engine's own word for "convinced".
@@ -500,7 +549,7 @@ impl Default for Raid {
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Shields {
     /// A Trusted member is queued for a human, never actioned.
     pub respect_trusted: bool,
@@ -560,6 +609,38 @@ impl Config {
                         l.name, l.threshold
                     ));
                 }
+            }
+            let mut seen = std::collections::HashSet::new();
+            for l in &self.vision.labels {
+                // `over_threshold` takes the first match, so a second entry's
+                // threshold and gravity are silently ignored.
+                if !seen.insert(l.name.as_str()) {
+                    return Err(format!("vision label '{}' is listed twice; the second is ignored", l.name));
+                }
+                if l.name.trim().is_empty() {
+                    return Err("a vision label has no name".into());
+                }
+            }
+            // Every one of these turns the lane into a machine for announcing
+            // that it judged nothing: configured, running, and structurally
+            // unable to answer.
+            if self.vision.mimes.is_empty() {
+                return Err("vision.mimes is empty: nothing would ever be sent to the model".into());
+            }
+            if self.vision.max_bytes == 0 {
+                return Err("vision.max_bytes = 0: every attachment is refused as oversize".into());
+            }
+            if self.vision.max_per_min == 0 {
+                return Err("vision.max_per_min = 0: the minute's allowance is spent before it starts".into());
+            }
+            if self.vision.timeout_secs == 0 {
+                return Err("vision.timeout_secs = 0: every classification times out unanswered".into());
+            }
+            if self.vision.model.trim().is_empty() {
+                return Err("vision.model is empty".into());
+            }
+            if self.vision.base_url.trim().is_empty() {
+                return Err("vision.base_url is empty".into());
             }
             if !self.vision.is_local() && !self.vision.allow_remote {
                 return Err(format!(
@@ -676,5 +757,110 @@ mod tests {
         let p = Config::default().for_community("aa");
         assert_eq!(p.gravity_of("nonexistent", "severe"), Gravity::Grave);
         assert_eq!(p.gravity_of("nonexistent", "nonsense"), Gravity::Note);
+    }
+}
+
+#[cfg(test)]
+mod unknown_key_tests {
+    use super::*;
+
+    /// The shipped example documented `arm.vision`, which no struct has and
+    /// nothing in the crate reads. Serde dropped it, validation passed, and the
+    /// media lane went on judging that community — an operator following the
+    /// example believed they had turned it off.
+    #[test]
+    fn a_key_sentinel_does_not_know_is_a_boot_error() {
+        for (text, key) in [
+            ("[arm]\nwarn = true\nvision = false", "vision"),
+            ("[limits]\nhalt_if_over_pc = 50", "halt_if_over_pc"),
+            ("[ladder]\ndecay_half_life_hour = 72", "decay_half_life_hour"),
+            ("[community.\"aa\".arm]\nraids = true", "raids"),
+            ("[community.\"aa\".vision]\nenabled = false", "vision"),
+            ("[rules]\nwindow_hour = 72", "window_hour"),
+        ] {
+            let err = toml::from_str::<Config>(text).unwrap_err().to_string();
+            assert!(err.contains(key), "a typo must name itself, got: {err}");
+        }
+    }
+
+    /// Values that parse, validate today, and then make the thing they
+    /// configure structurally unable to do its job.
+    #[test]
+    fn a_config_that_can_only_fail_is_refused_at_boot() {
+        let label = "[[vision.labels]]\nname = \"gore\"\nthreshold = 0.9\ngravity = \"grave\"";
+        let cases: &[(String, &str)] = &[
+            (format!("[vision]\nenabled = true\nmimes = []\n{label}"), "mimes"),
+            (format!("[vision]\nenabled = true\nmax_bytes = 0\n{label}"), "max_bytes"),
+            (format!("[vision]\nenabled = true\nmax_per_min = 0\n{label}"), "max_per_min"),
+            (format!("[vision]\nenabled = true\ntimeout_secs = 0\n{label}"), "timeout_secs"),
+            (format!("[vision]\nenabled = true\nmodel = \"\"\n{label}"), "model"),
+            (format!("[vision]\nenabled = true\n{label}\n{label}"), "listed twice"),
+            ("[raid]\nmin_confidence = 0".into(), "min_confidence"),
+            ("[raid]\ntripwire_cooldown_secs = 0".into(), "tripwire_cooldown_secs"),
+            ("[ladder]\ndecay_half_life_hours = 100000000".into(), "decay_half_life_hours"),
+            ("[ladder]\nstrikes = { note = 0, minor = 0, serious = 0, grave = 0 }".into(), "grave = 0"),
+            ("[[rules.words]]\nid = \"x\"\npatterns = [\"\"]\ngravity = \"minor\"".into(), "matches nothing"),
+            ("[[rules.links]]\nid = \"x\"\ndomains = [\"\"]\ngravity = \"minor\"".into(), "matches nothing"),
+        ];
+        for (text, needle) in cases {
+            let cfg: Config = toml::from_str(text).unwrap_or_else(|e| panic!("{text:?} should parse: {e}"));
+            match Config::validate_for_test(&cfg) {
+                Ok(()) => panic!("{text:?} must be refused at boot"),
+                Err(err) => assert!(err.contains(needle), "the error must name {needle}, got: {err}"),
+            }
+        }
+    }
+
+    /// The rulebook the ENGINE will take, not the one Sentinel can describe.
+    /// These all installed as an error line per pass, beside a healthy
+    /// heartbeat, with the community running no custom rulebook at all.
+    #[test]
+    fn a_rulebook_the_engine_refuses_is_refused_at_boot() {
+        let cases: &[(&str, &str)] = &[
+            ("[rules]\nwindow_hours = 2160\n[[rules.words]]\nid = \"a\"\npatterns = [\"x\"]\ngravity = \"minor\"", "engine refuses"),
+            ("[rules]\nwindow_messages = 10000\n[[rules.words]]\nid = \"a\"\npatterns = [\"x\"]\ngravity = \"minor\"", "engine refuses"),
+            ("[[rules.words]]\nid = \"dup\"\npatterns = [\"x\"]\ngravity = \"minor\"\n[[rules.words]]\nid = \"dup\"\npatterns = [\"y\"]\ngravity = \"minor\"", "engine refuses"),
+            ("[[rules.words]]\nid = \"\"\npatterns = [\"x\"]\ngravity = \"minor\"", "engine refuses"),
+        ];
+        for (text, needle) in cases {
+            let cfg: Config = toml::from_str(text).unwrap_or_else(|e| panic!("{text:?} should parse: {e}"));
+            match Config::validate_for_test(&cfg) {
+                Ok(()) => panic!("{text:?} must be refused at boot"),
+                Err(e) => assert!(e.contains(needle), "the error must name {needle}, got: {e}"),
+            }
+        }
+    }
+
+    /// And every key the example file actually uses still parses.
+    #[test]
+    fn the_shipped_example_parses() {
+        let text = std::fs::read_to_string("sentinel.example.toml").expect("the example ships with the crate");
+        let cfg: Config = toml::from_str(&text).expect("the example Sentinel ships must load");
+        Config::validate_for_test(&cfg).expect("and must validate");
+    }
+
+    /// The commented-out blocks are the part operators actually copy, and
+    /// nothing checked them: the example documented an `arm.vision` key that no
+    /// struct has and nothing reads, so following it turned nothing off.
+    /// Uncommenting the whole file must still produce a config Sentinel accepts.
+    #[test]
+    fn every_commented_example_is_real_config() {
+        let text = std::fs::read_to_string("sentinel.example.toml").expect("the example ships with the crate");
+        let uncommented: String = text
+            .lines()
+            .map(|l| {
+                let body = l.trim_start().strip_prefix("# ").unwrap_or(l);
+                let looks_like_config = body.starts_with('[')
+                    || body.split('=').next().is_some_and(|k| {
+                        !k.is_empty() && k.trim().chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    }) && body.contains('=');
+                if looks_like_config { body } else { "" }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let cfg: Config = toml::from_str(&uncommented)
+            .unwrap_or_else(|e| panic!("a commented example is not valid config: {e}"));
+        Config::validate_for_test(&cfg).expect("and the example must describe a config that validates");
     }
 }
