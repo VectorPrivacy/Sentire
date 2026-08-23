@@ -49,10 +49,17 @@ pub(crate) async fn enforce(
     let Some(response) = select_rung(&ctx.policy, |r| ctx.powers.can_deliver(r), store, community.id(), &v.npub, strikes, now)
         .map_err(vector_sdk::Error::Other)?
     else {
-        // Nothing owed, or every rung above what they last received is one this
-        // community withholds. Which of the two it is comes from the boot line
-        // and `/status`, both of which name the powers Sentinel holds here —
-        // printing it per member per poll would say the same thing forever.
+        // The one case worth a line: a member at the top of the ladder keeps
+        // offending and keeps being answered with silence, which reads exactly
+        // like a bot that has stopped working. The other reasons — nothing
+        // owed, a rung this community withholds — repeat every poll and are
+        // already on the boot line and in `/status`.
+        let total = ladder::total(strikes, now, ctx.policy.ladder.decay_half_life_hours);
+        if ladder::owed(&ctx.policy.ladder, strikes, [], |r| ctx.powers.can_deliver(r), now, ctx.policy.ladder.decay_half_life_hours)
+            .is_some_and(|r| r == Response::Ban)
+        {
+            println!("[{id}] TOP     {who} — {total} strike(s), already at the top rung — a person decides from here");
+        }
         return Ok(Outcome::AlreadyAnswered);
     };
 
