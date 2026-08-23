@@ -185,9 +185,10 @@ pub(crate) async fn sweep(
     if !halted {
         let owed = store.subjects_with_strikes(community.id()).map_err(vector_sdk::Error::Other)?;
         let roster = roster_map(wires, community.id());
-        for (npub, shield) in debt_subjects(&handled, &roster, owed, me) {
+        for (npub, shield) in debt_subjects(&ctx.policy, &handled, &roster, owed, me) {
             let strikes = store.strikes(community.id(), &npub).map_err(vector_sdk::Error::Other)?;
-            let v = own_verdict(&npub, shield, store.evidence(community.id(), &npub).unwrap_or_default(), vec![]);
+            let evidence = store.evidence(community.id(), &npub).map_err(vector_sdk::Error::Other)?;
+            let v = own_verdict(&npub, shield, evidence, vec![]);
             if enforce(bot, community, &ctx, store, wires, &pass, &v, &strikes).await? == Outcome::Halted {
                 halted = true;
                 break;
@@ -454,6 +455,7 @@ pub(crate) fn heartbeat(community: &str, verdicts: &Verdicts, found: usize, powe
 /// answers "absent" for anyone off-roster handed the gate a value meaning
 /// "not shielded" for every single subject.
 pub(crate) fn debt_subjects(
+    policy: &crate::policy::CommunityPolicy,
     handled: &std::collections::HashSet<String>,
     roster: &std::collections::HashMap<String, String>,
     owed: Vec<String>,
@@ -462,6 +464,11 @@ pub(crate) fn debt_subjects(
     owed.into_iter()
         .filter(|n| !handled.contains(n) && n != me)
         .filter_map(|n| roster.get(&n).cloned().map(|shield| (n, shield)))
+        // Standing spares them wherever they are read, so sending them on to
+        // `enforce` only prints that it spared them — every pass, for as long
+        // as a strike row survives, which is how a moderator came to be named
+        // in the log forever.
+        .filter(|(_, shield)| crate::adjudicate::spared_by_standing(policy, shield).is_none())
         .collect()
 }
 
@@ -506,13 +513,31 @@ mod tests {
             "npub1me".to_string(),
             "npub1departed".to_string(),
         ];
-        let got = debt_subjects(&handled, &r, owed, "npub1me");
+        let got = debt_subjects(&base(), &handled, &r, owed, "npub1me");
 
         assert!(got.iter().any(|(n, _)| n == "npub1vision"), "the case this loop exists for");
-        assert!(got.iter().any(|(n, s)| n == "npub1trusted" && s == "trusted"), "with their REAL standing");
         assert!(!got.iter().any(|(n, _)| n == "npub1handled"), "already sentenced this pass");
         assert!(!got.iter().any(|(n, _)| n == "npub1me"), "never itself");
         assert!(!got.iter().any(|(n, _)| n == "npub1departed"), "not on the roster, not ours to judge");
+        assert!(
+            !got.iter().any(|(n, _)| n == "npub1trusted"),
+            "standing spares them wherever they are read, so passing them on only prints that it did — \
+             every pass, for as long as a strike row survives"
+        );
+    }
+
+    /// And a community that has chosen to reach its regulars does reach them.
+    #[test]
+    fn the_debt_loop_follows_this_communitys_shield_policy() {
+        let r = roster(&[("npub1trusted", "trusted")]);
+        let owed = vec!["npub1trusted".to_string()];
+
+        let sparing = base();
+        assert!(debt_subjects(&sparing, &Default::default(), &r, owed.clone(), "me").is_empty());
+
+        let mut reaching = base();
+        reaching.shields.respect_trusted = false;
+        assert_eq!(debt_subjects(&reaching, &Default::default(), &r, owed, "me").len(), 1);
     }
 
     /// Every shield this loop emits must be one the gate recognises. "absent"
@@ -521,7 +546,7 @@ mod tests {
     fn the_debt_loop_never_emits_an_unresolved_standing() {
         let r = roster(&[("a", "none"), ("b", "trusted"), ("c", "protected"), ("d", "indeterminate")]);
         let owed = vec!["a".into(), "b".into(), "c".into(), "d".into(), "gone".into()];
-        for (_, shield) in debt_subjects(&Default::default(), &r, owed, "me") {
+        for (_, shield) in debt_subjects(&base(), &Default::default(), &r, owed, "me") {
             assert!(
                 matches!(shield.as_str(), "none" | "trusted" | "protected" | "indeterminate"),
                 "unresolved standing {shield} reached the gate"

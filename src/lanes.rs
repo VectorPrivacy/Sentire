@@ -353,22 +353,24 @@ pub(crate) async fn evaluate_now(
     me: &str,
 ) {
     let cid = community.id().to_string();
-    let r = cfg.for_community(&cid).raid;
-    println!(
-        "[{}] TRIPWIRE — {} distinct accounts inside {}s, evaluating now",
-        short(community.id()),
-        r.tripwire_accounts,
-        r.tripwire_secs
-    );
     // The 90-second memoisation is right for a background pass and far too slow
     // for a wave in progress.
     community.invalidate();
     match sweep(bot, community, cfg, store, wires, me).await {
         // Only a genuine race gives the trip back. Checking `sweeping`
         // beforehand was itself a race: both handlers could see false and the
-        // loser still lost its trip.
+        // loser still lost its trip. Said nothing either: during a long pass a
+        // wave would otherwise print this line once per message.
         Ok(Pass::Declined) => untrip(wires, community.id()),
-        Ok(_) => {}
+        Ok(_) => {
+            let r = cfg.for_community(&cid).raid;
+            println!(
+                "[{}] TRIPWIRE — {} distinct accounts inside {}s",
+                short(community.id()),
+                r.tripwire_accounts,
+                r.tripwire_secs
+            );
+        }
         Err(e) => eprintln!("{}: {e}", short(community.id())),
     }
 }

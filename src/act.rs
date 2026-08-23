@@ -134,12 +134,13 @@ pub(crate) async fn enforce(
         return Ok(Outcome::Failed);
     }
 
-    if let Err(e) = store.log_action(community.id(), &v.npub, name, now, &why) {
-        // The act ALREADY happened. Propagating would abort the pass and
-        // re-deliver it next poll — and a ban rotates the community's keys
-        // every time.
-        eprintln!("[{id}] {name} {who} happened but could not be recorded: {e}");
-    }
+    // A ledger that cannot be written must stop the pass. The act already
+    // happened and is now unrecorded either way, so the next poll re-delivers
+    // it — but continuing would spend the same failure on every other member
+    // too, and for a ban that is a key rotation each time.
+    store
+        .log_action(community.id(), &v.npub, name, now, &why)
+        .map_err(|e| vector_sdk::Error::Other(format!("{name} {who} happened but could not be recorded: {e}")))?;
     if armed {
         announce(bot, community, ctx, &format!("{name} {who} — {total} strike(s) — {why}")).await;
     }

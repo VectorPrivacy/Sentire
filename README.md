@@ -76,7 +76,8 @@ a member escalates once, not twice.
    re-report every standing conviction on every poll, so the conviction id is what separates
    an offense from an echo of one.
 3. Strikes **decay by halves**. Two serious offenses in a week reach a kick; the same pair a
-   week apart do not.
+   week apart do not — measured from when Sentinel SAW them. A verdict carries no timestamp
+   for its evidence, so a backfill after downtime charges an old pair as a fresh one.
 4. The running total meets the **ladder**, and Sentinel answers with the next rung up from
    whatever that member last received: warn, delete and warn, kick, ban. It climbs rather
    than jumping, so a member who accrued enough for a ban in one burst still gets warned
@@ -172,6 +173,9 @@ Three rules this lane keeps:
   the bytes say what it is. Anything claiming to be an image or a video is fetched and
   answered for, and whatever the operator did not list goes to a person — a client renders by
   extension, so a type Sentinel skipped in silence would still be on screen.
+- **One post is one sentence.** If the text screen already answered for a post, a flagged
+  attachment on it is recorded but not answered again — so the hide waits for the rung that
+  does the hiding. A post carrying only media is answered immediately.
 - **One community's flood is its own.** The classifier budget is per community, and its
   single permit is held from before the fetch, so a wave in one room cannot spend the minute
   of another. That bounds each community to one blob in memory at a time — N watched
