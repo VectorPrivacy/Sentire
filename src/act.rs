@@ -49,15 +49,10 @@ pub(crate) async fn enforce(
     let Some(response) = select_rung(&ctx.policy, |r| ctx.powers.can_deliver(r), store, community.id(), &v.npub, strikes, now)
         .map_err(vector_sdk::Error::Other)?
     else {
-        // Three states used to collapse into one wordless return: nothing owed,
-        // already answered, and every remaining rung undeliverable here. The
-        // last is the one a stuck bot spends its life in.
-        // Only when powerlessness is the REASON: with any ladder that has a
-        // warn step, `Warn` is always deliverable, so this would otherwise fire
-        // for every already-answered member of a permissionless community.
-        if !ctx.powers.any() && ladder::decide(&ctx.policy.ladder, ladder::total(strikes, now, ctx.policy.ladder.decay_half_life_hours)).is_some_and(|r| r != Response::Warn) {
-            println!("[{id}] CANNOT answer {who} — this community grants Sentinel no moderation powers");
-        }
+        // Nothing owed, or every rung above what they last received is one this
+        // community withholds. Which of the two it is comes from the boot line
+        // and `/status`, both of which name the powers Sentinel holds here —
+        // printing it per member per poll would say the same thing forever.
         return Ok(Outcome::AlreadyAnswered);
     };
 

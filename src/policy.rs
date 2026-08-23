@@ -274,11 +274,6 @@ impl Powers {
         }
     }
 
-    /// Can Sentinel do anything at all here?
-    pub fn any(&self) -> bool {
-        self.hide || self.kick || self.ban
-    }
-
     /// One line for the boot log, so an operator sees what Sentinel can and
     /// cannot do somewhere before it matters.
     pub fn describe(&self) -> String {
