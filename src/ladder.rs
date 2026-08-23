@@ -14,18 +14,25 @@ pub struct Strike {
 /// after two, never negative and never rounded up. Forgiveness is built in
 /// rather than being a pardon someone has to remember to issue.
 pub fn total(strikes: &[Strike], now_ms: u64, half_life_hours: u64) -> u32 {
-    let half_life_ms = half_life_hours.saturating_mul(3_600_000);
     strikes
         .iter()
-        .map(|s| {
-            let age = now_ms.saturating_sub(s.at_ms);
-            // Integer halvings: cheap, monotone, and exact at the boundaries.
-            let halvings = if half_life_ms == 0 { 0 } else { age / half_life_ms };
-            if halvings >= 32 { 0 } else { s.worth >> halvings }
-        })
+        .map(|s| decay(s.worth, now_ms.saturating_sub(s.at_ms), half_life_hours))
         // Saturating: a total that wrapped would read as almost clean, which is
         // silent UNDER-enforcement and the worse direction to fail in.
         .fold(0u32, u32::saturating_add)
+}
+
+/// One value aged by the same halving the ladder forgives strikes with.
+///
+/// Integer halvings: cheap, monotone, and exact at the boundaries.
+pub fn decay(worth: u32, age_ms: u64, half_life_hours: u64) -> u32 {
+    let half_life_ms = half_life_hours.saturating_mul(3_600_000);
+    let halvings = if half_life_ms == 0 { 0 } else { age_ms / half_life_ms };
+    if halvings >= 32 {
+        0
+    } else {
+        worth >> halvings
+    }
 }
 
 /// The highest step this total has reached, if any. Below the first step,

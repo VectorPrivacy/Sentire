@@ -18,6 +18,55 @@ use crate::{
 };
 use crate::raid;
 
+/// One strike this verdict earns: the id it dedups on, what it is worth, and
+/// the line a person reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Charge {
+    pub(crate) conviction: String,
+    pub(crate) worth: u32,
+    pub(crate) evidence: String,
+}
+
+/// What one verdict charges, decided without touching the store.
+///
+/// Only the BASIS gates a strike: deterministic evidence charges, inference
+/// never does. The member's overall score is not consulted — it answers "is
+/// this enough to act on unattended", which is the ladder's question, not the
+/// ledger's, and gating here meant a light rule never accumulated at all.
+pub(crate) fn charges(v: &vector_sdk::policy::Verdict, policy: &crate::policy::CommunityPolicy) -> Vec<Charge> {
+    // A content rule convicts at BOTH scopes over the same citations, so the
+    // window rung is dropped where the per-message charges already cover the
+    // evidence. `messages` shorter than `citation_count` means they do not.
+    let charged_per_message: std::collections::HashSet<&str> = v
+        .findings
+        .iter()
+        .filter(|f| f.stateless && f.is_proven() && !f.messages.is_empty() && f.citation_count as usize <= f.messages.len())
+        .map(|f| f.rule_id.as_str())
+        .collect();
+
+    let mut out = Vec::new();
+    for f in &v.findings {
+        if !f.is_proven() {
+            continue; // inference never earns a strike
+        }
+        if !f.stateless && charged_per_message.contains(f.rule_id.as_str()) {
+            continue;
+        }
+        let worth = policy.ladder.strikes.worth(policy.gravity_of(&f.rule_id, &f.severity));
+        let evidence = format!("{} [{}] {}×", f.rule_id, f.severity, f.hits);
+        if f.stateless {
+            // Under the id the live screen would have used, so whichever clock
+            // reached the message first wins and the other is an ignored insert.
+            for mid in &f.messages {
+                out.push(Charge { conviction: conviction_id(&f.rule_id, mid), worth, evidence: evidence.clone() });
+            }
+            continue;
+        }
+        out.push(Charge { conviction: f.conviction_id.clone(), worth, evidence });
+    }
+    out
+}
+
 /// One pass: verdicts in, strikes recorded, ladder consulted, sentences
 /// rehearsed or carried out.
 pub(crate) async fn sweep(
@@ -89,7 +138,13 @@ pub(crate) async fn sweep(
     // `all()`, not `proven()`: the shielded are filtered out upstream by
     // `proven()`, so gating on them inside that loop could never fire and the
     // operator never saw who was spared.
-    for v in verdicts.all().filter(|v| v.is_proven()) {
+    //
+    // Gated on the FINDINGS, not the member's score. `Verdict::is_proven` asks
+    // whether the total is enough to act on unattended; that is the ladder's
+    // question. A note-gravity rule never reaches it at any hit count, so
+    // asking it here meant light rules accumulated nothing and a small offense
+    // was charged only when an unrelated grave one carried the score.
+    for v in verdicts.all().filter(|v| v.findings.iter().any(|f| f.is_proven())) {
         if v.npub == me {
             continue;
         }
@@ -106,50 +161,8 @@ pub(crate) async fn sweep(
             continue;
         }
 
-        // Record what is NEW this poll. Verdicts re-report every standing
-        // conviction, so the conviction id is the line between an offense and
-        // an echo of one.
-        // Which rules already charged per message. A content rule convicts at
-        // BOTH scopes over the same citations, so charging the window rung too
-        // billed one offense twice — and pushed three flagged links from a kick
-        // to an instant ban.
-        // Only rules that actually CHARGED. A stateless finding that is
-        // unproven, or that cites no message, charges nothing — and still
-        // suppressed its rule's window rung, so the offense went to nobody.
-        let charged_per_message: std::collections::HashSet<&str> = v
-            .findings
-            .iter()
-            // `messages` may be shorter than `citation_count`, and then the
-            // per-message charges did NOT cover the evidence — so suppressing
-            // the window rung charged the worst offenders the least.
-            .filter(|f| f.stateless && f.is_proven() && !f.messages.is_empty() && f.citation_count as usize <= f.messages.len())
-            .map(|f| f.rule_id.as_str())
-            .collect();
-        for f in &v.findings {
-            if !f.is_proven() {
-                continue; // inference never earns a strike
-            }
-            if !f.stateless && charged_per_message.contains(f.rule_id.as_str()) {
-                continue; // the density charges already cover this evidence
-            }
-            let gravity = ctx.policy.gravity_of(&f.rule_id, &f.severity);
-            let worth = ctx.policy.ladder.strikes.worth(gravity);
-            let evidence = format!("{} [{}] {}×", f.rule_id, f.severity, f.hits);
-            if f.stateless {
-                // Charged per cited message, under the id the live screen would
-                // have used. Whichever clock got there first wins; the other is
-                // an ignored insert. Skipping these outright meant anything
-                // posted while Sentinel was down was never charged at all.
-                for mid in &f.messages {
-                    store
-                        .record(community.id(), &v.npub, &conviction_id(&f.rule_id, mid), worth, now, &evidence)
-                        .map_err(vector_sdk::Error::Other)?;
-                }
-                continue;
-            }
-            store
-                .record(community.id(), &v.npub, &f.conviction_id, worth, now, &evidence)
-                .map_err(vector_sdk::Error::Other)?;
+        for c in charges(v, &ctx.policy) {
+            store.record(community.id(), &v.npub, &c.conviction, c.worth, now, &c.evidence).map_err(vector_sdk::Error::Other)?;
         }
         let strikes = store.strikes(community.id(), &v.npub).map_err(vector_sdk::Error::Other)?;
         handled.insert(v.npub.clone());
@@ -255,12 +268,10 @@ pub(crate) async fn contain(
     }
 
     let verb = response.name();
-    // A ceiling that spans TIME, not one pass. `raid::select` halts only when a
-    // SINGLE pass is over the bar, so a sustained false positive contained 10%
-    // every two minutes and emptied the community in twenty — without the guard
-    // built to prevent exactly that ever firing.
-    // Containment's own bound: the ladder's hourly count excludes raid rows.
-    let spent = store.actions_last_hour(community.id(), now).map_err(vector_sdk::Error::Other)?;
+    // A ceiling that spans TIME, not one pass: `raid::select` halts only when a
+    // SINGLE pass is over the bar, so a sustained false positive contains a
+    // tenth every pass and empties the community without it ever firing.
+    let spent = store.contained_last_hour(community.id(), now).map_err(vector_sdk::Error::Other)?;
     // Claimed PER MEMBER, not per cohort. A wave arriving over many sweeps
     // grows the set every pass, so re-containing everyone already handled
     // means a key rotation each time.
@@ -284,10 +295,7 @@ pub(crate) async fn contain(
         return Ok(());
     }
 
-    // Measured against what will actually be acted on, after the claims — and
-    // across the HOUR. `raid::select` halts only on a single pass being over the
-    // bar, so a sustained false positive contained a tenth every two minutes and
-    // emptied a community in twenty without the guard ever firing.
+    // Measured against what will actually be acted on, after the claims.
     if let Some(ceiling) = adjudicate::roster_ceiling(&ctx.policy, ctx.roster) {
         if spent + fresh.len() > ceiling {
             let line = format!(
@@ -383,7 +391,7 @@ pub(crate) async fn contain(
     // against warn, delete and kick — permanently, on evidence nobody acted on.
     for npub in &done {
         store
-            .log_action(community.id(), npub, &format!("raid:{verb}"), now, "raid cohort")
+            .log_action(community.id(), npub, &format!("raid:{verb}"), now, 0, "raid cohort")
             .map_err(vector_sdk::Error::Other)?;
     }
     if armed {
@@ -473,6 +481,9 @@ mod tests {
         pairs.iter().map(|(n, s)| (n.to_string(), s.to_string())).collect()
     }
 
+    /// The population is "owed but not yet handled THIS pass", and every
+    /// subject carries the standing the roster actually lists.
+    #[test]
     fn the_debt_loop_reaches_current_members_the_pass_missed() {
         let r = roster(&[
             ("npub1vision", "none"),
@@ -497,6 +508,9 @@ mod tests {
         assert!(!got.iter().any(|(n, _)| n == "npub1departed"), "not on the roster, not ours to judge");
     }
 
+    /// Every shield this loop emits must be one the gate recognises. "absent"
+    /// falls through to "not shielded", so emitting it here is a ban path.
+    #[test]
     fn the_debt_loop_never_emits_an_unresolved_standing() {
         let r = roster(&[("a", "none"), ("b", "trusted"), ("c", "protected"), ("d", "indeterminate")]);
         let owed = vec!["a".into(), "b".into(), "c".into(), "d".into(), "gone".into()];

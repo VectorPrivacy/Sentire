@@ -10,7 +10,7 @@ use rusqlite::Connection;
 
 use crate::ladder::Strike;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
@@ -22,6 +22,11 @@ CREATE TABLE IF NOT EXISTS strikes (
     worth         INTEGER NOT NULL,
     at_ms         INTEGER NOT NULL,
     evidence      TEXT NOT NULL DEFAULT '',
+    -- A forgiven strike stays as a tombstone. The engine re-reports a standing
+    -- conviction for as long as its evidence sits in the window, so a deleted
+    -- row is re-inserted within one poll at full worth and a fresh timestamp:
+    -- the pardon would raise the total it was meant to clear.
+    pardoned      INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (community, subject, conviction_id)
 );
 CREATE TABLE IF NOT EXISTS actions (
@@ -29,7 +34,10 @@ CREATE TABLE IF NOT EXISTS actions (
     subject   TEXT NOT NULL,
     response  TEXT NOT NULL,
     at_ms     INTEGER NOT NULL,
-    evidence  TEXT NOT NULL DEFAULT ''
+    evidence  TEXT NOT NULL DEFAULT '',
+    -- The total this answered. The ladder climbs per OFFENSE, so a rung is
+    -- owed only once the total rises above the one already answered.
+    at_total  INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS classifications (
     content_hash TEXT NOT NULL,
@@ -38,12 +46,20 @@ CREATE TABLE IF NOT EXISTS classifications (
     at_ms        INTEGER NOT NULL,
     PRIMARY KEY (content_hash, model)
 );
-CREATE INDEX IF NOT EXISTS idx_strikes_live ON strikes(community, at_ms);
+CREATE INDEX IF NOT EXISTS idx_strikes_prune ON strikes(at_ms);
 CREATE INDEX IF NOT EXISTS idx_actions_subject ON actions(community, subject, at_ms);
 CREATE INDEX IF NOT EXISTS idx_actions_hour ON actions(community, at_ms);";
 
 pub struct Store {
     conn: Mutex<Connection>,
+}
+
+/// One answer already given, and the total it answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Answer {
+    pub response: String,
+    pub at_total: u32,
+    pub at_ms: u64,
 }
 
 impl Store {
@@ -59,6 +75,14 @@ impl Store {
             .unwrap_or(SCHEMA_VERSION);
         if stored > SCHEMA_VERSION {
             return Err(format!("{path} was written by a newer Sentinel (schema {stored} > {SCHEMA_VERSION})"));
+        }
+        if stored < SCHEMA_VERSION {
+            // The ledger is derived state: the engine re-reports every standing
+            // conviction, so a rebuilt slate costs one poll. Migrating it would
+            // cost a migration path per release for nothing.
+            conn.execute_batch("DROP TABLE IF EXISTS strikes; DROP TABLE IF EXISTS actions;")
+                .map_err(|e| e.to_string())?;
+            conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
         }
         conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema', ?1)", [SCHEMA_VERSION])
             .map_err(|e| e.to_string())?;
@@ -93,7 +117,7 @@ impl Store {
     pub fn strikes(&self, community: &str, subject: &str) -> Result<Vec<Strike>, String> {
         let conn = self.lock();
         let mut stmt = conn
-            .prepare("SELECT worth, at_ms FROM strikes WHERE community = ?1 AND subject = ?2")
+            .prepare("SELECT worth, at_ms FROM strikes WHERE community = ?1 AND subject = ?2 AND pardoned = 0")
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map(rusqlite::params![community, subject], |r| {
@@ -109,7 +133,7 @@ impl Store {
         let mut stmt = conn
             .prepare(
                 "SELECT evidence, MAX(at_ms) AS t FROM strikes WHERE community = ?1 AND subject = ?2 \
-                 AND evidence != '' GROUP BY evidence ORDER BY t DESC LIMIT 3",
+                 AND pardoned = 0 AND evidence != '' GROUP BY evidence ORDER BY t DESC, evidence LIMIT 3",
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
@@ -118,42 +142,52 @@ impl Store {
         Ok(rows.flatten().collect())
     }
 
+    /// Record an answer. `at_total` is the decayed total it answered, which is
+    /// what makes the next rung owed only once the total rises above it.
     pub fn log_action(
         &self,
         community: &str,
         subject: &str,
         response: &str,
         at_ms: u64,
+        at_total: u32,
         evidence: &str,
     ) -> Result<(), String> {
         self.lock()
             .execute(
-                "INSERT INTO actions (community, subject, response, at_ms, evidence) VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![community, subject, response, at_ms as i64, evidence],
+                "INSERT INTO actions (community, subject, response, at_ms, at_total, evidence) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![community, subject, response, at_ms as i64, at_total, evidence],
             )
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
 
-    /// The strongest response this member has already had.
+    /// The strongest answer this member has already had, with the total it
+    /// answered and when.
     ///
     /// Strongest, not latest: ordering by time let a later, lesser response
     /// reopen them to everything above it. Ranking happens in Rust so the
     /// severity order lives in exactly one place.
-    pub fn strongest_response(&self, community: &str, subject: &str) -> Result<Option<String>, String> {
+    pub fn strongest_response(&self, community: &str, subject: &str) -> Result<Option<Answer>, String> {
         let conn = self.lock();
         let mut stmt = conn
-            .prepare("SELECT response FROM actions WHERE community = ?1 AND subject = ?2")
+            .prepare("SELECT response, at_total, at_ms FROM actions WHERE community = ?1 AND subject = ?2")
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map(rusqlite::params![community, subject], |r| r.get::<_, String>(0))
+            .query_map(rusqlite::params![community, subject], |r| {
+                Ok(Answer {
+                    response: r.get::<_, String>(0)?,
+                    at_total: r.get::<_, i64>(1)? as u32,
+                    at_ms: r.get::<_, i64>(2)? as u64,
+                })
+            })
             .map_err(|e| e.to_string())?;
-        let mut best: Option<String> = None;
-        for name in rows.flatten() {
-            if crate::config::Response::rank_of(&name)
-                > best.as_deref().map(crate::config::Response::rank_of).unwrap_or(0)
-            {
-                best = Some(name);
+        let mut best: Option<Answer> = None;
+        for a in rows.flatten() {
+            let rank = crate::config::Response::rank_of(&a.response);
+            if rank > best.as_ref().map(|b| crate::config::Response::rank_of(&b.response)).unwrap_or(0) {
+                best = Some(a);
             }
         }
         Ok(best)
@@ -192,13 +226,32 @@ impl Store {
             .map_err(|e| e.to_string())
     }
 
+    /// People CONTAINED here in the last hour.
+    ///
+    /// Containment's own budget. The ladder's count deliberately excludes raid
+    /// rows, so reading it here measured an unrelated quantity: a raid ceiling
+    /// that could never see a raid, and that a single warning switched off.
+    /// Claims are excluded — a claim is a reservation, not a removal.
+    pub fn contained_last_hour(&self, community: &str, now_ms: u64) -> Result<usize, String> {
+        let since = now_ms.saturating_sub(3_600_000) as i64;
+        self.lock()
+            .query_row(
+                "SELECT COUNT(DISTINCT subject) FROM actions WHERE community = ?1 AND at_ms >= ?2 \
+                 AND response LIKE 'raid:%' AND response != 'raid:claim'",
+                rusqlite::params![community, since],
+                |r| r.get::<_, i64>(0).map(|n| n as usize),
+            )
+            .map_err(|e| e.to_string())
+    }
+
     /// Everyone carrying a strike here. The sweep's own population is whatever
     /// the engine reported, which never includes a media-only offender.
     pub fn subjects_with_strikes(&self, community: &str) -> Result<Vec<String>, String> {
         let conn = self.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT subject FROM strikes WHERE community = ?1 GROUP BY subject ORDER BY MIN(at_ms)",
+                "SELECT subject FROM strikes WHERE community = ?1 AND pardoned = 0 \
+                 GROUP BY subject ORDER BY MIN(at_ms), subject",
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
@@ -312,8 +365,16 @@ impl Store {
     /// wrong about somebody.
     pub fn pardon(&self, community: &str, subject: &str) -> Result<usize, String> {
         let conn = self.lock();
+        // Tombstoned, not deleted. The engine re-reports a standing conviction
+        // for as long as its evidence sits in the window, so a deleted row is
+        // re-inserted within one poll at full worth and a fresh timestamp —
+        // the pardon would raise the total it was asked to clear. `record` is
+        // INSERT OR IGNORE, so the tombstone survives every later poll.
         let n = conn
-            .execute("DELETE FROM strikes WHERE community = ?1 AND subject = ?2", rusqlite::params![community, subject])
+            .execute(
+                "UPDATE strikes SET pardoned = 1 WHERE community = ?1 AND subject = ?2 AND pardoned = 0",
+                rusqlite::params![community, subject],
+            )
             .map_err(|e| e.to_string())?;
         conn.execute("DELETE FROM actions WHERE community = ?1 AND subject = ?2", rusqlite::params![community, subject])
             .map_err(|e| e.to_string())?;
@@ -379,9 +440,9 @@ pub mod tests {
     #[test]
     fn the_strongest_response_wins_not_the_latest() {
         let s = mem();
-        s.log_action("c", "npub1a", "kick", 1000, "").unwrap();
-        s.log_action("c", "npub1a", "warn", 2000, "").unwrap();
-        assert_eq!(s.strongest_response("c", "npub1a").unwrap().as_deref(), Some("kick"));
+        s.log_action("c", "npub1a", "kick", 1000, 0, "").unwrap();
+        s.log_action("c", "npub1a", "warn", 2000, 0, "").unwrap();
+        assert_eq!(s.strongest_response("c", "npub1a").unwrap().map(|a| a.response).as_deref(), Some("kick"));
     }
 
     /// Raid rows share the table and must never read as a ladder response: an
@@ -389,9 +450,26 @@ pub mod tests {
     #[test]
     fn a_raid_row_is_not_a_ladder_response() {
         let s = mem();
-        s.log_action("c", "npub1a", "raid:kick", 0, "").unwrap();
+        s.log_action("c", "npub1a", "raid:kick", 0, 0, "").unwrap();
         assert_eq!(s.strongest_response("c", "npub1a").unwrap(), None);
         assert_eq!(s.actions_last_hour("c", 1000).unwrap(), 0, "and answers to its own bound");
+        assert_eq!(s.contained_last_hour("c", 1000).unwrap(), 1, "which is this one");
+    }
+
+    /// The two bounds must not read each other's rows. Containment measured by
+    /// the ladder's counter could never see a containment, so its ceiling was
+    /// always zero-based; and one warning switched containment off for an hour.
+    #[test]
+    fn the_ladder_and_containment_do_not_share_a_budget() {
+        let s = mem();
+        s.log_action("c", "npub1a", "warn", 0, 1, "").unwrap();
+        s.log_action("c", "npub1a", "delete_and_warn", 0, 2, "").unwrap();
+        s.log_action("c", "npub1b", "raid:kick", 0, 0, "").unwrap();
+        s.log_action("c", "npub1c", "raid:kick", 0, 0, "").unwrap();
+        s.claim("c", "armed:kick:npub1d", 0, 10_000).unwrap();
+
+        assert_eq!(s.actions_last_hour("c", 1000).unwrap(), 2, "the ladder sees only ladder rows");
+        assert_eq!(s.contained_last_hour("c", 1000).unwrap(), 2, "containment sees only removals");
     }
 
     #[test]
@@ -409,7 +487,7 @@ pub mod tests {
     fn a_pardon_clears_everything_including_a_claim() {
         let s = mem();
         s.record("c", "npub1a", "x", 4, 0, "").unwrap();
-        s.log_action("c", "npub1a", "kick", 0, "").unwrap();
+        s.log_action("c", "npub1a", "kick", 0, 0, "").unwrap();
         s.claim("c", "kick:npub1a", 0, 10_000).unwrap();
 
         assert_eq!(s.pardon("c", "npub1a").unwrap(), 1);
@@ -420,6 +498,38 @@ pub mod tests {
             "a pardoned member who kept a kick on file could only ever be banned next"
         );
         assert!(s.claim("c", "kick:npub1a", 0, 10_000).unwrap(), "and is containable again");
+    }
+
+    /// The whole point of a tombstone. The engine re-reports a standing
+    /// conviction every poll, so a pardon that DELETED the row had it back
+    /// within 90 seconds — at full worth, stamped `now`, with the action
+    /// history gone. The undo re-ran the entire ladder against them.
+    #[test]
+    fn a_pardon_survives_the_next_poll_re_reporting_the_same_conviction() {
+        let s = mem();
+        s.record("c", "npub1a", "conviction-1", 12, 1_000, "words").unwrap();
+        s.pardon("c", "npub1a").unwrap();
+        assert!(s.strikes("c", "npub1a").unwrap().is_empty());
+
+        // The next sweep, re-reporting exactly what it reported before.
+        let fresh = s.record("c", "npub1a", "conviction-1", 12, 90_000, "words").unwrap();
+        assert!(!fresh, "the tombstone is still there, so this is an echo and not an offense");
+        assert!(
+            s.strikes("c", "npub1a").unwrap().is_empty(),
+            "a pardon the engine can undo is not a pardon"
+        );
+        assert!(s.subjects_with_strikes("c").unwrap().is_empty(), "and they are not owed anything");
+        assert!(s.evidence("c", "npub1a").unwrap().is_empty(), "nor cited for it");
+    }
+
+    /// A pardon forgives what was done, not what comes next.
+    #[test]
+    fn a_pardoned_member_can_be_convicted_again() {
+        let s = mem();
+        s.record("c", "npub1a", "conviction-1", 12, 1_000, "words").unwrap();
+        s.pardon("c", "npub1a").unwrap();
+        assert!(s.record("c", "npub1a", "conviction-2", 12, 90_000, "more words").unwrap());
+        assert_eq!(s.strikes("c", "npub1a").unwrap().len(), 1, "the new offense stands on its own");
     }
 
     /// Arming wipes the slate, which is the whole reason there is one ledger.
@@ -437,7 +547,7 @@ pub mod tests {
     fn forgetting_a_community_clears_its_slate() {
         let s = mem();
         s.record("c", "npub1a", "x", 4, 0, "rehearsed").unwrap();
-        s.log_action("c", "npub1a", "warn", 0, "").unwrap();
+        s.log_action("c", "npub1a", "warn", 0, 0, "").unwrap();
         s.record("other", "npub1b", "y", 4, 0, "").unwrap();
 
         s.forget("c").unwrap();
@@ -458,8 +568,8 @@ pub mod tests {
     #[test]
     fn the_hourly_bounds_are_scoped_per_community() {
         let s = mem();
-        s.log_action("c", "npub1a", "warn", 1000, "").unwrap();
-        s.log_action("other", "npub1b", "kick", 1000, "").unwrap();
+        s.log_action("c", "npub1a", "warn", 1000, 0, "").unwrap();
+        s.log_action("other", "npub1b", "kick", 1000, 0, "").unwrap();
         assert_eq!(s.actions_last_hour("c", 2000).unwrap(), 1, "another community's wave does not starve this one");
         assert_eq!(s.actions_last_hour("c", 3_700_000 + 1000).unwrap(), 0, "and the hour rolls off");
         assert_eq!(s.subjects_actioned_last_hour("c", 2000, "npub1a").unwrap(), 0, "the judged member is excluded");
@@ -480,7 +590,7 @@ pub mod tests {
         let s = mem();
         s.record("c", "npub1a", "old", 4, 1_000, "").unwrap();
         s.record("c", "npub1a", "new", 4, 9_000, "").unwrap();
-        s.log_action("c", "npub1a", "warn", 1_000, "").unwrap();
+        s.log_action("c", "npub1a", "warn", 1_000, 0, "").unwrap();
         assert_eq!(s.prune(5_000).unwrap(), 2, "one strike and one action");
         assert_eq!(s.strikes("c", "npub1a").unwrap().len(), 1, "the live one stays");
     }

@@ -112,7 +112,7 @@ pub(crate) async fn enforce(
         return Ok(Outcome::Failed);
     }
 
-    store.log_action(community.id(), &v.npub, name, now, &why).map_err(vector_sdk::Error::Other)?;
+    store.log_action(community.id(), &v.npub, name, now, total, &why).map_err(vector_sdk::Error::Other)?;
     announce(bot, community, ctx, &format!("{name} {who} — {total} strike(s) — {why}")).await;
     *pass.lock().unwrap_or_else(|e| e.into_inner()) += 1;
     Ok(Outcome::Acted)
@@ -231,9 +231,25 @@ pub(crate) fn select_rung(
     strikes: &[ladder::Strike],
     now: u64,
 ) -> Result<Option<Response>, String> {
-    let total = ladder::total(strikes, now, policy.ladder.decay_half_life_hours);
+    let hl = policy.ladder.decay_half_life_hours;
+    let total = ladder::total(strikes, now, hl);
     let prior = store.strongest_response(community, npub)?;
-    Ok(ladder::next_step(&policy.ladder, total, prior.as_deref(), |r| powers.can_deliver(r)))
+    // The ladder climbs per OFFENSE, not per poll. A verdict re-reports every
+    // standing conviction forever, so without this one message walks the whole
+    // ladder on the clock: warn, delete, kick, ban, four polls apart.
+    //
+    // The answered total is aged the same way the strikes are, so the gate
+    // opens again as the evidence behind it is forgiven rather than sealing
+    // the member off for the life of the row.
+    let answered = prior.as_ref().map(|p| ladder::decay(p.at_total, now.saturating_sub(p.at_ms), hl)).unwrap_or(0);
+    if total <= answered {
+        return Ok(None);
+    }
+    // An answer whose evidence is fully forgiven stops flooring the ladder.
+    // Otherwise a kick from March leaves a light offense in October answerable
+    // only by a ban — the strikes forgive and the floor never would.
+    let floor = prior.as_ref().filter(|_| answered > 0).map(|p| p.response.as_str());
+    Ok(ladder::next_step(&policy.ladder, total, floor, |r| powers.can_deliver(r)))
 }
 
 /// A member cited across many messages is still one sentence.
@@ -251,25 +267,69 @@ mod tests {
         toml::from_str::<Config>(&format!("[arm]\n{arm}")).unwrap().for_community("aa")
     }
 
+    /// One strike per offense; the ladder climbs as the total rises.
     #[test]
-    fn the_ladder_climbs_and_stops_where_it_should() {
+    fn the_ladder_climbs_one_rung_per_offense() {
         let store = mem();
         let p = policy_with("warn = true\ndelete = true\nkick = true\nban = true");
         let all = Powers { hide: true, kick: true, ban: true };
-        let twelve = [ladder::Strike { worth: 12, at_ms: NOW }];
-        let pick = |s: &Store| {
-            select_rung(&p, all, s, "c", "npub1a", &twelve, NOW).unwrap()
-        };
+        let offenses = |n: u32| (0..n).map(|_| ladder::Strike { worth: 12, at_ms: NOW }).collect::<Vec<_>>();
+        let pick = |s: &Store, n: u32| select_rung(&p, all, s, "c", "npub1a", &offenses(n), NOW).unwrap();
 
-        assert_eq!(pick(&store), Some(Response::Warn), "twelve points still starts at a warning");
-        store.log_action("c", "npub1a", "warn", NOW, "").unwrap();
-        assert_eq!(pick(&store), Some(Response::DeleteAndWarn));
-        store.log_action("c", "npub1a", "delete_and_warn", NOW, "").unwrap();
-        assert_eq!(pick(&store), Some(Response::Kick));
-        store.log_action("c", "npub1a", "kick", NOW, "").unwrap();
-        assert_eq!(pick(&store), Some(Response::Ban));
-        store.log_action("c", "npub1a", "ban", NOW, "").unwrap();
-        assert_eq!(pick(&store), None, "and stops at the top rather than repeating it");
+        assert_eq!(pick(&store, 1), Some(Response::Warn), "twelve points still starts at a warning");
+        store.log_action("c", "npub1a", "warn", NOW, 12, "").unwrap();
+        assert_eq!(pick(&store, 2), Some(Response::DeleteAndWarn));
+        store.log_action("c", "npub1a", "delete_and_warn", NOW, 24, "").unwrap();
+        assert_eq!(pick(&store, 3), Some(Response::Kick));
+        store.log_action("c", "npub1a", "kick", NOW, 36, "").unwrap();
+        assert_eq!(pick(&store, 4), Some(Response::Ban));
+        store.log_action("c", "npub1a", "ban", NOW, 48, "").unwrap();
+        assert_eq!(pick(&store, 5), None, "and stops at the top rather than repeating it");
+    }
+
+    /// The bug this gate exists for: a verdict re-reports every standing
+    /// conviction, so without it one message walked the whole ladder on the
+    /// clock — warn, delete, kick, ban, one poll apart, in under ten minutes.
+    #[test]
+    fn re_reading_the_same_offense_does_not_climb() {
+        let store = mem();
+        let p = policy_with("warn = true\ndelete = true\nkick = true\nban = true");
+        let all = Powers { hide: true, kick: true, ban: true };
+        let one_grave = [ladder::Strike { worth: 12, at_ms: NOW }];
+
+        let first = select_rung(&p, all, &store, "c", "npub1a", &one_grave, NOW).unwrap();
+        assert_eq!(first, Some(Response::Warn));
+        store.log_action("c", "npub1a", "warn", NOW, 12, "").unwrap();
+
+        for poll in 1..=20u64 {
+            let later = NOW + poll * 90_000;
+            assert_eq!(
+                select_rung(&p, all, &store, "c", "npub1a", &one_grave, later).unwrap(),
+                None,
+                "poll {poll} answered an offense that was already answered"
+            );
+        }
+    }
+
+    /// The floor forgives on the same schedule as the strikes. Without this a
+    /// member kicked in March is answerable only by a ban in October, however
+    /// light the new offense.
+    #[test]
+    fn a_forgiven_floor_no_longer_blocks_a_lighter_offense() {
+        let store = mem();
+        let p = policy_with("warn = true\ndelete = true\nkick = true\nban = true");
+        let all = Powers { hide: true, kick: true, ban: true };
+        let hl = p.ladder.decay_half_life_hours * 3_600_000;
+
+        store.log_action("c", "npub1a", "kick", NOW, 12, "").unwrap();
+        let much_later = NOW + hl * 40;
+        let fresh = [ladder::Strike { worth: 4, at_ms: much_later }];
+
+        assert_eq!(
+            select_rung(&p, all, &store, "c", "npub1a", &fresh, much_later).unwrap(),
+            Some(Response::Warn),
+            "a forgiven kick must not make a fresh minor offense unanswerable"
+        );
     }
 
     #[test]
@@ -277,10 +337,13 @@ mod tests {
         let store = mem();
         let p = policy_with("warn = true\ndelete = true\nkick = true\nban = true");
         let no_hiding = Powers { hide: false, kick: true, ban: true };
-        store.log_action("c", "npub1a", "warn", NOW, "").unwrap();
+        store.log_action("c", "npub1a", "warn", NOW, 12, "").unwrap();
+        let two_grave = [
+            ladder::Strike { worth: 12, at_ms: NOW },
+            ladder::Strike { worth: 12, at_ms: NOW },
+        ];
         assert_eq!(
-            select_rung(&p, no_hiding, &store, "c", "npub1a", &[ladder::Strike { worth: 12, at_ms: NOW }], NOW)
-                .unwrap(),
+            select_rung(&p, no_hiding, &store, "c", "npub1a", &two_grave, NOW).unwrap(),
             Some(Response::Kick),
             "delete_and_warn cannot be delivered here, so the ladder goes on"
         );

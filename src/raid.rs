@@ -18,6 +18,21 @@ use crate::config::Config;
 use crate::config::RaidResponse;
 use crate::policy::CommunityPolicy;
 
+/// The engine's built-in rule that says "this member is part of the wave".
+///
+/// `raid_detected` is community-wide: it means a cohort exists SOMEWHERE. A
+/// member's own cohort finding is the only thing that puts them in it.
+const COHORT_RULE: &str = "cohort";
+
+/// Is this member part of the wave, rather than merely a high score?
+///
+/// The finding must be inference. Containment exists to answer what nobody can
+/// replay; a deterministic conviction under the same rule id is a word rule an
+/// operator happened to name `cohort`, and it answers to the ladder.
+fn in_the_cohort(v: &Verdict) -> bool {
+    v.findings.iter().any(|f| f.rule_id == COHORT_RULE && !f.is_proven())
+}
+
 /// What one pass decided about a suspected raid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Containment {
@@ -59,6 +74,11 @@ pub fn select_from<'a>(
         .iter()
         .filter(|v| v.npub != me)
         .filter(|v| !v.is_shielded())
+        // In the wave, not merely loud. `raid_detected` says a cohort exists
+        // somewhere; without this an ordinary member mid-ladder — someone the
+        // ladder has answered with a warning — was removed as a raider the
+        // moment three throwaway accounts posted the same line.
+        .filter(|v| in_the_cohort(v))
         .filter(|v| v.confidence >= cfg.raid.min_confidence)
         .map(|v| v.npub.clone())
         .collect();
@@ -89,7 +109,34 @@ pub const BAN_CHUNK: usize = 100;
 mod tests {
     use super::*;
 
+    fn finding(rule: &str, basis: &str) -> vector_sdk::policy::Finding {
+        vector_sdk::policy::Finding {
+            conviction_id: format!("{rule}-1"),
+            policy_hash: String::new(),
+            rule_id: rule.into(),
+            scope: "whole".into(),
+            basis: basis.into(),
+            severity: "severe".into(),
+            stateless: false,
+            rung: 0,
+            hits: 1,
+            weight: 0,
+            detail: vec![],
+            messages: vec![],
+            citation_count: 0,
+        }
+    }
+
     fn verdict(npub: &str, confidence: u32, shield: &str) -> Verdict {
+        with_findings(npub, confidence, shield, vec![finding(COHORT_RULE, "heuristic")])
+    }
+
+    fn with_findings(
+        npub: &str,
+        confidence: u32,
+        shield: &str,
+        findings: Vec<vector_sdk::policy::Finding>,
+    ) -> Verdict {
         Verdict {
             npub: npub.into(),
             name: npub.into(),
@@ -98,7 +145,7 @@ mod tests {
             band: "alert".into(),
             shield: shield.into(),
             reasons: vec![],
-            findings: vec![],
+            findings,
             messages: 0,
             tenure_secs: 0,
         }
@@ -120,6 +167,44 @@ mod tests {
         let mut cfg = base();
         cfg.limits.halt_if_over_pct = 100;
         cfg
+    }
+
+    /// The bug this filter exists for. `raid_detected` is community-wide, so
+    /// three throwaway accounts posting the same line used to make every
+    /// high-scoring member a raider — including someone the ladder had just
+    /// answered with a warning, removed with every rung skipped.
+    #[test]
+    fn a_loud_member_who_is_not_in_the_cohort_is_not_contained() {
+        let mut cfg = permissive();
+        cfg.arm.raid = true;
+        let mut rows = crowd(3, 90, "none");
+        rows.push(with_findings(
+            "npub1regular",
+            95,
+            "none",
+            vec![finding("slurs", "deterministic")],
+        ));
+
+        match pick(&rows, true, &cfg, "me") {
+            Containment::Contain { suspects, .. } => {
+                assert_eq!(suspects.len(), 3, "the wave, and only the wave");
+                assert!(
+                    !suspects.iter().any(|s| s == "npub1regular"),
+                    "a member the ladder is already handling is not a raider"
+                );
+            }
+            other => panic!("expected containment of the cohort, got {other:?}"),
+        }
+    }
+
+    /// Containment answers what nobody can replay. A deterministic conviction
+    /// under a rule an operator happened to name `cohort` is a word rule.
+    #[test]
+    fn a_deterministic_cohort_rule_does_not_reach_containment() {
+        let mut cfg = permissive();
+        cfg.arm.raid = true;
+        let rows = vec![with_findings("npub1a", 99, "none", vec![finding(COHORT_RULE, "deterministic")])];
+        assert_eq!(pick(&rows, true, &cfg, "me"), Containment::Quiet);
     }
 
     #[test]

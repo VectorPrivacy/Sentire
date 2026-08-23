@@ -15,6 +15,8 @@
 
 mod act;
 mod adjudicate;
+#[cfg(test)]
+mod harness;
 mod commands;
 mod config;
 mod ladder;
@@ -422,12 +424,6 @@ mod tests {
     /// A rung the PROVABLE points already reach answers under the text
     /// switches; one only the full total reaches leans on a model and answers
 
-    /// The population is "owed but not yet handled THIS pass", and every
-    /// subject carries the standing the roster actually lists.
-    #[test]
-    /// Every shield this loop emits must be one the gate recognises. "absent"
-    /// falls through to "not shielded", so emitting it here was a ban path.
-    #[test]
     #[test]
     fn a_short_string_never_panics_however_a_peer_supplies_it() {
         // A remote peer chooses attachment and message ids. A panic here
