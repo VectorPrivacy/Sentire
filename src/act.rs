@@ -58,7 +58,10 @@ pub(crate) async fn enforce(
         if ladder::owed(&ctx.policy.ladder, strikes, [], |r| ctx.powers.can_deliver(r), now, ctx.policy.ladder.decay_half_life_hours)
             .is_some_and(|r| r == Response::Ban)
         {
-            println!("[{id}] TOP     {who} — {total} strike(s), already at the top rung — a person decides from here");
+            println!(
+                "[{id}] TOP     {who} — {}, already at the top rung — a person decides from here",
+                tally(strikes, total)
+            );
         }
         return Ok(Outcome::AlreadyAnswered);
     };
@@ -101,7 +104,8 @@ pub(crate) async fn enforce(
 
     let name = response.name();
     let total = ladder::total(strikes, now, ctx.policy.ladder.decay_half_life_hours);
-    println!("[{id}] {} {name} {who} — {total} strike(s) — {why}", if armed { "ENFORCE" } else { "WOULD  " });
+    let tally = tally(strikes, total);
+    println!("[{id}] {} {name} {who} — {tally} — {why}", if armed { "ENFORCE" } else { "WOULD  " });
 
     // Resolved before the act: a delete removes the very messages the channel
     // would have been read from.
@@ -111,7 +115,7 @@ pub(crate) async fn enforce(
     // an operator has to see what is about to happen, and the ledger must hold
     // only what did. A named mod channel that cannot be reached holds the
     // sentence rather than carrying it out unrecorded.
-    if armed && !announce(bot, community, ctx, &format!("{name} {who} — {total} strike(s) — {why}")).await {
+    if armed && !announce(bot, community, ctx, &format!("{name} {who} — {tally} — {why}")).await {
         println!("[{id}] HELD    {who} — the mod channel is unreachable, and this would go unrecorded");
         return Ok(Outcome::Held);
     }
@@ -265,6 +269,17 @@ pub(crate) fn own_finding(rule: &str, detail: &str, message_id: String) -> vecto
         messages: vec![message_id],
         citation_count: 1,
     }
+}
+
+/// A member's record in words: how many offences are on file, and what they
+/// are worth after decay.
+///
+/// Two different numbers. The total is a SUM OF WORTHS — one grave offence is
+/// twelve points at the default scale — so reporting it as "12 strike(s)" read
+/// as twelve separate offences, which is what `/why` had always said correctly
+/// and this had not.
+fn tally(strikes: &[ladder::Strike], total: u32) -> String {
+    format!("{} strike record(s), worth {total}", strikes.len())
 }
 
 /// What a warned member reads.
@@ -513,6 +528,30 @@ mod tests {
     fn a_message_cited_twice_is_hidden_once() {
         let v = with(vec![cited("deterministic", &["m1", "m1", "m2", "m1"])]);
         assert_eq!(cited_ids(&v), vec!["m1", "m2"]);
+    }
+
+    /// Two different numbers, and saying one when you mean the other is how
+    /// "one grave offence" came to read as twelve of them. The total is a SUM
+    /// OF WORTHS; the count is how many offences are on file.
+    #[test]
+    fn a_tally_separates_how_many_from_how_much() {
+        let one_grave = [ladder::Strike { worth: 12, at_ms: 0 }];
+        let line = tally(&one_grave, 12);
+        assert!(line.contains("1 strike record"), "one offence, not twelve: {line}");
+        assert!(line.contains("worth 12"), "and what it is worth: {line}");
+
+        let three = [
+            ladder::Strike { worth: 1, at_ms: 0 },
+            ladder::Strike { worth: 2, at_ms: 0 },
+            ladder::Strike { worth: 4, at_ms: 0 },
+        ];
+        let line = tally(&three, 7);
+        assert!(line.contains("3 strike record"), "{line}");
+        assert!(line.contains("worth 7"), "{line}");
+
+        // Decay moves the worth and never the count.
+        let line = tally(&three, 3);
+        assert!(line.contains("3 strike record") && line.contains("worth 3"), "{line}");
     }
 
     /// The warned member reads this, so it has to say what matched, what
