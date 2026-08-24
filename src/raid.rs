@@ -113,10 +113,6 @@ pub fn select_from<'a>(
     }
 }
 
-/// Ban chunk size. The wire caps a banlist at 500 entries and rejects an
-/// over-cap batch WHOLE, so a wave larger than that has to arrive in pieces.
-pub const BAN_CHUNK: usize = 100;
-
 #[cfg(test)]
 mod tests {
     use super::*;

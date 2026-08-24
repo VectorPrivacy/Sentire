@@ -491,15 +491,53 @@ async fn notice_in_channel(bot: &VectorBot, chat: Option<String>, v: &Verdict, r
 /// an automated mass-action. Its own function (not `notify_mods`, which is one
 /// member per rule) because a raid is one event, many subjects — an admin wants
 /// the whole list in one message, not forty DMs.
-pub(crate) async fn notify_mods_raid(bot: &VectorBot, ctx: &Ctx, action: &str, removed: &[&str]) {
+pub(crate) async fn notify_mods_raid(
+    bot: &VectorBot,
+    ctx: &Ctx,
+    action: &str,
+    removed: &[&str],
+    report: Option<&vector_sdk::ContainmentReport>,
+) {
     if ctx.notify.mods.is_empty() || removed.is_empty() {
         return;
     }
     // Full npubs, one per line: the reader has to be able to paste any of them
     // into a tool to unban a false positive.
     let list = removed.iter().map(|n| format!("- {n}")).collect::<Vec<_>>().join("\n");
+    // The state of the DOOR, which is the half a human can actually act on. A
+    // failed rotation still silenced the raiders, and saying only that would
+    // read as "handled" while the link they came through is still live.
+    let door = match report {
+        None => String::new(),
+        Some(r) if r.refound_ok => {
+            let mut s = format!(
+                "\n\n**Keys rotated** — epoch {} → {}, invite links revoked ({}).",
+                r.epoch_before, r.epoch_after, r.own_links_revoked,
+            );
+            if r.window_cut > 0 {
+                s.push_str(&format!(
+                    "\n{} account(s) who joined during the raid were cut from the new keys without being banned; \
+                     they can rejoin through a fresh invite.",
+                    r.window_cut,
+                ));
+            }
+            if !r.foreign_link_creators.is_empty() {
+                s.push_str(&format!(
+                    "\n⚠️ {} other link creator(s) still have live invites — theirs close when their client syncs.",
+                    r.foreign_link_creators.len(),
+                ));
+            }
+            s.push_str("\n\nMint a fresh invite link when the raid is over — the old ones are dead for good.");
+            s
+        }
+        Some(r) => format!(
+            "\n\n🚨 **The key rotation FAILED** — the raiders are silenced, but the invite link they came \
+             through may still be open. Revoke it by hand.{}",
+            r.warnings.iter().map(|w| format!("\n- {w}")).collect::<String>(),
+        ),
+    };
     let line = format!(
-        "**Raid contained in {}**\n\n**{action}** applied to {} account(s):\n\n{list}\n\n\
+        "**Raid contained in {}**\n\n**{action}** applied to {} account(s):\n\n{list}{door}\n\n\
          If any of these are real members, pardon them to reverse it.",
         ctx.community_name,
         removed.len(),

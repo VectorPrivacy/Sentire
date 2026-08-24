@@ -442,6 +442,7 @@ pub(crate) async fn contain(
     // Act, THEN log — the same discipline the ladder keeps. Logging first meant
     // a failed ban left an audit trail claiming a contained raid.
     let mut done: Vec<&str> = Vec::new();
+    let mut containment: Option<vector_sdk::ContainmentReport> = None;
     if armed && response != RaidResponse::Report {
         match response {
             RaidResponse::Kick => {
@@ -458,17 +459,30 @@ pub(crate) async fn contain(
                 }
             }
             RaidResponse::Ban => {
-                // ban_many, never a loop of ban(): each single ban rotates the
-                // community's keys, and forty rotations strand everyone.
-                // Bounded per pass like the kick path, then chunked for the
-                // wire cap inside that. `max_batch` means one thing.
+                // `contain_raid`, not ban_many: a ban in a PUBLIC community leaves
+                // the invite link live, which is how a raid walks back in with
+                // fresh keys. Containment revokes the door and rolls the root in
+                // one severing rotation. One call for the whole pass — it bans
+                // through the same coalescer, so chunking here would only make
+                // each chunk rotate.
                 let this_pass = &fresh[..fresh.len().min(ctx.policy.raid.max_batch)];
-                for chunk in this_pass.chunks(raid::BAN_CHUNK) {
-                    let refs: Vec<&str> = chunk.iter().map(String::as_str).collect();
-                    match community.ban_many(&refs).await {
-                        Ok(()) => done.extend(refs),
-                        Err(e) => eprintln!("[{id}] ban batch of {}: {e}", refs.len()),
+                let refs: Vec<&str> = this_pass.iter().map(String::as_str).collect();
+                // The raid's opening edge: the earliest arrival among the accounts
+                // being contained, floored at the tenure horizon so a single
+                // longer-lived suspect can never widen the cut into real members.
+                let window = refs
+                    .iter()
+                    .map(|n| tenure.get(*n).copied().unwrap_or(0))
+                    .max()
+                    .unwrap_or(0)
+                    .min(ctx.policy.raid.protect_tenure_secs);
+                let window_start = (now / 1000).saturating_sub(window);
+                match community.contain_raid(&refs, window_start).await {
+                    Ok(report) => {
+                        done.extend(refs);
+                        containment = Some(report);
                     }
+                    Err(e) => eprintln!("[{id}] containment of {}: {e}", refs.len()),
                 }
             }
             RaidResponse::Report => {}
@@ -518,7 +532,7 @@ pub(crate) async fn contain(
     // Only for a real containment — a report or an unarmed suspicion removed
     // nobody, and the mod channel line already carried those.
     if armed && response != RaidResponse::Report && !done.is_empty() {
-        crate::act::notify_mods_raid(bot, ctx, verb, &done).await;
+        crate::act::notify_mods_raid(bot, ctx, verb, &done, containment.as_ref()).await;
     }
     Ok(())
 }
