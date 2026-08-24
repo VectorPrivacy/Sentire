@@ -208,6 +208,7 @@ pub struct Config {
     pub shields: Shields,
     pub raid: Raid,
     pub vision: VisionCfg,
+    pub notify: NotifyCfg,
     /// Per-community overrides, keyed by community id. Anything absent falls
     /// back to the blocks above, so an operator names only what differs.
     pub community: std::collections::HashMap<String, crate::policy::Overrides>,
@@ -336,6 +337,11 @@ impl Default for Rules {
 #[serde(deny_unknown_fields)]
 pub struct WordRule {
     pub id: String,
+    /// What this rule is CALLED when a member is told they broke it. The id is
+    /// yours for the config and the ledger; `Slurs` reads better in a channel
+    /// than `slurs_v2`. Defaults to the id, tidied.
+    #[serde(default)]
+    pub title: String,
     pub patterns: Vec<String>,
     pub gravity: Gravity,
 }
@@ -344,6 +350,9 @@ pub struct WordRule {
 #[serde(deny_unknown_fields)]
 pub struct LinkRule {
     pub id: String,
+    /// See [`WordRule::title`].
+    #[serde(default)]
+    pub title: String,
     pub domains: Vec<String>,
     pub gravity: Gravity,
 }
@@ -456,6 +465,18 @@ impl Response {
         }
     }
 
+    /// How a response reads to somebody who did not write the config. The wire
+    /// name is a key, and `delete_and_warn` in a sentence asks a member to parse
+    /// an identifier to find out what is about to happen to them.
+    pub fn label(self) -> &'static str {
+        match self {
+            Response::Warn => "a Warning",
+            Response::DeleteAndWarn => "Deletion and a Warning",
+            Response::Kick => "a Kick",
+            Response::Ban => "a Ban",
+        }
+    }
+
     /// Every response, for callers that must enumerate them (the store's
     /// severity ordering, tests that prove the two agree).
     pub const ALL: [Response; 4] = [Response::Warn, Response::DeleteAndWarn, Response::Kick, Response::Ban];
@@ -472,11 +493,15 @@ impl Default for Ladder {
         Ladder {
             strikes: Strikes::default(),
             decay_half_life_hours: 168,
+            // Two warnings, then a kick, then a ban — against `grave` being
+            // worth 12, so a serious offender is warned twice before losing
+            // access. Removal of the post itself is NOT a rung: whatever a
+            // conviction cites comes down the first time it is answered, so a
+            // ladder step only ever decides what happens to the member.
             steps: vec![
                 Step { at: 1, response: Response::Warn },
-                Step { at: 4, response: Response::DeleteAndWarn },
-                Step { at: 8, response: Response::Kick },
-                Step { at: 12, response: Response::Ban },
+                Step { at: 36, response: Response::Kick },
+                Step { at: 48, response: Response::Ban },
             ],
         }
     }
@@ -507,13 +532,137 @@ pub struct VisionCfg {
     /// business, not Sentinel's: an endpoint that cannot answer for a video
     /// says so, and an unanswered attachment goes to a person.
     pub mimes: Vec<String>,
+    /// A ceiling on the ANSWER. The reply is a small JSON map, so anything long
+    /// is a model talking to itself — and a loop that runs to the timeout holds
+    /// that community's one blob slot for the whole of it.
+    #[serde(default = "default_answer_tokens")]
+    pub max_answer_tokens: u32,
+    /// How many times to ask before giving up on a usable answer. A model that
+    /// returns prose, fences its JSON, or drops a label is asked again with the
+    /// fault named. BOUNDED, not "until it complies": a model that never
+    /// complies would hold the blob slot and spend the budget forever, and
+    /// unjudged-and-escalated is the safe end of that.
+    #[serde(default = "default_attempts")]
+    pub max_attempts: u32,
+    /// Sent as `reasoning_effort`. Local reasoning models otherwise spend the
+    /// whole budget deliberating about a picture and answer with truncated
+    /// JSON, which reads as unjudged. Empty omits the field; an endpoint that
+    /// rejects it is retried once without it.
+    #[serde(default = "default_reasoning_effort")]
+    pub reasoning_effort: String,
     pub labels: Vec<VisionLabel>,
+    #[serde(default)]
+    pub video: VideoCfg,
+}
+
+fn default_answer_tokens() -> u32 {
+    256
+}
+
+fn default_attempts() -> u32 {
+    3
+}
+
+fn default_reasoning_effort() -> String {
+    "none".into()
+}
+
+/// People to tell, personally, when Sentinel acts.
+///
+/// The mod channel is a room; this is a DM. An owner who is not reading the
+/// channel at 3am still finds out what happened in the morning.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotifyCfg {
+    /// npubs to DM. Empty means nobody, which is the default: Sentinel does not
+    /// message people who never asked it to.
+    pub mods: Vec<String>,
+    /// Forward what was actually posted, so the decision can be checked rather
+    /// than taken on trust. Images are sent with a `SPOILER_` filename, which
+    /// is how Vector marks an attachment to be revealed on tap.
+    pub attach_media: bool,
+    /// Post a short line in the channel the rule was broken in, naming the
+    /// member. Public, brief, and says what happens next.
+    pub notice_in_channel: bool,
+    /// Seconds before that notice deletes itself. It has to be seen, not kept:
+    /// the room learns the rule is real, and nobody is left with a permanent
+    /// public record of their worst day pinned to the channel. 0 keeps it.
+    #[serde(default = "default_notice_ttl")]
+    pub notice_ttl_secs: u64,
+}
+
+fn default_notice_ttl() -> u64 {
+    30
+}
+
+impl Default for NotifyCfg {
+    fn default() -> Self {
+        NotifyCfg {
+            mods: Vec::new(),
+            attach_media: false,
+            notice_in_channel: false,
+            // Not `Default::default()`: a zeroed TTL means "keep it forever",
+            // which is the one value nobody would choose on purpose.
+            notice_ttl_secs: default_notice_ttl(),
+        }
+    }
+}
+
+/// How a clip becomes something a still-image model can answer for.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VideoCfg {
+    /// Off means video is refused rather than judged — which reaches a person,
+    /// because a type nobody looked at is not a clean type.
+    pub enabled: bool,
+    /// Looked up on PATH unless given a path. Absent at startup is a warning,
+    /// not a failure: images still work without it.
+    pub ffmpeg: String,
+    pub ffprobe: String,
+    /// The grid. Frames are spread across the WHOLE clip, so more tiles buy
+    /// resolution in time, and each one costs the model pixels.
+    pub cols: u32,
+    pub rows: u32,
+    /// Width of one tile in pixels; height follows the source aspect.
+    pub tile_width: u32,
+    /// A wall clock on ffmpeg itself. Decoding attacker-supplied video is the
+    /// one place Sentinel runs a parser it did not write.
+    pub timeout_secs: u64,
+    /// Longest clip to sample across. A three-hour upload spread over six tiles
+    /// samples every thirty minutes, which answers for nothing.
+    pub max_duration_secs: f64,
+}
+
+impl Default for VideoCfg {
+    fn default() -> Self {
+        VideoCfg {
+            enabled: true,
+            ffmpeg: "ffmpeg".into(),
+            ffprobe: "ffprobe".into(),
+            cols: 3,
+            rows: 2,
+            tile_width: 512,
+            timeout_secs: 30,
+            max_duration_secs: 600.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VisionLabel {
     pub name: String,
+    /// See [`WordRule::title`]. `sexual_content` is a label a model scores;
+    /// **NSFW** is what a member is told they broke.
+    #[serde(default)]
+    pub title: String,
+    /// What this label MEANS, in the operator's own words, sent to the model
+    /// with the label. A bare name is the model's guess at a community's
+    /// standards; a sentence is the operator's. Optional, so a config written
+    /// before this still loads — but a label without one is judged by whatever
+    /// the model imagines the word covers.
+    #[serde(default)]
+    pub describe: String,
     /// 0.0..=1.0. A label with no threshold would flag everything.
     pub threshold: f32,
     pub gravity: Gravity,
@@ -534,7 +683,11 @@ impl Default for VisionCfg {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            max_answer_tokens: default_answer_tokens(),
+            max_attempts: default_attempts(),
+            reasoning_effort: default_reasoning_effort(),
             labels: vec![],
+            video: VideoCfg::default(),
         }
     }
 }
@@ -585,6 +738,15 @@ pub struct Raid {
     /// Members per ban call. The wire caps a banlist at 500 and rejects an
     /// over-cap batch WHOLE, so a bigger wave arrives in pieces.
     pub max_batch: usize,
+    /// Community tenure (seconds) above which a suspect counts as ESTABLISHED.
+    ///
+    /// The raid halt protects established members from a misfiring cohort — it
+    /// must NEVER limit removing fresh raiders, or a raid that inflates the
+    /// roster raises the very bar it has to clear (150 real members bloated to
+    /// 650 by bots sails past a 50% ceiling exactly when containment matters
+    /// most). Only suspects with tenure at or above this count toward
+    /// `halt_floor`; anyone newer is a fresh account, contained without limit.
+    pub protect_tenure_secs: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -618,6 +780,9 @@ impl Default for Raid {
             tripwire_cooldown_secs: 60,
             claim_ttl_secs: 6 * 3600,
             max_batch: 100,
+            // 24h: a raider joins during the raid, so community tenure of a day
+            // cleanly separates them from a member who was here yesterday.
+            protect_tenure_secs: 24 * 3600,
         }
     }
 }

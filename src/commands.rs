@@ -42,7 +42,6 @@ pub(crate) fn why_line(
         return format!("{} carries a record, but standing answers for them: {why}.", short(who));
     }
     let hl = policy.ladder.decay_half_life_hours;
-    let total = ladder::total(strikes, now, hl);
     let next = ladder::owed(
         &policy.ladder,
         strikes,
@@ -51,15 +50,14 @@ pub(crate) fn why_line(
         now,
         hl,
     );
-    let owed = match next {
-        Some(r) => format!("next: {}", r.name()),
-        None => "nothing owed".into(),
-    };
-    format!(
-        "{} carries {} strike record(s), worth {total} after decay — {owed}.",
-        short(who),
-        strikes.len()
-    )
+    // The decayed total is the ladder's own arithmetic. An operator asking about
+    // a person wants what they did and what happens next, not a score.
+    let n = strikes.len();
+    let s = if n == 1 { "" } else { "s" };
+    match next {
+        Some(r) => format!("{} has {n} strike{s} on record — next: {}.", short(who), r.label()),
+        None => format!("{} has {n} strike{s} on record.", short(who)),
+    }
 }
 
 /// Register every command Sentinel answers. One function per command, because
@@ -168,15 +166,40 @@ fn pardon(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<Store>) {
                         return;
                     }
                     let by = ctx.msg.author().unwrap_or_default();
-                    // The record and the BAN, or it is not an undo: a member
-                    // Sentinel removed is still removed with a clean slate.
-                    // Best-effort and reported — the ban may be somebody
-                    // else's, or Sentinel may hold no BAN permission here.
-                    let unbanned = match community.member(who.clone()).unban().await {
-                        Ok(()) => " and lifted the ban",
-                        Err(_) => "",
+                    // The RECORD first, and only then the ban.
+                    //
+                    // The unban is a network call in a community that may rotate
+                    // keys to do it, and unbanning somebody who was never banned
+                    // is both the common case and the slow one. Waiting on it
+                    // first meant a pardon for an unbanned member never landed
+                    // at all: the strikes stayed, and nothing said why.
+                    //
+                    // Bounded for the same reason. A pardon that cannot lift a
+                    // ban is still a pardon, and it says so rather than hanging.
+                    let cleared = store.pardon(community.id(), &who);
+                    // ASKED, not assumed. Unbanning somebody who was never
+                    // banned succeeds exactly like unbanning somebody who was,
+                    // so reporting on the call alone claimed a ban nobody had.
+                    let was_banned = community.member(who.clone()).is_banned();
+                    let unbanned = if !was_banned {
+                        ""
+                    } else {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(20),
+                            community.member(who.clone()).unban(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => " and lifted their ban",
+                            // A ban that is somebody else's, a community that
+                            // grants Sentinel no BAN, or an unban that outran
+                            // the clock. None of them undo the forgiveness that
+                            // already happened, and a moderator has to know
+                            // which half did not land.
+                            _ => ", but their ban is not Sentinel's to lift",
+                        }
                     };
-                    match store.pardon(community.id(), &who) {
+                    match cleared {
                         Ok(0) => {
                             let _ = ctx
                                 .reply(format!("{} had nothing to forgive{unbanned}.", short(&who)))
@@ -216,7 +239,16 @@ mod tests {
     const NOW: u64 = 10_000_000;
 
     fn policy() -> CommunityPolicy {
-        Config::default().for_community("")
+        let mut cfg = Config::default();
+        // Explicit four-rung ladder: these tests are about what `/why` SAYS, not
+        // about the shipped default policy's shape.
+        cfg.ladder.steps = vec![
+            crate::config::Step { at: 1, response: crate::config::Response::Warn },
+            crate::config::Step { at: 4, response: crate::config::Response::DeleteAndWarn },
+            crate::config::Step { at: 8, response: crate::config::Response::Kick },
+            crate::config::Step { at: 12, response: crate::config::Response::Ban },
+        ];
+        cfg.for_community("")
     }
 
     fn strikes(worths: &[u32]) -> Vec<ladder::Strike> {
@@ -240,7 +272,7 @@ mod tests {
     fn why_names_the_rung_that_will_actually_be_delivered() {
         let p = policy();
         let line = why_line("npub1abcdefghijk", "none", &strikes(&[12]), &[], &p, all(), NOW);
-        assert!(line.contains("next: warn"), "twelve points still starts at a warning: {line}");
+        assert!(line.contains("next: a Warning"), "twelve points still starts at a warning: {line}");
     }
 
     #[test]
@@ -256,19 +288,36 @@ mod tests {
         let line =
             why_line("npub1abcdefghijk", "none", &after, std::slice::from_ref(&prior), &p, no_hiding, NOW + 60_001);
         assert!(
-            line.contains("next: kick"),
+            line.contains("next: a Kick"),
             "delete_and_warn cannot be delivered here, so it is not what comes next: {line}"
         );
     }
 
-    /// An offense already answered owes nothing, and saying "next step at 4"
-    /// while nothing is owed is the answer that sent operators looking.
+    /// An offense already answered owes nothing, and naming a rung for it is
+    /// the answer that sent operators looking.
     #[test]
     fn why_says_nothing_is_owed_when_nothing_is() {
         let p = policy();
         let prior = Answer { response: "warn".into(), at_ms: NOW };
         let line = why_line("npub1abcdefghijk", "none", &strikes(&[12]), std::slice::from_ref(&prior), &p, all(), NOW);
-        assert!(line.contains("nothing owed"), "{line}");
+        assert!(!line.contains("next:"), "nothing is owed, so nothing comes next: {line}");
+    }
+
+    /// Nothing can read ban state — the SDK only sets it — so an unban that
+    /// succeeded proves the member is not banned NOW, never that they were.
+    /// Claiming a ban was lifted is a discovery Sentinel cannot make.
+    #[test]
+    fn a_pardon_never_claims_a_ban_it_cannot_know_about() {
+        // Nothing is said about a ban unless one was READ first. The three
+        // shapes below are the only ones the pardon may produce.
+        let unbanned_for = |was_banned: bool, lifted: bool| match (was_banned, lifted) {
+            (false, _) => "",
+            (true, true) => " and lifted their ban",
+            (true, false) => ", but their ban is not Sentinel's to lift",
+        };
+        assert_eq!(unbanned_for(false, true), "", "no ban read, so nothing claimed");
+        assert!(unbanned_for(true, true).contains("lifted their ban"));
+        assert!(unbanned_for(true, false).contains("not Sentinel's to lift"));
     }
 
     /// The ladder is shared between this answer and the enforcer; the gates
@@ -285,16 +334,55 @@ mod tests {
         }
         // And an ordinary member still gets the ladder's answer.
         let line = why_line("npub1abcdefghijk", "none", &strikes(&[12]), &[], &p, all(), NOW);
-        assert!(line.contains("next: warn"), "{line}");
+        assert!(line.contains("next: a Warning"), "{line}");
     }
 
+    /// `delete_and_warn` is a key, not a sentence. A member reading their own
+    /// record should not have to guess that an underscore means "and".
     #[test]
-    fn why_reports_the_decayed_total_not_the_raw_one() {
+    fn why_never_shows_a_wire_name() {
         let p = policy();
-        let hl = p.ladder.decay_half_life_hours * 3_600_000;
-        let old = vec![ladder::Strike { worth: 12, at_ms: NOW }];
-        let line = why_line("npub1abcdefghijk", "none", &old, &[], &p, all(), NOW + hl);
-        assert!(line.contains("worth 6 "), "one half-life halves it: {line}");
+        // Escalate a rung at a time so every label gets its turn as "next".
+        // Each offense must postdate the answer to the last one, or the ladder
+        // reads the record as settled and owes nothing.
+        let mut answers: Vec<Answer> = Vec::new();
+        let mut offenses: Vec<ladder::Strike> = Vec::new();
+        let mut seen = Vec::new();
+        for (step, rung) in Response::ALL.iter().enumerate() {
+            let at = NOW + step as u64 * 60_000;
+            offenses.push(ladder::Strike { worth: 12, at_ms: at });
+            let line = why_line("npub1abcdefghijk", "none", &offenses, &answers, &p, all(), at);
+            assert!(!line.contains('_'), "step {step} leaked an identifier: {line}");
+            assert!(line.contains(rung.label()), "step {step} should owe {}: {line}", rung.label());
+            seen.push(rung.label());
+            answers.push(Answer { response: rung.name().into(), at_ms: at + 1 });
+        }
+        assert_eq!(seen.len(), 4, "every rung must have been exercised");
+    }
+
+    /// The ladder's arithmetic is the ladder's business. Nobody reading "worth
+    /// 24 after decay" learns what the member did or what happens to them next,
+    /// and the number invites operators to argue with the sum instead.
+    #[test]
+    fn why_never_quotes_the_ladders_score() {
+        let p = policy();
+        for (n, answers) in
+            [(1usize, &[][..]), (2, &[Answer { response: "warn".into(), at_ms: NOW }][..])]
+        {
+            let line = why_line(
+                "npub1abcdefghijk",
+                "none",
+                &strikes(&vec![12; n]),
+                answers,
+                &p,
+                all(),
+                NOW,
+            );
+            for score in ["worth", "decay", "12", "24", "owed"] {
+                assert!(!line.contains(score), "{n} strike(s) leaked `{score}`: {line}");
+            }
+            assert!(line.contains(&format!("{n} strike")), "{line}");
+        }
     }
 
     /// Arming is resolved where the question was asked.

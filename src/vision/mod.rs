@@ -9,8 +9,27 @@
 //! as a cross-client verdict.
 
 pub mod openai;
+pub mod storyboard;
 
 use crate::config::Gravity;
+
+/// What the model is being shown.
+///
+/// A contact sheet is one image but it is not one moment, and a model not told
+/// so describes the top-left tile and calls the clip clean.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Shown<'a> {
+    Still { mime: &'a str },
+    Storyboard { mime: &'a str, board: storyboard::Board },
+}
+
+impl<'a> Shown<'a> {
+    pub fn mime(&self) -> &'a str {
+        match self {
+            Shown::Still { mime } | Shown::Storyboard { mime, .. } => mime,
+        }
+    }
+}
 
 /// One thing a model claims to see, and how sure it says it is.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -28,17 +47,71 @@ pub struct Label {
 /// a reason to let everything through.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Verdict {
-    Clean,
-    Flagged(Vec<Label>),
+    Clean {
+        /// What the model says is in it, for the record a moderator reads later.
+        /// Carried on Clean as well as Flagged: the useful question months on is
+        /// often "what WAS that", not "what did it break".
+        #[serde(default)]
+        description: Option<String>,
+    },
+    Flagged {
+        labels: Vec<Label>,
+        #[serde(default)]
+        description: Option<String>,
+    },
     Unknown(String),
+}
+
+/// A well-formed answer, before thresholds decide what it means.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Answer {
+    pub labels: Vec<Label>,
+    pub description: Option<String>,
+}
+
+/// Why an answer was not usable. Named rather than described, because the next
+/// attempt tells the model which fault to fix.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Fault {
+    /// No JSON object in the reply at all — prose, a refusal, or a truncation.
+    NotJson,
+    /// Parsed, but did not score every label asked. `{}` satisfied "all keys are
+    /// numbers" and read as a full all-clear, cached by content hash forever.
+    Missing(Vec<String>),
+}
+
+impl Fault {
+    /// What to tell the model it did wrong. Naming the fault is what makes a
+    /// second attempt worth more than a repeat of the first.
+    pub fn correction(&self) -> String {
+        match self {
+            Fault::NotJson => "Your previous reply was not a JSON object. Reply with ONLY the JSON \
+                 object, no prose, no explanation and no code fence."
+                .into(),
+            Fault::Missing(names) => format!(
+                "Your previous reply left out these labels: {}. Every label must appear with a \
+                 number from 0.0 to 1.0. Reply with ONLY the JSON object.",
+                names.join(", ")
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for Fault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Fault::NotJson => write!(f, "the model did not answer with JSON"),
+            Fault::Missing(names) => write!(f, "the model did not score: {}", names.join(", ")),
+        }
+    }
 }
 
 #[allow(async_fn_in_trait)]
 pub trait Vision {
-    /// Classify decrypted bytes — an image, a video, whatever the operator
-    /// listed. `mime` comes from the content itself, never from a filename an
-    /// uploader chose, and the model decides whether it can read it.
-    async fn classify(&self, bytes: &[u8], mime: &str) -> Verdict;
+    /// Classify decrypted bytes. The MIME comes from the content itself, never
+    /// from a filename an uploader chose, and `Shown` tells the model whether it
+    /// is looking at one picture or a sheet of frames from one clip.
+    async fn classify(&self, bytes: &[u8], shown: Shown<'_>) -> Verdict;
     fn model(&self) -> &str;
 }
 
@@ -65,8 +138,8 @@ mod tests {
 
     fn labels() -> Vec<VisionLabel> {
         vec![
-            VisionLabel { name: "gore".into(), threshold: 0.90, gravity: Gravity::Grave },
-            VisionLabel { name: "spam_graphic".into(), threshold: 0.85, gravity: Gravity::Serious },
+            VisionLabel { name: "gore".into(), title: String::new(), describe: String::new(), threshold: 0.90, gravity: Gravity::Grave },
+            VisionLabel { name: "spam_graphic".into(), title: String::new(), describe: String::new(), threshold: 0.85, gravity: Gravity::Serious },
         ]
     }
 
@@ -97,7 +170,7 @@ mod tests {
     /// The distinction the whole lane rests on.
     #[test]
     fn an_unreachable_model_is_never_an_all_clear() {
-        assert_ne!(Verdict::Unknown("timeout".into()), Verdict::Clean);
+        assert_ne!(Verdict::Unknown("timeout".into()), Verdict::Clean { description: None });
     }
 
     /// A model that answers something OTHER than what it was asked has not
@@ -120,7 +193,7 @@ mod tests {
     fn cfg(pairs: &[(&str, f32, Gravity)]) -> Vec<crate::config::VisionLabel> {
         pairs
             .iter()
-            .map(|(n, t, g)| crate::config::VisionLabel { name: (*n).into(), threshold: *t, gravity: *g })
+            .map(|(n, t, g)| crate::config::VisionLabel { name: (*n).into(), title: String::new(), describe: String::new(), threshold: *t, gravity: *g })
             .collect()
     }
 
@@ -184,10 +257,10 @@ mod tests {
     /// The distinction the whole lane rests on, asserted as a type property.
     #[test]
     fn unknown_is_never_clean() {
-        assert_ne!(Verdict::Unknown("timeout".into()), Verdict::Clean);
-        assert_ne!(Verdict::Flagged(vec![]), Verdict::Clean);
+        assert_ne!(Verdict::Unknown("timeout".into()), Verdict::Clean { description: None });
+        assert_ne!(Verdict::Flagged { labels: vec![], description: None }, Verdict::Clean { description: None });
         // And it round-trips, because it is cached and read back.
-        let v = Verdict::Flagged(vec![label("gore", 0.95)]);
+        let v = Verdict::Flagged { labels: vec![label("gore", 0.95)], description: None };
         let json = serde_json::to_string(&v).unwrap();
         assert_eq!(serde_json::from_str::<Verdict>(&json).unwrap(), v);
     }
@@ -197,7 +270,7 @@ mod tests {
     struct Fake(Verdict);
 
     impl Vision for Fake {
-        async fn classify(&self, _bytes: &[u8], _mime: &str) -> Verdict {
+        async fn classify(&self, _bytes: &[u8], _shown: Shown<'_>) -> Verdict {
             self.0.clone()
         }
         fn model(&self) -> &str {
@@ -211,24 +284,24 @@ mod tests {
     async fn every_answer_a_classifier_can_give_is_handled() {
         let labels = cfg(&[("gore", 0.9, Gravity::Grave)]);
         let cases = [
-            (Verdict::Clean, 0, "the model looked and found nothing"),
-            (Verdict::Flagged(vec![]), 0, "it looked and nothing cleared the bar"),
-            (Verdict::Flagged(vec![label("gore", 0.95)]), 1, "over the bar"),
+            (Verdict::Clean { description: None }, 0, "the model looked and found nothing"),
+            (Verdict::Flagged { labels: vec![], description: None }, 0, "it looked and nothing cleared the bar"),
+            (Verdict::Flagged { labels: vec![label("gore", 0.95)], description: None }, 1, "over the bar"),
             (Verdict::Unknown("timed out".into()), 0, "a timeout is not an all-clear"),
         ];
 
         for (verdict, want_hits, why) in cases {
             let fake = Fake(verdict.clone());
-            let got = fake.classify(b"bytes", "image/png").await;
+            let got = fake.classify(b"bytes", Shown::Still { mime: "image/png" }).await;
             assert_eq!(got, verdict, "{why}");
             let hits = match &got {
-                Verdict::Flagged(ls) => over_threshold(ls, &labels).len(),
+                Verdict::Flagged { labels: ls, .. } => over_threshold(ls, &labels).len(),
                 _ => 0,
             };
             assert_eq!(hits, want_hits, "{why}");
             // The distinction the whole lane rests on.
             assert!(
-                !matches!(got, Verdict::Unknown(_)) || got != Verdict::Clean,
+                !matches!(got, Verdict::Unknown(_)) || !matches!(got, Verdict::Clean { .. }),
                 "Unknown must never equal Clean"
             );
         }
@@ -241,7 +314,7 @@ mod tests {
         for why in ["timed out", "model refused", "cache unreadable: bad json", ""] {
             let v = Verdict::Unknown(why.into());
             assert!(matches!(&v, Verdict::Unknown(w) if w == why));
-            assert_ne!(v, Verdict::Clean);
+            assert_ne!(v, Verdict::Clean { description: None });
         }
     }
 }

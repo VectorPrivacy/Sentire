@@ -42,6 +42,9 @@ pub struct Facts<'a> {
     /// Members this community has, as the last evaluation counted them.
     pub roster: usize,
     pub is_me: bool,
+    /// Is this sentence answering what they POSTED, or how they were acting?
+    /// Standing spares the second and not the first.
+    pub for_content: bool,
 }
 
 /// How many DISTINCT people Sentinel may answer for here in an hour.
@@ -79,6 +82,30 @@ pub fn armed_for(cfg: &CommunityPolicy, response: Response) -> bool {
 /// records anything, and three hand-written copies of this rule had already
 /// drifted apart — the sweep's omitted `unknown` and `absent`, so it built a
 /// silent backlog on members the gate would always spare.
+/// Does standing spare this member from a CONTENT rule?
+///
+/// Only a role at or above Sentinel's own does. Trust is earned by not behaving
+/// like a spammer, which says nothing about what somebody may post — so a
+/// trusted regular is judged on content exactly like anyone else.
+///
+/// Unresolved standing still fails CLOSED. "Not knowing" is not "knowing they
+/// are not an admin", and this gate decides whether attachments get decrypted
+/// and posted to somebody else's server.
+pub fn spared_from_content(shield: &str) -> Option<&'static str> {
+    match shield {
+        "protected" => Some("protected"),
+        "unknown" => Some("standing not yet established"),
+        "absent" => Some("not on the roster"),
+        // Trusted is DELIBERATELY absent: see above.
+        "none" | "trusted" | "indeterminate" => None,
+        // Upstream's vocabulary having moved. Falling through would read a
+        // renamed shield as unshielded, which is the one direction drift must
+        // never take.
+        _ => Some("standing not recognised"),
+    }
+}
+
+/// Does standing spare this member from a HEURISTIC rule?
 pub fn spared_by_standing(cfg: &CommunityPolicy, shield: &str) -> Option<&'static str> {
     match shield {
         "protected" => Some("protected"),
@@ -114,8 +141,14 @@ pub fn adjudicate(cfg: &CommunityPolicy, powers: Powers, facts: &Facts, response
         return Sentence::Spare { why: "roster unknown" };
     }
 
-    // Standing, first and unconditional.
-    if let Some(why) = spared_by_standing(cfg, facts.shield) {
+    // Standing, first. A content sentence answers what somebody posted, which
+    // only a role at or above Sentinel's own is spared from.
+    let spared = if facts.for_content {
+        spared_from_content(facts.shield)
+    } else {
+        spared_by_standing(cfg, facts.shield)
+    };
+    if let Some(why) = spared {
         return Sentence::Spare { why };
     }
 
@@ -168,7 +201,78 @@ mod tests {
             roster: 100,
             is_me: false,
             subjects_this_hour: 0,
+            for_content: false,
         }
+    }
+
+    /// Trust is earned by not behaving like a spammer. It says nothing about
+    /// what somebody may post, so it spares the behavioural rules and not the
+    /// word list, the link list or the media lane.
+    #[test]
+    fn a_trusted_regular_is_spared_behaviour_and_judged_on_content() {
+        let cfg = policy();
+        let heuristic = Facts { shield: "trusted", for_content: false, ..facts() };
+        assert!(
+            matches!(adjudicate(&cfg, all_powers(), &heuristic, Response::Warn), Sentence::Spare { .. }),
+            "a long-tenured member gets leniency on spam and mentions"
+        );
+        let content = Facts { shield: "trusted", for_content: true, ..facts() };
+        assert!(
+            !matches!(adjudicate(&cfg, all_powers(), &content, Response::Warn), Sentence::Spare { .. }),
+            "trust is not a licence to post what the community banned outright"
+        );
+    }
+
+    /// A role at or above Sentinel's own is ignored either way. A bot that can
+    /// action its own admins is one bad rule away from decapitating a community.
+    #[test]
+    fn an_admin_is_spared_whatever_the_rule() {
+        let cfg = policy();
+        for for_content in [false, true] {
+            let f = Facts { shield: "protected", for_content, ..facts() };
+            assert!(
+                matches!(adjudicate(&cfg, all_powers(), &f, Response::Warn), Sentence::Spare { .. }),
+                "for_content={for_content}"
+            );
+        }
+    }
+
+    /// Unresolved standing fails CLOSED on both paths. "Not knowing" is not
+    /// "knowing they are not an admin", and on the content path this gate also
+    /// decides whether attachments are decrypted and shipped off the machine.
+    #[test]
+    fn unresolved_standing_is_spared_on_both_paths() {
+        let cfg = policy();
+        for shield in ["unknown", "absent", "some-shield-upstream-added"] {
+            for for_content in [false, true] {
+                let f = Facts { shield, for_content, ..facts() };
+                assert!(
+                    matches!(adjudicate(&cfg, all_powers(), &f, Response::Warn), Sentence::Spare { .. }),
+                    "{shield} / for_content={for_content} must fail closed"
+                );
+            }
+        }
+    }
+
+    /// An ordinary member is judged on both, which is the case every other test
+    /// here assumes.
+    #[test]
+    fn an_ordinary_member_is_judged_on_both() {
+        let cfg = policy();
+        for for_content in [false, true] {
+            let f = Facts { shield: "none", for_content, ..facts() };
+            assert!(!matches!(adjudicate(&cfg, all_powers(), &f, Response::Warn), Sentence::Spare { .. }));
+        }
+    }
+
+    /// `respect_trusted = false` reaches a community's regulars for behaviour
+    /// too — the content path was already reaching them.
+    #[test]
+    fn turning_off_respect_trusted_reaches_behaviour_as_well() {
+        let mut cfg = policy();
+        cfg.shields.respect_trusted = false;
+        let f = Facts { shield: "trusted", for_content: false, ..facts() };
+        assert!(!matches!(adjudicate(&cfg, all_powers(), &f, Response::Warn), Sentence::Spare { .. }));
     }
 
     fn policy() -> CommunityPolicy {
@@ -521,6 +625,7 @@ mod tests {
                 subjects_this_hour: 9999,
                 roster: 1,
                 is_me: false,
+            for_content: false,
             };
             assert!(
                 matches!(adjudicate(&cfg, Powers::default(), &f, Response::Ban), Sentence::Spare { .. }),

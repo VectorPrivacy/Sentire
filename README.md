@@ -168,8 +168,31 @@ answered is excluded from the count, so someone already inside the bound still c
 
 Optional, off by default. When `[vision] enabled` is set, Sentinel decrypts attachments as
 they arrive, asks a vision model to score them against labels you named, and feeds anything
-over its threshold into the same strike ladder as everything else. Images and video both, by
+over its threshold into the same strike ladder as everything else.
+
+Each label carries the operator's own `describe` sentence, sent to the model with the name —
+a bare label is the model's guess at what a community means by "spam", and a sentence is the
+operator's answer. The model returns a score per label **and** one sentence describing what the
+media actually shows, which is stored on the strike record: a moderator reviewing a decision
+months later reads a line of text instead of reopening the worst thing somebody posted.
+
+The answer shape is pinned by a JSON schema where the endpoint supports one, and checked by the
+parser regardless. A reply that is prose, fenced, truncated or missing a label is sent back with
+the fault named, up to `max_attempts`. That bound is deliberate: a model that never complies
+would hold the blob slot and spend the budget forever, and unjudged — which escalates to a
+person — is the safe end of that. Images and video both, by
 whatever `[vision] mimes` lists.
+
+Video is not sent to the model whole, because no vision endpoint reads an mp4. ffmpeg samples
+frames evenly across the **whole** clip and tiles them into one contact sheet, judged in a
+single call — so the thing worth catching is not hidden by being at 4:12 rather than 0:00.
+Animated GIF and WebP take the same path for the same reason. The grid shrinks to fit a clip
+with fewer frames than cells, since a blank tile costs pixels and asks the model to read a
+hole. Set the grid under `[vision.video]`.
+
+This is the one place Sentinel points a parser it did not write at attacker-supplied bytes, so
+ffmpeg runs as a **child process** under a wall clock: a decoder bug kills a child rather than
+the bot. Without ffmpeg on PATH, clips reach a person unjudged and still images are unaffected.
 
 llama.cpp's `llama-server` speaks the OpenAI-compatible shape out of the box, so local is the
 default and remote is the same block with a different `base_url`. That switch is deliberate:

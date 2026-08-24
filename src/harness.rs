@@ -273,6 +273,7 @@ impl Pipeline {
             subjects_this_hour: self.store.subjects_actioned_last_hour("c", now, &v.npub).unwrap(),
             roster: 50,
             is_me: false,
+            for_content: false,
         };
         match crate::adjudicate::adjudicate(&p, powers, &facts, rung) {
             crate::adjudicate::Sentence::Carry { response, .. } => {
@@ -323,7 +324,7 @@ pub(crate) mod tests {
         let mut cfg = Config::default();
         cfg.rules.words = vec![WordRule {
             id: id.into(),
-            patterns: patterns.iter().map(|s| s.to_string()).collect(),
+            title: String::new(), patterns: patterns.iter().map(|s| s.to_string()).collect(),
             gravity,
         }];
         rules::compile(&cfg.for_community("")).expect("a word rule is a rule")
@@ -333,7 +334,7 @@ pub(crate) mod tests {
         let mut cfg = Config::default();
         cfg.rules.links = vec![LinkRule {
             id: id.into(),
-            domains: domains.iter().map(|s| s.to_string()).collect(),
+            title: String::new(), domains: domains.iter().map(|s| s.to_string()).collect(),
             gravity,
         }];
         rules::compile(&cfg.for_community("")).expect("a link rule is a rule")
@@ -488,9 +489,9 @@ pub(crate) mod tests {
         w.says(who, "badword");
 
         let mut light = Config::default();
-        light.rules.words = vec![WordRule { id: "rude".into(), patterns: vec!["badword".into()], gravity: Gravity::Note }];
+        light.rules.words = vec![WordRule { id: "rude".into(), title: String::new(), patterns: vec!["badword".into()], gravity: Gravity::Note }];
         let mut heavy = Config::default();
-        heavy.rules.words = vec![WordRule { id: "rude".into(), patterns: vec!["badword".into()], gravity: Gravity::Grave }];
+        heavy.rules.words = vec![WordRule { id: "rude".into(), title: String::new(), patterns: vec!["badword".into()], gravity: Gravity::Grave }];
 
         let vs_light = w.verdicts(&rules::compile(&light.for_community("")).unwrap());
         let vs_heavy = w.verdicts(&rules::compile(&heavy.for_community("")).unwrap());
@@ -552,7 +553,10 @@ pub(crate) mod tests {
         }
     }
 
-    /// And offending again does climb.
+    /// And offending again does climb — through the SHIPPED ladder, end to end
+    /// against the real engine. Two warnings, then a kick, then a ban: a grave
+    /// offender is told twice before they lose access. Removal of the post is
+    /// not a rung, so the first warning already takes it down.
     #[test]
     fn offending_again_climbs_one_rung() {
         let policy = word_policy("rude", &["badword"], Gravity::Grave);
@@ -563,9 +567,11 @@ pub(crate) mod tests {
         w.says(who, "badword");
         assert_eq!(p.poll(&w, &policy, &who), Some(crate::config::Response::Warn));
         w.says(who, "badword again");
-        assert_eq!(p.poll(&w, &policy, &who), Some(crate::config::Response::DeleteAndWarn));
+        assert_eq!(p.poll(&w, &policy, &who), Some(crate::config::Response::Warn), "a second warning, not a kick");
         w.says(who, "badword once more");
         assert_eq!(p.poll(&w, &policy, &who), Some(crate::config::Response::Kick));
+        w.says(who, "badword yet again");
+        assert_eq!(p.poll(&w, &policy, &who), Some(crate::config::Response::Ban));
     }
 
     /// Forgiveness is built in: the same offenses spread out do not reach the
@@ -744,11 +750,11 @@ pub(crate) mod tests {
         for policy in [
             rules_policy(|r| {
                 r.rate = Some(crate::config::RateRule { enabled: false, per_secs: 60, messages: 5, gravity: Gravity::Minor });
-                r.words = vec![WordRule { id: "x".into(), patterns: vec!["zzz".into()], gravity: Gravity::Note }];
+                r.words = vec![WordRule { id: "x".into(), title: String::new(), patterns: vec!["zzz".into()], gravity: Gravity::Note }];
             }),
             rules_policy(|r| {
                 r.repetition = Some(crate::config::ToggleRule { enabled: false, times: 3, gravity: Gravity::Minor });
-                r.words = vec![WordRule { id: "x".into(), patterns: vec!["zzz".into()], gravity: Gravity::Note }];
+                r.words = vec![WordRule { id: "x".into(), title: String::new(), patterns: vec!["zzz".into()], gravity: Gravity::Note }];
             }),
         ] {
             let vs = w.verdicts(&policy);
@@ -790,7 +796,7 @@ pub(crate) mod tests {
         let rulebook = |cfg: &Config| {
             let mut c = cfg.clone();
             c.rules.words =
-                vec![WordRule { id: "rude".into(), patterns: vec!["badword".into()], gravity: Gravity::Grave }];
+                vec![WordRule { id: "rude".into(), title: String::new(), patterns: vec!["badword".into()], gravity: Gravity::Grave }];
             rules::compile(&c.for_community("")).expect("a rule is a rule")
         };
 
@@ -827,7 +833,7 @@ pub(crate) mod tests {
             let mut cfg = armed();
             cfg.shields.respect_trusted = false;
             cfg.rules.words =
-                vec![WordRule { id: "rude".into(), patterns: vec!["badword".into()], gravity }];
+                vec![WordRule { id: "rude".into(), title: String::new(), patterns: vec!["badword".into()], gravity }];
             Config::validate_for_test(&cfg)
                 .unwrap_or_else(|e| panic!("{gravity:?} with respect_trusted off must still boot: {e}"));
 
@@ -1052,6 +1058,7 @@ pub(crate) mod tests {
                 subjects_this_hour: rng.upto(50) as usize,
                 roster: rng.upto(500) as usize,
                 is_me: false,
+            for_content: false,
             };
             let powers = crate::policy::Powers { hide: true, kick: true, ban: true };
             for rung in [
@@ -1088,7 +1095,7 @@ pub(crate) mod tests {
                 Box::new(|r: &mut crate::config::Rules| {
                     r.words = vec![WordRule {
                         id: "words".into(),
-                        patterns: vec!["badword".into()],
+                        title: String::new(), patterns: vec!["badword".into()],
                         gravity: Gravity::Serious,
                     }]
                 }),
@@ -1098,7 +1105,7 @@ pub(crate) mod tests {
                 Box::new(|r: &mut crate::config::Rules| {
                     r.links = vec![LinkRule {
                         id: "links".into(),
-                        domains: vec!["evil.example".into()],
+                        title: String::new(), domains: vec!["evil.example".into()],
                         gravity: Gravity::Serious,
                     }]
                 }),

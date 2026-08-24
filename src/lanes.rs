@@ -53,7 +53,20 @@ pub(crate) async fn screen(
     // Standing BEFORE recording: the live screen sees one message, so a
     // long-tenured regular reads as untrusted here.
     let shield = resolve_absent(standing_of(watches, community.id(), &author), msg);
-    if crate::adjudicate::spared_by_standing(&policy, &shield).is_some() {
+    // Per FINDING, not per member. A trusted regular is spared the behavioural
+    // rules — rate, repetition, mass tagging — because that is what their record
+    // earned them; they are not spared the word and link lists, which say what
+    // this community does not host regardless of who posts it.
+    let spared_heuristics = crate::adjudicate::spared_by_standing(&policy, &shield).is_some();
+    let spared_content = crate::adjudicate::spared_from_content(&shield).is_some();
+    if spared_heuristics && spared_content {
+        return Ok(false);
+    }
+    let findings: Vec<_> = findings
+        .into_iter()
+        .filter(|f| if policy.is_content_rule(&f.rule_id, &cfg.vision.labels) { !spared_content } else { !spared_heuristics })
+        .collect();
+    if findings.is_empty() {
         return Ok(false);
     }
     let mut fresh = false;
@@ -107,11 +120,33 @@ pub(crate) async fn screen(
 ///
 /// Adding a label or moving a threshold is a different question, and every
 /// blob has to be asked it again.
-pub(crate) fn asked_of(model: &str, cfg: &crate::config::VisionCfg) -> String {
+/// Types cut into a contact sheet rather than sent to the model whole.
+///
+/// Video always: no vision endpoint reads an mp4. Animated image formats too,
+/// because content in frame fifty of a GIF is invisible to a model shown only
+/// the first — the cheapest evasion there is. This needs no animation
+/// detection: a static source has one frame and collapses to a 1x1 sheet.
+pub(crate) fn sheeted(mime: &str, cfg: &crate::config::VisionCfg) -> bool {
+    cfg.video.enabled && (mime.starts_with("video/") || matches!(mime, "image/gif" | "image/webp"))
+}
+
+/// `mime` is part of the question because a sheeted type is never asked about
+/// directly: it is cut into a grid first, and a re-cut grid is a different set
+/// of frames. A verdict cached under the old geometry answers about pixels that
+/// were never sent.
+pub(crate) fn asked_of(model: &str, cfg: &crate::config::VisionCfg, mime: &str) -> String {
     let mut labels: Vec<String> =
         cfg.labels.iter().map(|l| format!("{}@{}", l.name, l.threshold)).collect();
     labels.sort();
-    format!("{model}?{}", labels.join(","))
+    // Keyed on the CONFIGURED grid, not the one a given clip ended up with:
+    // that follows from the clip's own frame count, which is fixed for fixed
+    // bytes. The configured grid is the part an operator changes.
+    let cut = if sheeted(mime, cfg) {
+        format!("+{}x{}@{}", cfg.video.cols, cfg.video.rows, cfg.video.tile_width)
+    } else {
+        String::new()
+    };
+    format!("{model}?{}{cut}", labels.join(","))
 }
 
 /// What to do about one attachment, before any byte is fetched.
@@ -136,6 +171,9 @@ pub(crate) fn gate(extension: &str, declared_size: u64, cfg: &crate::config::Vis
     let declared = vector_sdk::vector_core::crypto::mime_from_extension(extension);
     if !declared.starts_with("image/") && !declared.starts_with("video/") {
         return Gate::Skip;
+    }
+    if declared.starts_with("video/") && !cfg.video.enabled {
+        return Gate::Refuse("video judging is switched off");
     }
     if declared_size > cfg.max_bytes {
         return Gate::Refuse("declared over the size limit");
@@ -173,17 +211,18 @@ pub(crate) async fn watch_media(
     // that is then thrown away.
     let shield = resolve_absent(standing_of(watches, community.id(), &author), msg);
     let policy = cfg.for_community(community.id());
-    if crate::adjudicate::spared_by_standing(&policy, &shield).is_some() {
+    // What somebody posted is a content question, so only a role at or above
+    // Sentinel's spares them from it. A trusted regular's media is judged.
+    if crate::adjudicate::spared_from_content(&shield).is_some() {
         return Ok(());
     }
     let now = now_ms();
     // The cache remembers a verdict; `asked` remembers the QUESTION. Keyed on
     // the model alone, a blob classified before a label existed was exempt from
     // that label for good — the answer was cached, the question was not.
-    let asked = asked_of(eyes.model(), &cfg.vision);
     let budget = crate::budget_of(watches, community.id(), cfg.vision.max_per_min);
     // Every flagged attachment in this message, so one post is one sentence.
-    let mut flagged: Vec<String> = Vec::new();
+    let mut flagged: Vec<(String, String)> = Vec::new();
 
     for att in &msg.message.attachments {
         match gate(&att.extension, att.size, &cfg.vision) {
@@ -231,6 +270,8 @@ pub(crate) async fn watch_media(
             continue;
         }
         let content_hash = vector_sdk::vector_core::crypto::sha256_hex(&bytes);
+        // Before any sheet is cut: a hit must skip ffmpeg, not just the model.
+        let asked = asked_of(eyes.model(), &cfg.vision, actual);
         let verdict = match store.cached_verdict(&content_hash, &asked) {
             Some(cached) => match serde_json::from_str(&cached) {
                 Ok(v) => v,
@@ -243,7 +284,38 @@ pub(crate) async fn watch_media(
                     unclassified(bot, &community, cfg, store, watches, me, now, &att.id, "budget spent this minute").await;
                     continue;
                 }
-                let v = eyes.classify(&bytes, actual).await;
+                // A clip is cut into a contact sheet before anything is asked
+                // of the model: no vision endpoint reads an mp4, and sending one
+                // came back Unknown forever rather than being judged.
+                let sheet = if sheeted(actual, &cfg.vision) {
+                    Some(vision::storyboard::build(&bytes, &content_hash, &cfg.vision.video).await)
+                } else {
+                    None
+                };
+                let (payload, shown) = match sheet {
+                    Some(Ok((jpeg, board))) => {
+                        println!(
+                            "[media] {} — {}x{} sheet over {:.0}s",
+                            short(&att.id), board.cols, board.rows, board.covers_secs
+                        );
+                        (jpeg, vision::Shown::Storyboard { mime: "image/jpeg", board })
+                    }
+                    // A clip that cannot be cut cannot be judged at all, so it
+                    // reaches a person. An IMAGE still has a first frame worth
+                    // showing, which beats refusing every GIF on a box with no
+                    // ffmpeg — it is a weaker look, not no look.
+                    Some(Err(why)) if actual.starts_with("video/") => {
+                        unclassified(bot, &community, cfg, store, watches, me, now, &att.id, &why).await;
+                        continue;
+                    }
+                    Some(Err(why)) => {
+                        println!("[media] {} — no sheet ({why}); judging it as a still", short(&att.id));
+                        (bytes.clone(), vision::Shown::Still { mime: actual })
+                    }
+                    None => (bytes.clone(), vision::Shown::Still { mime: actual }),
+                };
+                println!("[media] {} — asking {} ({} KiB)", short(&att.id), eyes.model(), payload.len() / 1024);
+                let v = eyes.classify(&payload, shown).await;
                 // Never cache Unknown: one timeout would retire that blob from
                 // classification forever.
                 if !matches!(v, vision::Verdict::Unknown(_)) {
@@ -256,7 +328,16 @@ pub(crate) async fn watch_media(
         };
 
         match verdict {
-            vision::Verdict::Clean => {}
+            vision::Verdict::Clean { description } => {
+                // ALWAYS a line. Printing only when the model volunteered a
+                // description made a clean answer and a classification still in
+                // flight look identical from the log, which is the one thing an
+                // operator watching a live lane needs to tell apart.
+                match description {
+                    Some(d) => println!("[media] {} — clean: {d}", short(&att.id)),
+                    None => println!("[media] {} — clean", short(&att.id)),
+                }
+            }
             vision::Verdict::Unknown(why) => {
                 // Never an all-clear. An unreachable model is a reason to ask a
                 // person, not a reason to let everything through — and it goes
@@ -264,23 +345,42 @@ pub(crate) async fn watch_media(
                 // a model answering in prose is N publishes into a channel.
                 unclassified(bot, &community, cfg, store, watches, me, now, &att.id, &why).await;
             }
-            vision::Verdict::Flagged(labels) => {
+            vision::Verdict::Flagged { labels, description } => {
                 let hits = vision::over_threshold(&labels, &cfg.vision.labels);
                 if hits.is_empty() {
                     continue;
                 }
                 let (label, gravity) = hits[0].clone();
                 let worth = policy.ladder.strikes.worth(gravity);
-                let evidence = format!("{} ({:.0}% per {})", label.name, label.score * 100.0, eyes.model());
+                // What the RECORD holds is what the member is later quoted, so
+                // it carries the description and nothing else. A label name, a
+                // confidence and a model are how the operator tuned their
+                // rulebook; quoting them at somebody tells them how to dress a
+                // picture up to score 0.89 next time.
+                //
+                // The description earns its place twice over: a moderator
+                // reviewing this in a year reads a line of text instead of
+                // reopening the worst thing anybody posted.
+                let evidence = description
+                    .as_deref()
+                    .map(|d| d.to_string())
+                    .unwrap_or_else(|| "An image or video that broke the rules".to_string());
+                // The operator's console keeps the parts the member never sees.
+                let internals =
+                    format!("{} ({:.0}% per {})", label.name, label.score * 100.0, eyes.model());
                 // One strike per (blob, label): re-posting the same image is
                 // the same offense, escalating happens by posting more.
                 let conviction = format!("vision:{content_hash}:{}", label.name);
                 let fresh = store
                     .record(community.id(), &author, &conviction, worth, now, &evidence)
                     .map_err(vector_sdk::Error::Other)?;
-                println!("[media] FLAGGED {} from {} — {evidence}", short(&att.id), short(&author));
+                println!("[media] FLAGGED {} from {} — {internals} — {evidence}", short(&att.id), short(&author));
                 if fresh {
-                    flagged.push(evidence);
+                    // The LABEL, carried with its evidence. Filed under one
+                    // blanket id, which rule matched was lost by the time
+                    // anything had to name it, and members were told they broke
+                    // the "Vision" rule.
+                    flagged.push((label.name.clone(), evidence));
                 }
             }
         }
@@ -304,9 +404,10 @@ pub(crate) async fn watch_media(
     if ladder::decide(&ctx.policy.ladder, total).is_some() {
         let findings = flagged
             .iter()
-            .map(|e| own_finding("vision", e, msg.message.id.clone()))
+            .map(|(rule, e)| own_finding(rule, e, msg.message.id.clone()))
             .collect();
-        let v = own_verdict(&author, shield, flagged, findings);
+        let reasons = flagged.into_iter().map(|(_, e)| e).collect();
+        let v = own_verdict(&author, shield, reasons, findings);
         enforce(bot, &community, &ctx, store, watches, &Mutex::new(0), &v, &strikes).await?;
     }
     Ok(())
@@ -354,6 +455,18 @@ pub(crate) async fn evaluate_now(
     me: &str,
 ) {
     let cid = community.id().to_string();
+    // Pull the wave's MESSAGES before judging. The tripwire fires on the join
+    // burst, which arrives on the guestbook plane ahead of the chat plane — so
+    // without this the immediate eval reads a corpus of joins with no messages,
+    // the cohort (which clusters on message TEXT) finds nothing, and containment
+    // waits for a later sweep to ingest the spam. A raid measured in minutes
+    // cannot wait a sweep. Sync every channel first, bounded so a huge backlog
+    // can't stall the reaction.
+    for ch in community.channels().await {
+        if let Err(e) = bot.channel(ch.id()).sync(200).await {
+            eprintln!("[{}] tripwire sync of {}: {e}", short(community.id()), &ch.id()[..8.min(ch.id().len())]);
+        }
+    }
     // The 90-second memoisation is right for a background pass and far too slow
     // for a wave in progress.
     community.invalidate();
@@ -419,6 +532,20 @@ pub(crate) fn media_lane(cfg: &Config) -> vector_sdk::Result<Arc<Option<vision::
             format!("  ⚠ REMOTE — decrypted attachments leave this machine for {}", cfg.vision.base_url)
         }
     );
+    // At boot, not on the first clip. An operator who armed video judging and is
+    // missing ffmpeg otherwise learns about it from a mod-channel line saying an
+    // attachment went unjudged, hours later.
+    if cfg.vision.video.enabled {
+        match vision::storyboard::probe_tooling(&cfg.vision.video) {
+            Ok(v) => println!(
+                "  video: {}x{} sheets via {v}",
+                cfg.vision.video.cols, cfg.vision.video.rows
+            ),
+            Err(e) => println!("  ⚠ video: {e} — clips will go to a person unjudged"),
+        }
+    } else {
+        println!("  video: off — clips go to a person unjudged");
+    }
     Ok(Arc::new(Some(eyes)))
 }
 
@@ -558,7 +685,7 @@ mod tests {
     }
 
     fn label(name: &str, threshold: f32) -> crate::config::VisionLabel {
-        crate::config::VisionLabel { name: name.into(), threshold, gravity: crate::config::Gravity::Grave }
+        crate::config::VisionLabel { name: name.into(), title: String::new(), describe: String::new(), threshold, gravity: crate::config::Gravity::Grave }
     }
 
     /// The answer was cached and the question was not, so a blob classified
@@ -567,16 +694,100 @@ mod tests {
     fn changing_what_is_asked_changes_the_cache_key() {
         let mut cfg = vision();
         cfg.labels = vec![label("gore", 0.9)];
-        let one = asked_of("llava", &cfg);
+        let one = asked_of("llava", &cfg, "image/png");
 
         cfg.labels.push(label("sexual_content", 0.9));
-        let two = asked_of("llava", &cfg);
+        let two = asked_of("llava", &cfg, "image/png");
         assert_ne!(one, two, "a new label is a new question");
 
         cfg.labels = vec![label("gore", 0.5)];
-        assert_ne!(asked_of("llava", &cfg), one, "so is a moved threshold");
+        assert_ne!(asked_of("llava", &cfg, "image/png"), one, "so is a moved threshold");
 
-        assert_ne!(asked_of("other-model", &cfg), asked_of("llava", &cfg), "and so is a different model");
+        assert_ne!(asked_of("other-model", &cfg, "image/png"), asked_of("llava", &cfg, "image/png"), "and so is a different model");
+    }
+
+    /// Same trap as the labels, one level down: a clip is never asked about
+    /// directly, it is cut into a grid first. Re-cut it and the model is shown
+    /// different frames, so a verdict cached under the old grid answers about
+    /// pixels that were never sent.
+    #[test]
+    fn recutting_the_grid_changes_the_cache_key_for_video() {
+        let mut cfg = vision();
+        cfg.labels = vec![label("gore", 0.9)];
+        let before = asked_of("llava", &cfg, "video/mp4");
+
+        cfg.video.cols = 4;
+        assert_ne!(asked_of("llava", &cfg, "video/mp4"), before, "a wider grid is a new question");
+
+        cfg.video.cols = 3;
+        cfg.video.rows = 3;
+        assert_ne!(asked_of("llava", &cfg, "video/mp4"), before, "a taller grid is too");
+
+        cfg.video.rows = 2;
+        cfg.video.tile_width = 256;
+        assert_ne!(asked_of("llava", &cfg, "video/mp4"), before, "and so is a coarser tile");
+    }
+
+    /// A still is not cut, so the grid is not part of ITS question — otherwise
+    /// tuning video re-bills every image ever classified.
+    #[test]
+    fn the_grid_is_not_part_of_the_question_asked_of_a_still() {
+        let mut cfg = vision();
+        cfg.labels = vec![label("gore", 0.9)];
+        let before = asked_of("llava", &cfg, "image/png");
+        cfg.video.cols = 4;
+        cfg.video.tile_width = 256;
+        assert_eq!(asked_of("llava", &cfg, "image/png"), before);
+    }
+
+    /// Switching video off must not read as a clean answer for video: nobody
+    /// looked, so a person is told.
+    #[test]
+    fn video_switched_off_is_refused_rather_than_skipped() {
+        let mut cfg = vision();
+        cfg.video.enabled = false;
+        assert!(matches!(gate("mp4", 1024, &cfg), Gate::Refuse(_)), "silence would read as clean");
+        assert_eq!(gate("png", 1024, &cfg), Gate::Fetch, "stills are unaffected");
+        cfg.video.enabled = true;
+        assert_eq!(gate("mp4", 1024, &cfg), Gate::Fetch);
+    }
+
+    /// Animated formats are clips in image containers, and a static one costs
+    /// nothing extra: it has a single frame and collapses to a 1x1 sheet.
+    #[test]
+    fn animated_image_formats_are_cut_into_sheets_too() {
+        let mut cfg = vision();
+        for mime in ["video/mp4", "video/webm", "image/gif", "image/webp"] {
+            assert!(sheeted(mime, &cfg), "{mime} hides later frames from a single look");
+        }
+        for mime in ["image/png", "image/jpeg"] {
+            assert!(!sheeted(mime, &cfg), "{mime} is one frame by definition");
+        }
+        cfg.video.enabled = false;
+        for mime in ["video/mp4", "image/gif", "image/webp"] {
+            assert!(!sheeted(mime, &cfg), "{mime}: nothing is cut with the tooling switched off");
+        }
+    }
+
+    /// The routing and the cache key have to agree about what gets cut, or a
+    /// sheet is judged under a key minted for a whole file.
+    #[test]
+    fn the_cache_key_covers_exactly_what_gets_sheeted() {
+        let mut cfg = vision();
+        for mime in ["video/mp4", "image/gif", "image/webp", "image/png", "image/jpeg"] {
+            let before = asked_of("llava", &cfg, mime);
+            let mut wider = cfg.clone();
+            wider.video.cols = 4;
+            let changed = asked_of("llava", &wider, mime) != before;
+            assert_eq!(changed, sheeted(mime, &cfg), "{mime}: key and routing disagree");
+        }
+        cfg.video.enabled = false;
+        for mime in ["video/mp4", "image/gif"] {
+            let before = asked_of("llava", &cfg, mime);
+            let mut wider = cfg.clone();
+            wider.video.cols = 4;
+            assert_eq!(asked_of("llava", &wider, mime), before, "{mime}: nothing is cut, so the grid is not asked");
+        }
     }
 
     /// Order in the file is not part of the question.
@@ -586,7 +797,7 @@ mod tests {
         a.labels = vec![label("gore", 0.9), label("sexual_content", 0.8)];
         let mut b = vision();
         b.labels = vec![label("sexual_content", 0.8), label("gore", 0.9)];
-        assert_eq!(asked_of("llava", &a), asked_of("llava", &b));
+        assert_eq!(asked_of("llava", &a, "image/png"), asked_of("llava", &b, "image/png"));
     }
 
     /// The minute is per community: one room's flood must not decide another

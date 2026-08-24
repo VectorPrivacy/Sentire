@@ -226,6 +226,11 @@ impl Store {
     /// counting either meant report mode halted the containment it was
     /// rehearsing — and an operator following the documented rollout, report
     /// then kick, found the first real containment already over its ceiling.
+    // Retained for the deferred CUMULATIVE-tenured raid gate: the per-pass gates
+    // now protect established members (tenure-aware), but a slow drip of one
+    // tenured member per pass over an hour still needs an across-time count that
+    // knows tenure. This is its clearest starting point; kept tested until then.
+    #[allow(dead_code)]
     pub fn contained_last_hour(&self, community: &str, now_ms: u64) -> Result<usize, String> {
         let since = now_ms.saturating_sub(3_600_000) as i64;
         self.lock()
@@ -341,7 +346,16 @@ impl Store {
             .optional()
             .map_err(|e| e.to_string())?;
         let changed = seen.as_deref().is_some_and(|s| s != classes);
-        if changed {
+        // ONLY out of a rehearsal. A dry run records everything and answers
+        // nobody, so arming afterwards would fire the whole backlog at the top
+        // rung and ban somebody who had never actually been warned.
+        //
+        // Every other arming change keeps the record. Rows written while a bot
+        // was live are answers it really delivered to real people, and adding a
+        // rung to a working config must not silently pardon the community.
+        let leaving_rehearsal = seen.as_deref().is_some_and(str::is_empty);
+        let wiped = changed && leaving_rehearsal;
+        if wiped {
             tx.execute("DELETE FROM strikes WHERE community = ?1", [community]).map_err(|e| e.to_string())?;
             tx.execute("DELETE FROM actions WHERE community = ?1", [community]).map_err(|e| e.to_string())?;
         }
@@ -351,7 +365,7 @@ impl Store {
         )
         .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
-        Ok(changed)
+        Ok(wiped)
     }
 
     /// Clear one member's record. The undo an operator needs when Sentinel is
@@ -405,6 +419,42 @@ impl Store {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+
+    /// Only the rehearsal boundary wipes. Every other arming change is an
+    /// operator tuning a live bot, and the rows are answers it really delivered.
+    #[test]
+    fn arming_more_rungs_on_a_live_bot_keeps_the_record() {
+        let s = mem();
+
+        // A rehearsal: nothing armed, and it records what it WOULD have done.
+        assert!(!s.note_armed("c", "").unwrap(), "the first sighting is not a change");
+        s.record("c", "npub1a", "x", 12, 1_000, "e").unwrap();
+        assert_eq!(s.strikes("c", "npub1a").unwrap().len(), 1);
+
+        // Arming it: those rows answered nobody, so firing them at the top rung
+        // would ban somebody who had never been warned.
+        assert!(s.note_armed("c", "warn delete").unwrap(), "leaving a rehearsal wipes");
+        assert!(s.strikes("c", "npub1a").unwrap().is_empty());
+
+        // Now live. Two real warnings, really delivered.
+        s.record("c", "npub1a", "y", 12, 2_000, "e").unwrap();
+        s.record("c", "npub1a", "z", 12, 3_000, "e").unwrap();
+        s.log_action("c", "npub1a", "warn", 3_100, "e").unwrap();
+
+        // Adding a rung must not silently pardon the community.
+        assert!(!s.note_armed("c", "warn delete kick ban").unwrap(), "a live change keeps the record");
+        assert_eq!(s.strikes("c", "npub1a").unwrap().len(), 2, "their history survived");
+        assert!(!s.answers("c", "npub1a").unwrap().is_empty(), "and so did what was delivered");
+
+        // Disarming back down keeps it too — the same reasoning in reverse.
+        assert!(!s.note_armed("c", "warn").unwrap());
+        assert_eq!(s.strikes("c", "npub1a").unwrap().len(), 2);
+
+        // And an unchanged restart is not a change at all.
+        assert!(!s.note_armed("c", "warn").unwrap());
+        assert_eq!(s.strikes("c", "npub1a").unwrap().len(), 2);
+    }
+
 
     pub fn mem() -> Store {
         let conn = Connection::open_in_memory().unwrap();
@@ -571,14 +621,16 @@ pub mod tests {
         assert_eq!(s.strikes("c", "npub1a").unwrap().len(), 1, "the new offense stands on its own");
     }
 
-    /// Arming wipes the slate, which is the whole reason there is one ledger.
+    /// Leaving a rehearsal wipes the slate, which is the whole reason there is
+    /// one ledger. Nothing else does.
     #[test]
-    fn a_change_of_arming_is_noticed_once() {
+    fn only_leaving_a_rehearsal_wipes() {
         let s = mem();
-        assert!(!s.note_armed("c", "warn").unwrap(), "the first sight of a config is not a change");
-        assert!(!s.note_armed("c", "warn").unwrap(), "and neither is seeing it again");
-        assert!(s.note_armed("c", "warn kick").unwrap(), "arming a class is");
-        assert!(s.note_armed("c", "warn").unwrap(), "and so is disarming one");
+        assert!(!s.note_armed("c", "").unwrap(), "the first sight of a config is not a change");
+        assert!(!s.note_armed("c", "").unwrap(), "and neither is seeing it again");
+        assert!(s.note_armed("c", "warn").unwrap(), "arming after a rehearsal is");
+        assert!(!s.note_armed("c", "warn kick").unwrap(), "adding a rung to a live bot is not");
+        assert!(!s.note_armed("c", "warn").unwrap(), "and neither is taking one away");
         assert!(!s.note_armed("other", "warn").unwrap(), "per community");
     }
 
@@ -588,13 +640,13 @@ pub mod tests {
     #[test]
     fn arming_clears_the_slate_of_that_community_only() {
         let s = mem();
-        s.note_armed("c", "warn").unwrap();
-        s.note_armed("other", "warn").unwrap();
+        s.note_armed("c", "").unwrap();
+        s.note_armed("other", "").unwrap();
         s.record("c", "npub1a", "x", 4, 0, "rehearsed").unwrap();
         s.log_action("c", "npub1a", "warn", 0, "").unwrap();
         s.record("other", "npub1b", "y", 4, 0, "").unwrap();
 
-        assert!(s.note_armed("c", "warn kick").unwrap(), "arming a class is a change");
+        assert!(s.note_armed("c", "warn kick").unwrap(), "arming after a rehearsal is a change");
         assert!(s.strikes("c", "npub1a").unwrap().is_empty());
         assert!(s.answers("c", "npub1a").unwrap().iter().all(|a| crate::config::Response::rank_of(&a.response) == 0));
         assert_eq!(s.strikes("other", "npub1b").unwrap().len(), 1, "and only that community");
@@ -605,7 +657,7 @@ pub mod tests {
     #[test]
     fn arming_clears_tombstones_too() {
         let s = mem();
-        s.note_armed("c", "warn").unwrap();
+        s.note_armed("c", "").unwrap();
         s.record("c", "npub1a", "x", 4, 0, "").unwrap();
         s.pardon("c", "npub1a").unwrap();
         assert!(!s.record("c", "npub1a", "x", 4, 1, "").unwrap(), "tombstoned");

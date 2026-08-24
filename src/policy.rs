@@ -25,6 +25,22 @@ pub struct CommunityPolicy {
     pub raid: Raid,
 }
 
+/// `sexual_content` becomes `Sexual Content`. A fallback, not a feature: an
+/// operator who wants **NSFW** writes `title = "NSFW"`.
+fn titleize(id: &str) -> String {
+    id.split(['_', '-', '.'])
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut c = w.chars();
+            match c.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// A per-community override block. Every field is optional and falls back to
 /// the top-level default, so an operator names only what differs.
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -226,6 +242,51 @@ impl CommunityPolicy {
         }
     }
 
+    /// What a rule is CALLED when a member is told they broke it.
+    ///
+    /// The operator's `title` if they wrote one, else the id tidied into words:
+    /// an id is a config key and a ledger column, and `sexual_content` read out
+    /// to somebody names the machine rather than the rule.
+    /// `vision` is passed rather than held: the media lane is process-wide,
+    /// while a rulebook is per-community, and the two disagree about scope.
+    pub fn title_of(&self, rule_id: &str, vision: &[crate::config::VisionLabel]) -> String {
+        let named = self
+            .rules
+            .words
+            .iter()
+            .find(|w| w.id == rule_id)
+            .map(|w| w.title.as_str())
+            .or_else(|| self.rules.links.iter().find(|l| l.id == rule_id).map(|l| l.title.as_str()))
+            .or_else(|| vision.iter().find(|l| l.name == rule_id).map(|l| l.title.as_str()))
+            .unwrap_or("");
+        if !named.trim().is_empty() {
+            return named.trim().to_string();
+        }
+        titleize(rule_id)
+    }
+
+    /// Content, or behaviour?
+    ///
+    /// A CONTENT rule answers "what did they post" — the operator's own word and
+    /// link lists, and the media lane. A HEURISTIC answers "how are they acting"
+    /// — rate, repetition, mass tagging, raid cohorts — each an inference from a
+    /// pattern rather than from anything in a message.
+    ///
+    /// Standing only ever spares the second kind. A regular earns trust by not
+    /// behaving like a spammer, and that is not a licence to post what the
+    /// community banned outright. Anything the operator did not name is treated
+    /// as heuristic: the engine's built-ins are all behavioural, and guessing
+    /// the other way would act on a shielded member over a rule nobody wrote.
+    /// `vision` is passed for the same reason [`Self::title_of`] takes it: the
+    /// media lane is process-wide and a rulebook is per-community.
+    pub fn is_content_rule(&self, rule_id: &str, vision: &[crate::config::VisionLabel]) -> bool {
+        // A media label answers for a picture, not for a pattern — the most
+        // content-ish thing Sentinel produces.
+        vision.iter().any(|l| l.name == rule_id)
+            || self.rules.words.iter().any(|w| w.id == rule_id)
+            || self.rules.links.iter().any(|l| l.id == rule_id)
+    }
+
     /// The gravity this community assigns a rule, or the engine severity as a
     /// fallback when its operator never named one.
     pub fn gravity_of(&self, rule_id: &str, severity: &str) -> Gravity {
@@ -295,6 +356,67 @@ impl Powers {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// The operator's own word wins over the tidied id.
+    #[test]
+    fn an_operators_title_is_what_a_member_is_told() {
+        let mut cfg = crate::config::Config::default();
+        cfg.rules.words = vec![crate::config::WordRule {
+            id: "slurs_v2".into(),
+            title: "Hate Speech".into(),
+            patterns: vec!["x".into()],
+            gravity: crate::config::Gravity::Grave,
+        }];
+        let p = cfg.for_community("");
+        let vision = vec![crate::config::VisionLabel {
+            name: "sexual_content".into(),
+            title: "NSFW".into(),
+            describe: String::new(),
+            threshold: 0.9,
+            gravity: crate::config::Gravity::Grave,
+        }];
+        assert_eq!(p.title_of("slurs_v2", &vision), "Hate Speech");
+        assert_eq!(p.title_of("sexual_content", &vision), "NSFW");
+        // Anything nobody named still reads as words, never as a key.
+        assert_eq!(p.title_of("mass_tagging", &vision), "Mass Tagging");
+    }
+
+    /// A media conviction is filed under the LABEL that matched, so the rule can
+    /// be named. Filed under one blanket id, every NSFW hit told the member they
+    /// broke the "Vision" rule — the name of the subsystem, not of the rule.
+    #[test]
+    fn a_media_conviction_is_named_for_its_label() {
+        let cfg = crate::config::Config::default();
+        let p = cfg.for_community("");
+        let vision = vec![crate::config::VisionLabel {
+            name: "sexual_content".into(),
+            title: "NSFW".into(),
+            describe: String::new(),
+            threshold: 0.9,
+            gravity: crate::config::Gravity::Grave,
+        }];
+        assert_eq!(p.title_of("sexual_content", &vision), "NSFW");
+        assert!(p.is_content_rule("sexual_content", &vision), "a label is content, so standing does not spare it");
+        // The old blanket id is nobody's rule now.
+        assert!(!p.is_content_rule("vision", &vision));
+    }
+
+    /// An id is a config key and a ledger column. Read out to the person it was
+    /// used on, `sexual_content` names the machine rather than the rule.
+    #[test]
+    fn a_rule_is_named_for_the_member_not_for_the_config() {
+        assert_eq!(titleize("sexual_content"), "Sexual Content");
+        assert_eq!(titleize("slurs"), "Slurs");
+        assert_eq!(titleize("scam-links"), "Scam Links");
+        assert_eq!(titleize("rules.v2"), "Rules V2");
+        assert_eq!(titleize(""), "");
+        // No underscore may survive into anything a member reads.
+        for id in ["sexual_content", "a__b", "_leading", "trailing_"] {
+            assert!(!titleize(id).contains('_'), "{id} kept its underscore");
+        }
+    }
+
     use super::*;
 
     #[test]

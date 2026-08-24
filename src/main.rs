@@ -396,17 +396,37 @@ async fn main() -> vector_sdk::Result<()> {
 /// how to appeal. Only on a real difference: a kind-0 per restart is noise on
 /// every relay that carries it.
 async fn introduce(bot: &VectorBot, want: &crate::config::Profile) {
+    let (avatar, banner) = (hosted(bot, &want.avatar).await, hosted(bot, &want.banner).await);
     let now = bot.fetch_profile(&bot.npub()).await;
     let same = now.as_ref().is_some_and(|p| {
-        p.name == want.name && p.about == want.about && p.avatar == want.avatar && p.banner == want.banner
+        p.name == want.name && p.about == want.about && p.avatar == avatar && p.banner == banner
     });
     if same {
         return;
     }
-    if bot.update_profile(&want.name, &want.avatar, &want.banner, &want.about).await {
+    if bot.update_profile(&want.name, &avatar, &banner, &want.about).await {
         println!("published profile — {}", want.name);
     } else {
         eprintln!("could not publish profile; members looking up this npub will find nothing");
+    }
+}
+
+/// Resolve a configured image to a URL members can actually load.
+///
+/// A path is uploaded and a URL passes through, so an operator can point at a
+/// file on disk without hosting it first. Re-uploading each boot is deliberate:
+/// Blossom addresses blobs by their hash, so unchanged bytes come back as the
+/// same URL and the caller's change check still spares the relays a kind-0.
+async fn hosted(bot: &VectorBot, configured: &str) -> String {
+    if configured.is_empty() || configured.contains("://") {
+        return configured.to_string();
+    }
+    match bot.upload_image(configured).await {
+        Ok(url) => url,
+        Err(e) => {
+            eprintln!("could not upload profile image {configured}: {e}");
+            String::new()
+        }
     }
 }
 
@@ -428,7 +448,7 @@ fn ladder_classes(p: &crate::policy::CommunityPolicy) -> String {
 fn wipe_on_arming_change(cfg: &Config, community: &Community, store: &Arc<Store>) {
     let classes = ladder_classes(&cfg.for_community(community.id()));
     match store.note_armed(community.id(), &classes) {
-        Ok(true) => println!("{} — arming changed, starting from a clean slate", short(community.id())),
+        Ok(true) => println!("{} — armed after a rehearsal, starting from a clean slate", short(community.id())),
         Ok(false) => {}
         Err(e) => eprintln!("{}: {e}", short(community.id())),
     }
@@ -586,16 +606,34 @@ mod tests {
         assert_eq!(store.strikes("c", "npub1a").unwrap().len(), 1);
     }
 
-    /// And arming a ladder class still does wipe.
+    /// Arming a ladder class out of a REHEARSAL wipes: those rows answered
+    /// nobody, so firing them at the top rung would ban somebody who had never
+    /// been warned.
     #[test]
-    fn arming_a_ladder_class_still_wipes() {
+    fn arming_after_a_rehearsal_wipes() {
+        let store = Arc::new(crate::store::tests::mem());
+        let dry: Config = toml::from_str("[arm]\n").unwrap();
+        assert_eq!(ladder_classes(&dry.for_community("c")), "", "a rehearsal arms nothing");
+        store.note_armed("c", &ladder_classes(&dry.for_community("c"))).unwrap();
+        store.record("c", "npub1a", "x", 4, 0, "").unwrap();
+
+        let live: Config = toml::from_str("[arm]\nwarn = true\n").unwrap();
+        assert!(store.note_armed("c", &ladder_classes(&live.for_community("c"))).unwrap());
+        assert!(store.strikes("c", "npub1a").unwrap().is_empty());
+    }
+
+    /// Adding a rung to a LIVE bot does not. Those rows are warnings it really
+    /// delivered, and an operator tuning `[arm]` must not silently pardon their
+    /// whole community.
+    #[test]
+    fn arming_another_rung_on_a_live_bot_keeps_the_record() {
         let store = Arc::new(crate::store::tests::mem());
         let before: Config = toml::from_str("[arm]\nwarn = true\n").unwrap();
         store.note_armed("c", &ladder_classes(&before.for_community("c"))).unwrap();
         store.record("c", "npub1a", "x", 4, 0, "").unwrap();
 
         let after: Config = toml::from_str("[arm]\nwarn = true\nkick = true\n").unwrap();
-        assert!(store.note_armed("c", &ladder_classes(&after.for_community("c"))).unwrap());
-        assert!(store.strikes("c", "npub1a").unwrap().is_empty());
+        assert!(!store.note_armed("c", &ladder_classes(&after.for_community("c"))).unwrap());
+        assert_eq!(store.strikes("c", "npub1a").unwrap().len(), 1, "their history survived");
     }
 }

@@ -23,6 +23,10 @@ use crate::raid;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Charge {
     pub(crate) conviction: String,
+    /// The rule this charge came from, carried rather than parsed back out of
+    /// `conviction`: standing spares behavioural rules and not content ones, and
+    /// the two conviction id formats do not agree on where the rule id sits.
+    pub(crate) rule_id: String,
     pub(crate) worth: u32,
     pub(crate) evidence: String,
 }
@@ -83,7 +87,12 @@ pub(crate) fn charges(v: &vector_sdk::policy::Verdict, policy: &crate::policy::C
             // Under the id the live screen would have used, so whichever clock
             // reached the message first wins and the other is an ignored insert.
             for mid in &f.messages {
-                out.push(Charge { conviction: conviction_id(&f.rule_id, mid), worth, evidence: evidence.clone() });
+                out.push(Charge {
+                    conviction: conviction_id(&f.rule_id, mid),
+                    rule_id: f.rule_id.clone(),
+                    worth,
+                    evidence: evidence.clone(),
+                });
             }
             continue;
         }
@@ -99,6 +108,7 @@ pub(crate) fn charges(v: &vector_sdk::policy::Verdict, policy: &crate::policy::C
         // version does not — which is what the per-message id has always said.
         out.push(Charge {
             conviction: format!("win:{}:{}:{}", f.rule_id, f.scope, f.rung),
+            rule_id: f.rule_id.clone(),
             worth,
             evidence,
         });
@@ -186,7 +196,9 @@ pub(crate) async fn sweep(
         // built a silent backlog on members `enforce` would always spare —
         // ammunition for the day `respect_trusted` was turned off, or for any
         // path that failed to read their standing.
-        if let Some(why) = adjudicate::spared_by_standing(&ctx.policy, &v.shield) {
+        let spared_heuristics = adjudicate::spared_by_standing(&ctx.policy, &v.shield);
+        let spared_content = adjudicate::spared_from_content(&v.shield);
+        if let (Some(why), Some(_)) = (spared_heuristics, spared_content) {
             println!("[{id}] QUEUED  {} — {} ({why})", short(&v.npub), v.why());
             // Handled: without this their older strikes keep them in the debt
             // loop, which names a moderator in the log every single pass.
@@ -194,7 +206,25 @@ pub(crate) async fn sweep(
             continue;
         }
 
-        for c in charges(v, &ctx.policy) {
+        // Per CHARGE. A trusted regular is spared the behavioural rules their
+        // record earned them leniency on, and charged on the word and link
+        // lists, which say what this community does not host whoever posts it.
+        let kept: Vec<_> = charges(v, &ctx.policy)
+            .into_iter()
+            .filter(|c| {
+                if ctx.policy.is_content_rule(&c.rule_id, &ctx.vision_labels) {
+                    spared_content.is_none()
+                } else {
+                    spared_heuristics.is_none()
+                }
+            })
+            .collect();
+        if kept.is_empty() {
+            println!("[{id}] QUEUED  {} — {} (standing)", short(&v.npub), v.why());
+            handled.insert(v.npub.clone());
+            continue;
+        }
+        for c in kept {
             store.record(community.id(), &v.npub, &c.conviction, c.worth, now, &c.evidence).map_err(vector_sdk::Error::Other)?;
         }
         let strikes = store.strikes(community.id(), &v.npub).map_err(vector_sdk::Error::Other)?;
@@ -268,7 +298,7 @@ pub(crate) async fn contain(
     let id = short(community.id());
     let (suspects, response, armed) = match raid::select(verdicts, &ctx.policy, &ctx.me) {
         raid::Containment::Quiet => return Ok(()),
-        raid::Containment::Halt { suspects, roster } => {
+        raid::Containment::Halt { suspects, roster, tenured } => {
             // Claimed like any other containment: a raid stays detected for as
             // long as its evidence sits in the window, and an unclaimed halt
             // republished this line into a community channel every 90 seconds
@@ -278,10 +308,12 @@ pub(crate) async fn contain(
                 .claim(community.id(), &format!("halt:{}", now / 3_600_000), now, ttl)
                 .map_err(vector_sdk::Error::Other)?
             {
+                // A cohort this deep into ESTABLISHED members is a misfire or a
+                // raid that reached real people — either way a person's call.
+                // Fresh raiders never bring us here, however many.
                 let line = format!(
-                    "RAID HALT — {suspects} of {roster} members are over the bar, past the {}% ceiling. \
-                     Containing this many is a person's call, not mine.",
-                    ctx.policy.limits.halt_if_over_pct
+                    "RAID HALT — {tenured} established member(s) among {suspects} suspects (of {roster}) \
+                     are over the bar. Removing established members in bulk is a person's call, not mine.",
                 );
                 println!("[{id}] {line}");
                 announce(bot, community, ctx, &line).await;
@@ -305,10 +337,12 @@ pub(crate) async fn contain(
     }
 
     let verb = response.name();
-    // A ceiling that spans TIME, not one pass: `raid::select` halts only when a
-    // SINGLE pass is over the bar, so a sustained false positive contains a
-    // tenth every pass and empties the community without it ever firing.
-    let spent = store.contained_last_hour(community.id(), now).map_err(vector_sdk::Error::Other)?;
+    // Tenure of each suspect, to gate on ESTABLISHED members only — the same
+    // principle as `raid::select`'s halt, applied to what THIS pass would newly
+    // action. A raider's inflated roster must never raise the bar for removing
+    // the raider.
+    let tenure: std::collections::HashMap<&str, u64> =
+        verdicts.all().map(|v| (v.npub.as_str(), v.tenure_secs)).collect();
     // Claimed PER MEMBER, not per cohort. A wave arriving over many sweeps
     // grows the set every pass, so re-containing everyone already handled
     // means a key rotation each time.
@@ -332,15 +366,18 @@ pub(crate) async fn contain(
         return Ok(());
     }
 
-    // Measured against what will actually be acted on, after the claims.
-    if let Some(ceiling) = adjudicate::roster_ceiling(&ctx.policy, ctx.roster) {
-        if spent + fresh.len() > ceiling {
+    // Measured on ESTABLISHED members about to be actioned this pass — never on
+    // the raider-inflated roster. Fresh accounts are contained without limit.
+    let tenured_fresh = fresh
+        .iter()
+        .filter(|n| tenure.get(n.as_str()).copied().unwrap_or(0) >= ctx.policy.raid.protect_tenure_secs)
+        .count();
+    {
+        if tenured_fresh > ctx.policy.limits.halt_floor {
             let line = format!(
-                "RAID HALT — {spent} contained here in the last hour, {} more over the bar, past what {}% of {} members allows. \
+                "RAID HALT — {tenured_fresh} established member(s) would be {verb}ed this pass, over the {} allowed. \
                  A person decides from here.",
-                fresh.len(),
-                ctx.policy.limits.halt_if_over_pct,
-                ctx.roster
+                ctx.policy.limits.halt_floor,
             );
             println!("[{id}] {line}");
             for npub in &fresh {
@@ -377,6 +414,29 @@ pub(crate) async fn contain(
             let _ = store.release(community.id(), &format!("{scope}:{npub}"));
         }
         return Ok(());
+    }
+
+    // A public shout in the room the raid is hitting, the moment Sentinel moves —
+    // so the real members watching accounts pour in see it is being handled, not
+    // that the community is being overrun unanswered. Best-effort: a failed alert
+    // must never hold up the containment it announces.
+    if armed && response != RaidResponse::Report {
+        // Every readable public channel, not a cited-message lookup: a citation
+        // can fail to resolve (the message may not be locally held yet), and an
+        // alert that silently no-ops is the one message a raid most needs seen.
+        let alert = "🚨 **Raid detected** — locking down and clearing out the intruders.";
+        let mut posted = false;
+        for ch in community.channels().await {
+            if ch.is_readable() && !ch.is_private() {
+                match bot.channel(ch.id()).send(alert).await {
+                    Ok(_) => posted = true,
+                    Err(e) => eprintln!("[{id}] raid alert to {}: {e}", &ch.id()[..8.min(ch.id().len())]),
+                }
+            }
+        }
+        if posted {
+            println!("[{id}] raid alert posted");
+        }
     }
 
     // Act, THEN log — the same discipline the ladder keeps. Logging first meant
@@ -453,6 +513,12 @@ pub(crate) async fn contain(
     }
     if armed && response == RaidResponse::Report {
         announce(bot, community, ctx, &line).await;
+    }
+    // DM the mods WHO was removed, so a human can double-check the mass-action.
+    // Only for a real containment — a report or an unarmed suspicion removed
+    // nobody, and the mod channel line already carried those.
+    if armed && response != RaidResponse::Report && !done.is_empty() {
+        crate::act::notify_mods_raid(bot, ctx, verb, &done).await;
     }
     Ok(())
 }
@@ -798,7 +864,7 @@ mod tests {
         let mut cfg = crate::config::Config::default();
         cfg.rules.words = vec![crate::config::WordRule {
             id: "slurs".into(),
-            patterns: vec!["x".into()],
+            title: String::new(), patterns: vec!["x".into()],
             gravity: crate::config::Gravity::Grave,
         }];
         let p = cfg.for_community("");

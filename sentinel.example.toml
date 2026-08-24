@@ -89,20 +89,24 @@ window_messages = 4000
 strikes = { note = 1, minor = 2, serious = 4, grave = 12 }
 decay_half_life_hours = 168
 
+# The rungs, against a decayed running total. A rung is what happens to the
+# MEMBER; what happens to the post is not a rung at all. Whatever a conviction
+# cites is removed the first time it is answered, so content a community does
+# not host never outlives the warning that says so.
+#
+# A member sitting inside a band is answered at that band again on a fresh
+# offence, rather than climbing. With `grave` worth 12 that reads as: warned,
+# warned again, kicked, banned. Nobody is banned without having been told twice.
 [[ladder.steps]]
 at = 1
 response = "warn"
 
 [[ladder.steps]]
-at = 4
-response = "delete_and_warn"
-
-[[ladder.steps]]
-at = 8
+at = 36
 response = "kick"
 
 [[ladder.steps]]
-at = 12
+at = 48
 response = "ban"
 
 # A raid is one event, not forty members each earning strikes, so it skips the
@@ -143,18 +147,57 @@ allow_remote = false            # required for any host that is not loopback
 timeout_secs = 60
 max_bytes    = 8388608
 max_per_min  = 20
+# A ceiling on the model's ANSWER, not its input. The reply is a small JSON map;
+# anything longer is a model talking to itself, and a loop that runs to
+# timeout_secs holds that community's one blob slot for the whole of it.
+max_answer_tokens = 256
+# A model that answers in prose, fences its JSON, or drops a label is asked
+# again with the fault named. Bounded, not "until it complies": a model that
+# never complies would hold the blob slot and spend the budget forever, and
+# unjudged-then-escalated is the safe end of that.
+max_attempts      = 3
+# Local reasoning models otherwise spend the whole budget deliberating about a
+# picture and answer with truncated JSON, which reads as unjudged. Empty omits
+# the field; an endpoint that rejects it is retried once without it.
+reasoning_effort  = "none"
 # Whatever your model can read. Sentinel sends the bytes; an endpoint that
 # cannot answer for a video says so, and an unanswered attachment goes to a
 # person rather than being treated as clean.
 mimes        = ["image/png", "image/jpeg", "image/webp", "image/gif", "video/mp4", "video/webm"]
 
+# Clips are not sent to the model whole — no vision endpoint reads an mp4.
+# ffmpeg samples frames evenly across the WHOLE clip and tiles them into one
+# contact sheet, which the model judges in a single call. Animated GIF and WebP
+# go the same way: content in frame fifty is invisible to a model shown only the
+# first. Needs ffmpeg and ffprobe on PATH; without them clips reach a person
+# unjudged, and still images are unaffected.
+[vision.video]
+enabled           = true
+ffmpeg            = "ffmpeg"    # or an absolute path
+ffprobe           = "ffprobe"
+cols              = 3           # the grid. More tiles buy resolution in time
+rows              = 2           # and cost the model pixels.
+tile_width        = 512         # per tile; height follows the source aspect
+timeout_secs      = 30          # a wall clock on ffmpeg itself
+max_duration_secs = 600         # longest clip to sample across; 0 = no cap
+
+# Each label carries YOUR definition of it, which is sent to the model with the
+# name. A bare name is the model's guess at what your community means by a word;
+# a sentence is your answer. `describe` is optional and badly missed.
+#
+# The model returns a score for every label AND one sentence describing what the
+# media shows. That sentence goes on the strike record, so a moderator reading it
+# months later knows what was posted without reopening it.
+
 # [[vision.labels]]
 # name = "sexual_content"
+# describe = "Unclothed or barely-clothed bodies, suggestive posing, or sexual activity."
 # threshold = 0.90
 # gravity = "grave"
 
 # [[vision.labels]]
 # name = "gore"
+# describe = "Real injury, blood, mutilation or death. Not fictional or cartoon violence."
 # threshold = 0.90
 # gravity = "grave"
 

@@ -87,6 +87,10 @@ pub(crate) async fn enforce(
         acted_this_pass: *pass.lock().unwrap_or_else(|e| e.into_inner()),
         roster: ctx.roster,
         is_me: v.npub == ctx.me,
+        // ANY content charge makes the whole sentence a content sentence. A
+        // trusted member who posted a slur is not spared it because they also
+        // tripped a rate rule in the same window.
+        for_content: v.findings.iter().any(|f| ctx.policy.is_content_rule(&f.rule_id, &ctx.vision_labels)),
     };
 
     let armed = match adjudicate::adjudicate(&ctx.policy, ctx.powers, &facts, response) {
@@ -118,8 +122,24 @@ pub(crate) async fn enforce(
 
     // Resolved before the act: a delete removes the very messages the channel
     // would have been read from.
-    let warn =
-        warn_text(&why, &ctx.community_name, cited_channel(bot, community, v).await.as_deref(), strikes.len());
+    // Resolved BEFORE the act, for the same reason the channel NAME below is:
+    // hiding the cited message removes the very row this is read from, and a
+    // lookup afterwards finds nothing.
+    let notice_chat = match cited_ids(v).first() {
+        Some(first) => bot.message(&first.to_string()).await.map(|m| m.chat_id),
+        None => None,
+    };
+    let warn = warn_text(
+        response,
+        &why,
+        &ctx.community_name,
+        cited_channel(bot, community, v).await.as_deref(),
+        strikes.len(),
+        // Removal is unconditional now, so the message says so exactly when it
+        // happened: claiming a takedown that did not occur invites a reply
+        // asking why the post is still there.
+        armed && !cited_ids(v).is_empty(),
+    );
 
     // Announced BEFORE, recorded AFTER. The two want opposite sides of the act:
     // an operator has to see what is about to happen, and the ledger must hold
@@ -139,26 +159,35 @@ pub(crate) async fn enforce(
     // print `WOULD warn`, and arming switched on escalation plus three
     // ceilings at once, into behaviour nobody had watched. Arming wipes the
     // slate, so the rehearsal's rows can never be mistaken for real answers.
+    // Removal is not a rung. Whatever a conviction cites comes down the moment
+    // it is answered at all — content a community does not host must not
+    // outlive the warning that says so, and a first offence is exactly when it
+    // is still on screen. The ladder decides the CONSEQUENCE to the member;
+    // this decides what happens to the post.
+    //
+    // The debt lane rebuilds a verdict from the ledger, which never kept the
+    // message ids, so a sentence with nothing to cite is normal and quiet.
+    if armed && !cited_ids(v).is_empty() {
+        hide_cited(bot, v, id).await;
+    }
     let outcome = if !armed {
         Ok(())
     } else {
-        match response {
-            Response::Warn => bot.dm(&v.npub).send(&warn).await.map(|_| ()),
-            Response::DeleteAndWarn => {
-                // A rung with nothing to hide is still spent: the warning is
-                // delivered and the ladder moves on. Skipping it instead walked
-                // straight to a kick, and re-proposing it forever would pin the
-                // member below one. The debt lane rebuilds a verdict from the
-                // ledger, which never kept the message ids.
-                if cited_ids(v).is_empty() {
-                    println!("[{id}] {name} {who} — nothing left to hide; the warning stands alone");
-                } else {
-                    hide_cited(bot, v, id).await;
-                }
-                bot.dm(&v.npub).send(&warn).await.map(|_| ())
-            }
+        let done = match response {
+            // Both carry the same words now that removal happens either way.
+            // `DeleteAndWarn` stays readable because ledgers written before this
+            // hold rows naming it, and `rank_of` has to keep placing them.
+            Response::Warn | Response::DeleteAndWarn => Ok(()),
             Response::Kick => community.member(v.npub.clone()).kick().await,
             Response::Ban => community.member(v.npub.clone()).ban().await,
+        };
+        // AFTER the act, so it reports what happened rather than what was
+        // intended — and a DM outlives membership, so it still lands on somebody
+        // who was just removed. A removal they cannot read the reason for is the
+        // one message that has to arrive.
+        match done {
+            Ok(()) => bot.dm(&v.npub).send(&warn).await.map(|_| ()),
+            Err(e) => Err(e),
         }
     };
     if let Err(e) = outcome {
@@ -177,6 +206,17 @@ pub(crate) async fn enforce(
     store
         .log_action(community.id(), &v.npub, name, now, &why)
         .map_err(|e| vector_sdk::Error::Other(format!("{name} {who} happened but could not be recorded: {e}")))?;
+
+    // AFTER the ledger. Both are courtesies on top of a sentence that has
+    // already happened and been recorded — neither may fail it, and a channel
+    // notice for an action no row remembers is the one order that misleads.
+    if armed {
+        let rule = broken_rule(ctx, v).unwrap_or_else(|| "community".to_string());
+        if ctx.notify.notice_in_channel {
+            notice_in_channel(bot, notice_chat, v, &rule, ctx.notify.notice_ttl_secs).await;
+        }
+        notify_mods(bot, ctx, v, &rule, name, &why).await;
+    }
     *pass.lock().unwrap_or_else(|e| e.into_inner()) += 1;
     Ok(Outcome::Acted)
 }
@@ -296,25 +336,65 @@ fn tally(strikes: &[ladder::Strike]) -> String {
 
 /// What a warned member reads.
 ///
-/// It names WHERE. Somebody in several communities, told only that "a rule
-/// matched your recent messages", has to guess which room they are in trouble
-/// in — and a warning nobody can act on is not a warning.
-fn warn_text(why: &str, community: &str, channel: Option<&str>, on_record: usize) -> String {
+/// It names WHERE. Somebody in several communities, told only that a rule
+/// matched, has to guess which room they are in trouble in, and a warning
+/// nobody can act on is not a warning.
+///
+/// It names NOTHING ELSE. No label, no confidence, no model, no rule id, no
+/// strike arithmetic: those are how an operator tuned a rulebook, and read out
+/// to the person they were used on they are a specification for getting under
+/// the bar next time. What a member needs is what they did and what happens
+/// next.
+fn warn_text(
+    response: Response,
+    evidence: &str,
+    community: &str,
+    channel: Option<&str>,
+    on_record: usize,
+    removed: bool,
+) -> String {
     let place = match channel {
-        Some(c) if !c.is_empty() => format!("**{community}**, in **#{c}**"),
+        Some(c) if !c.is_empty() => format!("**{community}**: **#{c}**"),
         _ => format!("**{community}**"),
     };
-    // What they did and how many times — the two things a person actually
-    // asks. NOT the strike total: "worth 12" is the operator's number for
-    // tuning a ladder, and it reads to a member like twelve accusations.
-    let tally = if on_record == 1 {
-        "That is 1 match on record for you here.".to_string()
+    // Quoted, on its own line. Buried mid-sentence it read as part of Sentinel's
+    // prose rather than as the thing they actually posted.
+    let quote = {
+        let one_line = evidence.replace(['\n', '\r'], " ");
+        let one_line = one_line.trim();
+        if one_line.is_empty() {
+            String::new()
+        } else {
+            format!("\n\n> {one_line}\n\n")
+        }
+    };
+    let gone = if removed { " That post has been removed." } else { "" };
+    // What HAPPENED, and what happens next. A kick removes them from the
+    // community, so the public notice in the channel is unreadable to the one
+    // person it is about — this DM is the only thing they get, and "you have
+    // been removed" with no reason is how a moderation bot earns its reputation.
+    let (what, next) = match response {
+        Response::Warn | Response::DeleteAndWarn => {
+            ("so you have picked up a strike", "Further strikes lead to being removed from the community.")
+        }
+        Response::Kick => (
+            "so you have been removed from the community",
+            "You can rejoin, and further strikes lead to a permanent ban.",
+        ),
+        Response::Ban => ("so you have been permanently banned", "This one is not automatic to undo."),
+    };
+    // What they did and how many times, which is what a person actually asks.
+    // NOT the strike total: it is the operator's number for tuning a ladder,
+    // and it reads to a member like twelve separate accusations.
+    let tally = if on_record <= 1 {
+        "This is your first strike.".to_string()
     } else {
-        format!("That is {on_record} matches on record for you here.")
+        format!("That makes {on_record} strikes on your record here.")
     };
     format!(
-        "A rule in {place} matched your recent messages: {why}. {tally} \
-         This is a warning; repeated matches escalate. Reply to a moderator if you think this is wrong."
+        "You broke the rules in {place}, {what}.{quote}{}{gone} {next}\n\n\
+         If you think this is wrong, reply to a moderator.",
+        tally
     )
 }
 
@@ -336,13 +416,167 @@ async fn cited_channel(bot: &VectorBot, community: &Community, v: &Verdict) -> O
 /// removing people with no record of it is the incident the trail exists to
 /// prevent.
 pub(crate) async fn announce(bot: &VectorBot, community: &Community, ctx: &Ctx, line: &str) -> bool {
-    let Some(want) = &ctx.mod_channel else { return true };
+    // An empty name is "stay silent", not "look for a channel called nothing".
+    // Without this, an operator disabling the audit trail by emptying the string
+    // gets a channel that is never found, an announce that always fails, and
+    // every sentence held forever — a bot that silently stops moderating.
+    let want = match ctx.mod_channel.as_deref().map(str::trim) {
+        Some(w) if !w.is_empty() => w,
+        _ => return true,
+    };
     for ch in community.channels().await {
         if ch.name() == want && ch.is_readable() {
             return bot.channel(ch.id()).send(line).await.is_ok();
         }
     }
     false
+}
+
+/// The rule a sentence is about, named for a member.
+///
+/// The WORST charge, where a post broke several: told they broke one rule,
+/// somebody looks for one thing to stop doing.
+fn broken_rule(ctx: &Ctx, v: &Verdict) -> Option<String> {
+    v.findings
+        .iter()
+        // `actionable`, the same filter the citations use. `chargeable` demands
+        // a deterministic basis, which the media lane's own findings never
+        // have — so every vision conviction fell through to a fallback and told
+        // members they broke the "community" rule.
+        .filter(|f| actionable(f))
+        .max_by_key(|f| crate::config::Gravity::from(ctx.policy.gravity_of(&f.rule_id, &f.severity)) as u8)
+        .map(|f| ctx.policy.title_of(&f.rule_id, &ctx.vision_labels))
+}
+
+/// A short public line in the room it happened in.
+///
+/// Short on purpose. The DM carries the evidence and the appeal route; this is
+/// the part everyone else sees, and a channel does not need the detail of
+/// somebody else's warning to know the rule is real.
+async fn notice_in_channel(bot: &VectorBot, chat: Option<String>, v: &Verdict, rule: &str, ttl_secs: u64) {
+    // Silence here is indistinguishable from a notice that posted, and a public
+    // warning nobody can see failing to appear is exactly the failure worth a
+    // line.
+    let Some(chat) = chat else {
+        println!("[notice] nothing cited, so there is no channel to post in");
+        return;
+    };
+    // `@npub` is what Vector matches to raise a ping. A prettier pill would not
+    // reach the person it is about.
+    let line = format!(
+        "@{} You broke the **{rule}** rule and **received a strike**, please refrain from further \
+         posts of such content or action may be escalated.",
+        v.npub
+    );
+    let posted = if ttl_secs > 0 {
+        bot.channel(chat).send_expiring(&line, ttl_secs).await
+    } else {
+        bot.channel(chat).send(&line).await
+    };
+    match posted {
+        // Said out loud, because the whole point of this line is that people see
+        // it — and its absence was invisible for most of a day.
+        Ok(_) if ttl_secs > 0 => println!("[notice] posted, clearing itself in {ttl_secs}s"),
+        Ok(_) => println!("[notice] posted"),
+        Err(e) => eprintln!("[notice] could not post the channel notice: {e}"),
+    }
+}
+
+/// Tell the people who asked to be told, personally.
+///
+/// Failures are logged and never propagate: a moderator's DM not arriving is
+/// not a reason to leave a sentence unrecorded, and the ledger is already the
+/// record of what happened.
+/// DM the mods the raid kick-list: WHO was removed, so a human can double-check
+/// an automated mass-action. Its own function (not `notify_mods`, which is one
+/// member per rule) because a raid is one event, many subjects — an admin wants
+/// the whole list in one message, not forty DMs.
+pub(crate) async fn notify_mods_raid(bot: &VectorBot, ctx: &Ctx, action: &str, removed: &[&str]) {
+    if ctx.notify.mods.is_empty() || removed.is_empty() {
+        return;
+    }
+    // Full npubs, one per line: the reader has to be able to paste any of them
+    // into a tool to unban a false positive.
+    let list = removed.iter().map(|n| format!("- {n}")).collect::<Vec<_>>().join("\n");
+    let line = format!(
+        "**Raid contained in {}**\n\n**{action}** applied to {} account(s):\n\n{list}\n\n\
+         If any of these are real members, pardon them to reverse it.",
+        ctx.community_name,
+        removed.len(),
+    );
+    for who in &ctx.notify.mods {
+        if who == &ctx.me {
+            continue;
+        }
+        if let Err(e) = bot.dm(who.clone()).send(&line).await {
+            eprintln!("[notify] raid list did not reach {}: {e}", short(who));
+        }
+    }
+}
+
+async fn notify_mods(bot: &VectorBot, ctx: &Ctx, v: &Verdict, rule: &str, action: &str, why: &str) {
+    if ctx.notify.mods.is_empty() {
+        return;
+    }
+    // The full npub, not a short form: this is the one message whose reader has
+    // to go and DO something about a specific person, and eight characters is
+    // not something anybody can paste into a moderation tool.
+    let line = format!(
+        "**{}**\n\n**{}** broke the **{rule}** rule.\n\n> {}\n\nAction taken: **{action}**.",
+        ctx.community_name,
+        v.npub,
+        why.replace(['\n', '\r'], " ").trim()
+    );
+    for who in &ctx.notify.mods {
+        if who == &ctx.me {
+            continue;
+        }
+        if let Err(e) = bot.dm(who.clone()).send(&line).await {
+            eprintln!("[notify] {} did not get told: {e}", short(who));
+            continue;
+        }
+        if ctx.notify.attach_media {
+            forward_media(bot, v, who).await;
+        }
+    }
+}
+
+/// Forward what was actually posted, so a decision can be checked rather than
+/// taken on trust.
+///
+/// Images go out named `SPOILER_…`, which is how Vector marks an attachment to
+/// stay covered until it is tapped. A moderator reading their DMs on a train
+/// should choose when to look at the worst thing in the community.
+async fn forward_media(bot: &VectorBot, v: &Verdict, who: &str) {
+    for id in cited_ids(v) {
+        let Some(msg) = bot.message(&id.to_string()).await else { continue };
+        for att in &msg.message.attachments {
+            let bytes = match bot.download_attachment_from(att, msg.message.npub.as_deref()).await {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("[notify] could not fetch the evidence: {e}");
+                    continue;
+                }
+            };
+            let kind = vector_sdk::vector_core::crypto::mime_from_magic_bytes(&bytes);
+            // Video is sent plain: Vector covers images, and a covered video
+            // would be a thumbnail nobody can play.
+            let cover = kind.starts_with("image/");
+            let name = format!(
+                "{}evidence.{}",
+                if cover { "SPOILER_" } else { "" },
+                if att.extension.is_empty() { "bin" } else { &att.extension }
+            );
+            let path = std::env::temp_dir().join(&name);
+            if std::fs::write(&path, &bytes).is_err() {
+                continue;
+            }
+            if let Err(e) = bot.dm(who.to_string()).send_file(&path).await {
+                eprintln!("[notify] the evidence did not reach {}: {e}", short(who));
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 impl Ctx {
@@ -364,6 +598,8 @@ impl Ctx {
             roster,
             me: me.to_string(),
             mod_channel: cfg.bot.mod_channel.clone(),
+            notify: cfg.notify.clone(),
+            vision_labels: cfg.vision.labels.clone(),
         }
     }
 }
@@ -378,6 +614,10 @@ pub(crate) struct Ctx {
     pub(crate) roster: usize,
     pub(crate) me: String,
     pub(crate) mod_channel: Option<String>,
+    pub(crate) notify: crate::config::NotifyCfg,
+    /// The media lane's labels, for naming a rule to the person who broke it.
+    /// Process-wide, unlike everything else here.
+    pub(crate) vision_labels: Vec<crate::config::VisionLabel>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -435,8 +675,18 @@ mod tests {
 
     const NOW: u64 = 10_000;
 
+    /// An explicit four-rung ladder, NOT the shipped default: these tests are
+    /// about how a sentence is chosen and delivered, so the shape is pinned
+    /// here rather than moving whenever the default policy is retuned.
     fn policy_with(arm: &str) -> CommunityPolicy {
-        toml::from_str::<Config>(&format!("[arm]\n{arm}")).unwrap().for_community("fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea")
+        let mut cfg = toml::from_str::<Config>(&format!("[arm]\n{arm}")).unwrap();
+        cfg.ladder.steps = vec![
+            crate::config::Step { at: 1, response: Response::Warn },
+            crate::config::Step { at: 4, response: Response::DeleteAndWarn },
+            crate::config::Step { at: 8, response: Response::Kick },
+            crate::config::Step { at: 12, response: Response::Ban },
+        ];
+        cfg.for_community("fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea")
     }
 
     /// One strike per offense; the ladder climbs as the total rises.
@@ -574,11 +824,11 @@ mod tests {
     /// answer is a strike total.
     #[test]
     fn a_warning_counts_matches_and_never_shows_a_score() {
-        let one = warn_text("Used \"badword\" (1 time)", "Lab", Some("general"), 1);
-        assert!(one.contains("1 match on record"), "singular: {one}");
+        let one = warn_text(Response::Warn, "Used \"badword\" (1 time)", "Lab", Some("general"), 1, true);
+        assert!(one.contains("first strike"), "singular: {one}");
 
-        let many = warn_text("Used \"badword\" (1 time)", "Lab", Some("general"), 4);
-        assert!(many.contains("4 matches on record"), "plural: {many}");
+        let many = warn_text(Response::Warn, "Used \"badword\" (1 time)", "Lab", Some("general"), 4, true);
+        assert!(many.contains("4 strikes"), "plural: {many}");
 
         // The score belongs to the operator, not to the person being warned.
         for total in ["12", "48", "worth"] {
@@ -592,23 +842,114 @@ mod tests {
     #[test]
     fn a_warning_says_what_matched_where_and_what_comes_next() {
         for why in ["slurs [severe] 3×", "", "no findings", "a\nmultiline\nreason"] {
-            let text = warn_text(why, "Vector Community", Some("general"), 1);
+            let text = warn_text(Response::Warn, why, "Vector Community", Some("general"), 1, true);
             assert!(text.contains("**Vector Community**"), "the community, in bold: {text}");
             assert!(text.contains("**#general**"), "and the channel: {text}");
-            assert!(text.contains("warning"), "{text}");
-            assert!(text.contains("escalate"), "a warning that does not say it escalates is not one");
+            assert!(text.contains("strike"), "{text}");
+            assert!(text.contains("Further strikes"), "a warning that does not say it escalates is not one");
             assert!(text.contains("moderator"), "and it must name the way to dispute it");
-            if !why.is_empty() {
-                assert!(text.contains(why), "the evidence has to appear: {text}");
+            if !why.trim().is_empty() {
+                // Quoted on its own line, and flattened: a multi-line reason
+                // would otherwise break out of the quote block halfway through.
+                let want = why.replace('\n', " ");
+                assert!(text.contains(&format!("> {want}")), "the evidence has to be quoted: {text}");
+                assert!(!text.contains("\n> \n"), "no empty quote line: {text}");
             }
         }
+    }
+
+    /// Disabling the audit trail must make Sentinel quiet, not broken. A failed
+    /// announce HOLDS a sentence, so an empty channel name that is looked up
+    /// literally stops the bot moderating and says nothing about why.
+    #[test]
+    fn an_empty_mod_channel_is_silence_rather_than_a_channel_named_nothing() {
+        for raw in [Some(""), Some("   "), None] {
+            let quiet = match raw.map(str::trim) {
+                Some(w) if !w.is_empty() => Some(w),
+                _ => None,
+            };
+            assert!(quiet.is_none(), "{raw:?} should mean silence");
+        }
+        assert_eq!(
+            match Some("mod-log").map(str::trim) {
+                Some(w) if !w.is_empty() => Some(w),
+                _ => None,
+            },
+            Some("mod-log"),
+            "a real name still resolves"
+        );
+    }
+
+    /// Every rung explains itself, and a REMOVAL most of all: a kick takes the
+    /// channel away, so the public notice is unreadable to the one person it is
+    /// about, and this DM is all they get. Being removed with no reason given is
+    /// how a moderation bot earns its reputation.
+    #[test]
+    fn every_rung_says_what_happened_and_what_comes_next() {
+        let cases = [
+            (Response::Warn, "picked up a strike", "Further strikes"),
+            (Response::DeleteAndWarn, "picked up a strike", "Further strikes"),
+            (Response::Kick, "removed from the community", "You can rejoin"),
+            (Response::Ban, "permanently banned", "not automatic to undo"),
+        ];
+        for (rung, what, next) in cases {
+            let text = warn_text(rung, "Used \"badword\" (1 time)", "Lab", Some("general"), 3, true);
+            assert!(text.contains(what), "{rung:?} does not say what happened: {text}");
+            assert!(text.contains(next), "{rung:?} does not say what comes next: {text}");
+            // The parts every rung owes them, whatever it was.
+            assert!(text.contains("**Lab**"), "{rung:?}: where");
+            assert!(text.contains("> Used"), "{rung:?}: the evidence, quoted");
+            assert!(text.contains("moderator"), "{rung:?}: how to dispute it");
+            for leak in ["sexual_content", "gemma", "90%", "_"] {
+                assert!(!text.contains(leak), "{rung:?} leaked {leak:?}: {text}");
+            }
+        }
+    }
+
+    /// A kick is not a warning, and telling somebody they may rejoin after a
+    /// ban is worse than saying nothing.
+    #[test]
+    fn a_removal_does_not_read_like_a_warning() {
+        let kick = warn_text(Response::Kick, "e", "Lab", Some("general"), 3, true);
+        assert!(!kick.contains("picked up a strike"), "{kick}");
+        let ban = warn_text(Response::Ban, "e", "Lab", Some("general"), 4, true);
+        assert!(!ban.contains("You can rejoin"), "a ban is not a kick: {ban}");
+        assert!(!ban.contains("Further strikes"), "there is no next rung: {ban}");
+    }
+
+    /// The message goes to the person a rule was used ON. A label name, a
+    /// confidence, a model or a rule id read out to them is a specification for
+    /// getting under the bar next time.
+    #[test]
+    fn a_warning_never_names_the_machinery() {
+        let text = warn_text(
+            Response::Warn,
+            "A screenshot of a social media post featuring a woman in suggestive clothing",
+            "Lab",
+            Some("general"),
+            2,
+            true,
+        );
+        for leak in ["sexual_content", "gemma", "90%", "per ", "confidence", "threshold", "vision", "_"] {
+            assert!(!text.contains(leak), "{leak:?} reached the member: {text}");
+        }
+    }
+
+    /// Claiming a takedown that did not happen invites a reply asking why the
+    /// post is still there.
+    #[test]
+    fn removal_is_only_claimed_when_it_happened() {
+        let gone = warn_text(Response::Warn, "Used \"badword\" (1 time)", "Lab", Some("general"), 1, true);
+        assert!(gone.contains("has been removed"), "{gone}");
+        let stays = warn_text(Response::Warn, "Used \"badword\" (1 time)", "Lab", Some("general"), 1, false);
+        assert!(!stays.contains("That post has been removed"), "{stays}");
     }
 
     /// A sentence the citations cannot place still names the community.
     #[test]
     fn a_warning_without_a_channel_still_says_where() {
         for channel in [None, Some("")] {
-            let text = warn_text("Used \"badword\" (1 time)", "Vector Community", channel, 1);
+            let text = warn_text(Response::Warn, "Used \"badword\" (1 time)", "Vector Community", channel, 1, true);
             assert!(text.contains("**Vector Community**"), "{text}");
             assert!(!text.contains('#'), "no empty channel reference: {text}");
         }
@@ -617,7 +958,7 @@ mod tests {
     /// It speaks for the community, not for itself.
     #[test]
     fn a_warning_does_not_introduce_the_bot() {
-        let text = warn_text("Used \"badword\" (1 time)", "Vector Community", Some("general"), 1);
+        let text = warn_text(Response::Warn, "Used \"badword\" (1 time)", "Vector Community", Some("general"), 1, true);
         assert!(!text.contains("Sentinel"), "the member cares where and why, not who: {text}");
     }
 

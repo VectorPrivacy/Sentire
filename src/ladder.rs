@@ -114,6 +114,7 @@ pub fn next_step(
     let mut rungs: Vec<Response> = ladder.steps.iter().map(|s| s.response).collect();
     rungs.sort_by_key(|r| r.rank());
     rungs.dedup();
+    let mut repeat = None;
     for r in rungs {
         if r.rank() > reached.rank() {
             break;
@@ -127,8 +128,17 @@ pub fn next_step(
         if floor < r.rank() {
             return Some(r);
         }
+        repeat = Some(r);
     }
-    None
+    // Nothing higher is earned yet, but a FRESH offence still deserves an
+    // answer — `owed` only reaches here when a strike postdates the last one,
+    // so a quiet member is never re-warned. Repeating the rung they are at is
+    // what "two warnings before a kick" means: the ladder climbs on the total,
+    // not on the number of offences.
+    //
+    // Never a repeated BAN. They are already gone, and re-banning rotates the
+    // community's keys again for nothing.
+    repeat.filter(|r| *r != Response::Ban)
 }
 
 #[cfg(test)]
@@ -156,7 +166,14 @@ mod tests {
 
         // And it never climbs past what the total has actually earned.
         assert_eq!(next_step(&l, 4, Some("warn"), all_powers), Some(Response::DeleteAndWarn));
-        assert_eq!(next_step(&l, 4, Some("delete_and_warn"), all_powers), None, "four points is not a kick");
+        // Repeats its rung rather than climbing: `owed` only reaches here when a
+        // strike postdates the last answer, so this is a fresh offence being
+        // answered again at the level the total still sits at.
+        assert_eq!(
+            next_step(&l, 4, Some("delete_and_warn"), all_powers),
+            Some(Response::DeleteAndWarn),
+            "four points repeats, and is still not a kick"
+        );
         assert_eq!(next_step(&l, 0, None, all_powers), None, "and a clean member answers to nothing");
 
         // An unrecognised prior ranks 0, so it never blocks the first rung.
@@ -186,8 +203,19 @@ mod tests {
         assert_eq!(next_step(&l, 12, Some("warn"), all_powers), Some(Response::Ban), "no rung they never configured");
     }
 
+    /// An explicit four-rung ladder, NOT the shipped default: these tests are
+    /// about how the ladder climbs, and pinning the shape here keeps them from
+    /// moving every time the default policy is retuned.
     fn ladder() -> Ladder {
-        Config::default().ladder
+        Ladder {
+            steps: vec![
+                crate::config::Step { at: 1, response: Response::Warn },
+                crate::config::Step { at: 4, response: Response::DeleteAndWarn },
+                crate::config::Step { at: 8, response: Response::Kick },
+                crate::config::Step { at: 12, response: Response::Ban },
+            ],
+            ..Config::default().ladder
+        }
     }
 
     #[test]
@@ -465,11 +493,15 @@ mod tests {
         // And the gentlest: warnings and nothing else, forever.
         let gentle = Ladder { steps: vec![crate::config::Step { at: 1, response: Response::Warn }], ..Config::default().ladder };
         assert_eq!(owed(&gentle, &[at(12, 0)], [], all_powers, 1, HL), Some(Response::Warn));
+        // "Forever" means exactly that: a fresh offence is answered again with
+        // the only rung there is, rather than the ladder going silent after one.
         assert_eq!(
             owed(&gentle, &[at(12, 0), at(12, 20)], [("warn", 10u64)], all_powers, 30, HL),
-            None,
-            "nothing above the top rung the operator configured"
+            Some(Response::Warn),
+            "a warnings-only ladder keeps warning"
         );
+        // A quiet member is still never re-warned: nothing new since the answer.
+        assert_eq!(owed(&gentle, &[at(12, 0)], [("warn", 10u64)], all_powers, 30, HL), None);
     }
 
     /// The raid lane writes into the same table keyed on the same npub — in a

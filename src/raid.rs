@@ -48,7 +48,10 @@ pub enum Containment {
     WouldContain { suspects: Vec<String>, response: RaidResponse },
     /// Too much of the community. A bug, a false positive, or a raid so large
     /// that a person should be the one to answer it.
-    Halt { suspects: usize, roster: usize },
+    /// Too many ESTABLISHED members caught — a misfiring cohort, or a raid
+    /// that reached real members, either way a person's call. `tenured` is
+    /// why: fresh raiders never trip this, however many there are.
+    Halt { suspects: usize, roster: usize, tenured: usize },
     Contain { suspects: Vec<String>, response: RaidResponse },
 }
 
@@ -76,8 +79,9 @@ pub fn select_from<'a>(
     }
     let all: Vec<&Verdict> = members.collect();
     let roster = all.len();
-    let suspects: Vec<String> = all
+    let caught: Vec<&Verdict> = all
         .iter()
+        .copied()
         .filter(|v| v.npub != me)
         .filter(|v| !v.is_shielded())
         // In the wave, not merely loud. `raid_detected` says a cohort exists
@@ -86,20 +90,22 @@ pub fn select_from<'a>(
         // moment three throwaway accounts posted the same line.
         .filter(|v| in_the_cohort(v))
         .filter(|v| v.confidence >= cfg.raid.min_confidence)
-        .map(|v| v.npub.clone())
         .collect();
 
-    if suspects.is_empty() {
+    if caught.is_empty() {
         return Containment::Quiet;
     }
-    // The same floor the ladder's ceiling uses. Without it, 10% of a five-member
-    // community rounds to zero and ONE suspect halts containment — trivially
-    // triggerable, and it flooded the mod channel every sweep.
-    if let Some(ceiling) = crate::adjudicate::roster_ceiling(cfg, roster) {
-        if suspects.len() > ceiling {
-            return Containment::Halt { suspects: suspects.len(), roster };
-        }
+    // The halt protects ESTABLISHED members, never the raiders. A percentage of
+    // the roster was exactly backwards: a raid inflates the roster with fresh
+    // accounts, so the bigger the raid the higher the bar it had to clear, until
+    // a majority-bot wave (150 real → 650) sailed past a 50% ceiling when
+    // containment mattered most. Count only tenured suspects; fresh accounts are
+    // contained without limit (chunked by `max_batch`).
+    let tenured = caught.iter().filter(|v| v.tenure_secs >= cfg.raid.protect_tenure_secs).count();
+    if tenured > cfg.limits.halt_floor {
+        return Containment::Halt { suspects: caught.len(), roster, tenured };
     }
+    let suspects: Vec<String> = caught.iter().map(|v| v.npub.clone()).collect();
     if cfg.arm.raid {
         Containment::Contain { suspects, response: cfg.raid.response }
     } else {
@@ -159,6 +165,17 @@ mod tests {
 
     fn crowd(n: usize, confidence: u32, shield: &str) -> Vec<Verdict> {
         (0..n).map(|i| verdict(&format!("npub1raider{i:03}"), confidence, shield)).collect()
+    }
+    /// A crowd of ESTABLISHED members (real tenure), for the halt path — the one
+    /// case a raid response must defer to a human.
+    fn aged(n: usize, confidence: u32, tenure_secs: u64) -> Vec<Verdict> {
+        (0..n)
+            .map(|i| {
+                let mut v = verdict(&format!("npub1member{i:03}"), confidence, "none");
+                v.tenure_secs = tenure_secs;
+                v
+            })
+            .collect()
     }
 
     fn pick(rows: &[Verdict], raid: bool, cfg: &CommunityPolicy, me: &str) -> Containment {
@@ -243,13 +260,40 @@ mod tests {
         }
     }
 
+    /// The lesson from a real raid: 150 members bloated to 650 by bots. A
+    /// percentage ceiling halted exactly then. Fresh accounts are contained
+    /// however many they are — they never bring the halt.
     #[test]
-    fn a_pass_that_would_empty_the_community_stops_and_asks() {
+    fn a_wave_of_fresh_accounts_is_contained_however_large() {
         let mut cfg = base();
-        cfg.arm.raid = true; // even armed
-        assert_eq!(
-            pick(&crowd(50, 99, "none"), true, &cfg, "me"),
-            Containment::Halt { suspects: 50, roster: 50 }
+        cfg.arm.raid = true;
+        match pick(&crowd(500, 99, "none"), true, &cfg, "me") {
+            Containment::Contain { suspects, .. } => assert_eq!(suspects.len(), 500),
+            other => panic!("a fresh-account raid must contain, not {other:?}"),
+        }
+    }
+
+    /// The halt is for ESTABLISHED members swept into a cohort — a misfire, or a
+    /// raid that reached real people. That, and only that, defers to a human.
+    #[test]
+    fn a_cohort_of_established_members_halts_for_a_human() {
+        let mut cfg = base();
+        cfg.arm.raid = true;
+        cfg.limits.halt_floor = 3;
+        let day = cfg.raid.protect_tenure_secs;
+        // Under the floor: 3 tenured members contain fine.
+        assert!(matches!(pick(&aged(3, 99, day + 1), true, &cfg, "me"), Containment::Contain { .. }));
+        // Over it: a human decides.
+        match pick(&aged(4, 99, day + 1), true, &cfg, "me") {
+            Containment::Halt { tenured, .. } => assert_eq!(tenured, 4),
+            other => panic!("4 established members over a floor of 3 must halt, not {other:?}"),
+        }
+        // Fresh raiders mixed in NEVER raise the tenured count.
+        let mut mixed = aged(2, 99, day + 1);
+        mixed.extend(crowd(400, 99, "none"));
+        assert!(
+            matches!(pick(&mixed, true, &cfg, "me"), Containment::Contain { .. }),
+            "2 established (under floor 3) + 400 bots contains — the bots don't count"
         );
     }
 
