@@ -32,14 +32,37 @@ pub(crate) fn why_line(
     powers: crate::policy::Powers,
     now: u64,
 ) -> String {
-    if strikes.is_empty() {
-        return format!("{} has no strikes with me.", short(who));
+    // A card, not a sentence. An operator runs this mid-incident with a member
+    // list open; the three things they are deciding on — how bad, whether the
+    // gates spare them, what lands next — should be readable without parsing
+    // prose.
+    let standing = crate::adjudicate::spared_by_standing(policy, shield);
+    let n = strikes.len();
+    let dot = match (standing.is_some(), n) {
+        (true, _) => "🛡️",
+        (_, 0) => "🟢",
+        (_, 1) => "🟡",
+        (_, 2) => "🟠",
+        _ => "🔴",
+    };
+    let count = if n == 0 { "none".to_string() } else { n.to_string() };
+    let standing_line = match standing {
+        Some(why) => format!("✅ {why}"),
+        None => "❌ none".to_string(),
+    };
+    let mut card = format!(
+        "{dot} **{}**\n**Strikes** · {count}\n**Standing** · {standing_line}",
+        short(who)
+    );
+    if n == 0 {
+        return card;
     }
-    // Standing first, exactly as every lane asks it. The ladder is shared
+    // Standing is asked exactly as every lane asks it. The ladder is shared
     // between this answer and the enforcer; the gates are not, so naming a rung
     // for somebody the gate always spares describes a run that will not happen.
-    if let Some(why) = crate::adjudicate::spared_by_standing(policy, shield) {
-        return format!("{} carries a record, but standing answers for them: {why}.", short(who));
+    if standing.is_some() {
+        card.push_str("\n**Next** · nothing — standing answers for them");
+        return card;
     }
     let hl = policy.ladder.decay_half_life_hours;
     let next = ladder::owed(
@@ -52,12 +75,11 @@ pub(crate) fn why_line(
     );
     // The decayed total is the ladder's own arithmetic. An operator asking about
     // a person wants what they did and what happens next, not a score.
-    let n = strikes.len();
-    let s = if n == 1 { "" } else { "s" };
     match next {
-        Some(r) => format!("{} has {n} strike{s} on record — next: {}.", short(who), r.label()),
-        None => format!("{} has {n} strike{s} on record.", short(who)),
+        Some(r) => card.push_str(&format!("\n**Next** · {}", r.label())),
+        None => card.push_str("\n**Next** · nothing pending"),
     }
+    card
 }
 
 /// Register every command Sentinel answers. One function per command, because
@@ -262,7 +284,7 @@ mod tests {
     #[test]
     fn a_clean_member_is_said_to_be_clean() {
         let line = why_line("npub1abcdefghijk", "none", &[], &[], &policy(), all(), NOW);
-        assert!(line.contains("no strikes"), "{line}");
+        assert!(line.contains("**Strikes** \u{b7} none"), "{line}");
     }
 
     /// The naive answer read the ladder's steps directly and ignored both what
@@ -272,7 +294,7 @@ mod tests {
     fn why_names_the_rung_that_will_actually_be_delivered() {
         let p = policy();
         let line = why_line("npub1abcdefghijk", "none", &strikes(&[12]), &[], &p, all(), NOW);
-        assert!(line.contains("next: a Warning"), "twelve points still starts at a warning: {line}");
+        assert!(line.contains("**Next** \u{b7} a Warning"), "twelve points still starts at a warning: {line}");
     }
 
     #[test]
@@ -288,7 +310,7 @@ mod tests {
         let line =
             why_line("npub1abcdefghijk", "none", &after, std::slice::from_ref(&prior), &p, no_hiding, NOW + 60_001);
         assert!(
-            line.contains("next: a Kick"),
+            line.contains("**Next** \u{b7} a Kick"),
             "delete_and_warn cannot be delivered here, so it is not what comes next: {line}"
         );
     }
@@ -329,12 +351,13 @@ mod tests {
         let p = policy();
         for shield in ["protected", "trusted", "unknown", "absent"] {
             let line = why_line("npub1abcdefghijk", shield, &strikes(&[12]), &[], &p, all(), NOW);
-            assert!(!line.contains("next:"), "{shield}: {line}");
+            // No rung named: every rung renders as "Next \u{b7} a <Label>".
+            assert!(!line.contains("**Next** \u{b7} a "), "{shield}: {line}");
             assert!(line.contains("standing"), "{shield}: {line}");
         }
         // And an ordinary member still gets the ladder's answer.
         let line = why_line("npub1abcdefghijk", "none", &strikes(&[12]), &[], &p, all(), NOW);
-        assert!(line.contains("next: a Warning"), "{line}");
+        assert!(line.contains("**Next** \u{b7} a Warning"), "{line}");
     }
 
     /// `delete_and_warn` is a key, not a sentence. A member reading their own
@@ -381,7 +404,7 @@ mod tests {
             for score in ["worth", "decay", "12", "24", "owed"] {
                 assert!(!line.contains(score), "{n} strike(s) leaked `{score}`: {line}");
             }
-            assert!(line.contains(&format!("{n} strike")), "{line}");
+            assert!(line.contains(&format!("**Strikes** \u{b7} {n}")), "{line}");
         }
     }
 
