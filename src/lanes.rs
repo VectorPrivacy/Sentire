@@ -440,7 +440,8 @@ pub(crate) fn observe_arrival(cfg: &Config, wires: &Watches, community: &Communi
         .observe(who, now_ms())
 }
 
-/// Evaluate a community NOW, because its tripwire went off.
+/// Evaluate a community NOW, because its tripwire went off — and again shortly
+/// after if that first look sentenced nobody.
 ///
 /// Split from the counting deliberately. `observe_arrival` is a lock and a
 /// push, so it runs at arrival and the timestamps are the truth; this reads a
@@ -454,7 +455,6 @@ pub(crate) async fn evaluate_now(
     wires: &Watches,
     me: &str,
 ) {
-    let cid = community.id().to_string();
     // Pull the wave's MESSAGES before judging. The tripwire fires on the join
     // burst, which arrives on the guestbook plane ahead of the chat plane — so
     // without this the immediate eval reads a corpus of joins with no messages,
@@ -467,10 +467,50 @@ pub(crate) async fn evaluate_now(
             eprintln!("[{}] tripwire sync of {}: {e}", short(community.id()), &ch.id()[..8.min(ch.id().len())]);
         }
     }
-    // The 90-second memoisation is right for a background pass and far too slow
-    // for a wave in progress.
-    community.invalidate();
-    match sweep(bot, community, cfg, store, wires, me).await {
+    // A burst does not arrive together. Six accounts posting inside a second
+    // reach us STAGGERED, so the first look can hold half the wave — and the
+    // cohort clusters on message TEXT, needing several authors of the same line
+    // before it will say anything. One look then found nothing and the next was
+    // a full sweep away: measured at two minutes from first spam to containment,
+    // nearly all of it spent waiting rather than deciding.
+    //
+    // So look again while the rest lands. These re-read a corpus the live
+    // subscription has ALREADY delivered locally, so the retries cost relay
+    // traffic only for the channel sync above, and they stop the moment
+    // anything is convicted.
+    const RETRY_DELAYS: [u64; 2] = [15, 35];
+    for (attempt, delay) in std::iter::once(0).chain(RETRY_DELAYS).enumerate() {
+        if delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            // The wave kept landing while we waited; re-read before judging.
+            for ch in community.channels().await {
+                let _ = bot.channel(ch.id()).sync(200).await;
+            }
+        }
+        // The 90-second memoisation is right for a background pass and far too slow
+        // for a wave in progress.
+        community.invalidate();
+        let verdict = sweep(bot, community, cfg, store, wires, me).await;
+        let done = matches!(verdict, Ok(Pass::Ran(n)) if n > 0);
+        report(bot, community, cfg, wires, &verdict, attempt);
+        // Convicted, or the community is not ours to judge — either way, stop.
+        if done || matches!(verdict, Ok(Pass::Held) | Err(_)) {
+            return;
+        }
+    }
+}
+
+/// One tripwire verdict, said once.
+fn report(
+    _bot: &VectorBot,
+    community: &Community,
+    cfg: &Config,
+    wires: &Watches,
+    verdict: &vector_sdk::Result<Pass>,
+    attempt: usize,
+) {
+    let cid = community.id().to_string();
+    match verdict {
         // Only a genuine race gives the trip back. Checking `sweeping`
         // beforehand was itself a race: both handlers could see false and the
         // loser still lost its trip. Said nothing either: during a long pass a
@@ -478,9 +518,11 @@ pub(crate) async fn evaluate_now(
         Ok(Pass::Declined) => untrip(wires, community.id()),
         Ok(_) => {
             let r = cfg.for_community(&cid).raid;
+            let again = if attempt > 0 { format!(" (look {})", attempt + 1) } else { String::new() };
             println!(
-                "[{}] TRIPWIRE — {} distinct accounts inside {}s",
+                "[{}] TRIPWIRE{} — {} distinct accounts inside {}s",
                 short(community.id()),
+                again,
                 r.tripwire_accounts,
                 r.tripwire_secs
             );

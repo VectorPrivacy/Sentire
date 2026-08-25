@@ -475,7 +475,9 @@ fn conviction_id(rule_id: &str, message_id: &str) -> String {
 /// MESSAGE during exactly the wave the cooldown exists for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pass {
-    Ran,
+    /// The pass ran; carries how many members it convicted, so a caller that
+    /// scheduled the pass can stop re-asking once one lands.
+    Ran(usize),
     Held,
     Declined,
 }

@@ -276,7 +276,7 @@ pub(crate) async fn sweep(
     }
 
     heartbeat(id, &verdicts, convicted, Some(&ctx.powers));
-    Ok(Pass::Ran)
+    Ok(Pass::Ran(convicted))
 }
 
 /// A raid answers to itself, not to the ladder — but it answers to the same
