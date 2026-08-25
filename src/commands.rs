@@ -60,8 +60,11 @@ pub(crate) fn why_line(
     // Standing is asked exactly as every lane asks it. The ladder is shared
     // between this answer and the enforcer; the gates are not, so naming a rung
     // for somebody the gate always spares describes a run that will not happen.
+    //
+    // No Next line rather than a reassuring one: standing spares the BEHAVIOURAL
+    // rules only. The word and link lists still answer for what they post,
+    // whoever they are, so "nothing will happen to them" would be a lie.
     if standing.is_some() {
-        card.push_str("\n**Next** · nothing — standing answers for them");
         return card;
     }
     let hl = policy.ladder.decay_half_life_hours;
@@ -353,7 +356,7 @@ mod tests {
             let line = why_line("npub1abcdefghijk", shield, &strikes(&[12]), &[], &p, all(), NOW);
             // No rung named: every rung renders as "Next \u{b7} a <Label>".
             assert!(!line.contains("**Next** \u{b7} a "), "{shield}: {line}");
-            assert!(line.contains("standing"), "{shield}: {line}");
+            assert!(line.contains("✅"), "standing is shown as met: {shield}: {line}");
         }
         // And an ordinary member still gets the ladder's answer.
         let line = why_line("npub1abcdefghijk", "none", &strikes(&[12]), &[], &p, all(), NOW);
