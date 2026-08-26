@@ -205,10 +205,16 @@ pub(crate) async fn watch_media(
     if !cfg.watches(community.id()) {
         return Ok(());
     }
-    // Before ANY byte is fetched. Nothing here could be acted on for a shielded
-    // member, and classifying anyway decrypted their private images and — with
-    // a remote endpoint — shipped them off the machine to produce a verdict
-    // that is then thrown away.
+    // Before ANY byte is fetched, and before the shield is even resolved: a
+    // community the operator did not put on the vision list gets no media lane
+    // at all. This is the gate that keeps a bot invited into a hundred rooms
+    // from decrypting a hundred rooms' attachments and shipping them to a model.
+    if !cfg.vision_enabled_for(community.id()) {
+        return Ok(());
+    }
+    // Nothing here could be acted on for a shielded member, and classifying
+    // anyway decrypted their private images and — with a remote endpoint —
+    // shipped them off the machine to produce a verdict that is then thrown away.
     let shield = resolve_absent(standing_of(watches, community.id(), &author), msg);
     let policy = cfg.for_community(community.id());
     // What somebody posted is a content question, so only a role at or above

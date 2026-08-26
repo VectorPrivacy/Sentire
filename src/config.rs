@@ -513,6 +513,15 @@ impl Default for Ladder {
 #[serde(default, deny_unknown_fields)]
 pub struct VisionCfg {
     pub enabled: bool,
+    /// Which communities the media lane runs in. `None` (the key absent) means
+    /// every watched community, which is what a single-tenant bot wants.
+    ///
+    /// A bot watching `["*"]` is a different animal: it is in every community
+    /// anyone invited it to, and the media lane is the one that costs real money
+    /// and ships decrypted attachments to a model. So an operator running a
+    /// public bot names the communities that get it, and everyone else still
+    /// gets text rules and raid containment for nothing.
+    pub communities: Option<Vec<String>>,
     /// llama.cpp's server speaks the OpenAI-compatible shape, so local and
     /// remote differ by a URL and a header, not by an implementation.
     pub base_url: String,
@@ -671,6 +680,7 @@ pub struct VisionLabel {
 impl Default for VisionCfg {
     fn default() -> Self {
         VisionCfg {
+            communities: None,
             enabled: false,
             base_url: "http://127.0.0.1:8080/v1".into(),
             model: "llava".into(),
@@ -947,6 +957,23 @@ impl Config {
     pub fn watches(&self, community_id: &str) -> bool {
         self.bot.communities.iter().any(|w| w == "*" || w == community_id)
     }
+
+    /// Whether the media lane runs in this community.
+    ///
+    /// Three gates, all of which must pass: the operator configured a model at
+    /// all, this community is on the vision list (or there is no list), and the
+    /// community's own block did not switch it off. The per-community `false` is
+    /// honoured even against an explicit allowlist entry — the narrower answer
+    /// wins, so turning one room off never means editing the list too.
+    pub fn vision_enabled_for(&self, community_id: &str) -> bool {
+        if !self.vision.enabled {
+            return false;
+        }
+        if let Some(over) = self.community.get(community_id).and_then(|o| o.vision.as_ref()).and_then(|v| v.enabled) {
+            return over;
+        }
+        self.vision.communities.as_ref().is_none_or(|list| list.iter().any(|c| c == "*" || c == community_id))
+    }
 }
 
 #[cfg(test)]
@@ -1047,6 +1074,59 @@ mod tests {
 mod unknown_key_tests {
     use super::*;
 
+    /// The media lane is the expensive one and the only one that decrypts an
+    /// attachment and ships it to a model, so a bot watching `["*"]` must not
+    /// run it everywhere it was invited. Text rules and raid containment stay
+    /// free for everyone; this is the one thing an operator hands out by name.
+    #[test]
+    fn the_media_lane_runs_only_where_the_operator_named_it() {
+        const A: &str = "aaaa000000000000000000000000000000000000000000000000000000000000";
+        const B: &str = "bbbb000000000000000000000000000000000000000000000000000000000000";
+        let parse = |t: &str| toml::from_str::<Config>(t).unwrap();
+
+        // No list at all: every watched community, which is what a single-tenant
+        // bot has always had and must keep.
+        let all = parse("[vision]\nenabled = true");
+        assert!(all.vision_enabled_for(A) && all.vision_enabled_for(B));
+
+        // A list names who gets it, and by omission who does not.
+        let named = parse(&format!("[vision]\nenabled = true\ncommunities = [\"{A}\"]"));
+        assert!(named.vision_enabled_for(A), "named");
+        assert!(!named.vision_enabled_for(B), "a community nobody named gets no media lane");
+
+        // The master switch is still master.
+        let off = parse(&format!("[vision]\nenabled = false\ncommunities = [\"{A}\"]"));
+        assert!(!off.vision_enabled_for(A), "no model configured, no media lane anywhere");
+
+        // The narrower answer wins: switching one room off must not require
+        // editing the allowlist as well.
+        let vetoed = parse(&format!(
+            "[vision]\nenabled = true\ncommunities = [\"{A}\"]\n[community.\"{A}\".vision]\nenabled = false"
+        ));
+        assert!(!vetoed.vision_enabled_for(A), "the community's own block overrides the list");
+
+        // And it can grant, too — an operator can enable one room without a list.
+        let granted = parse(&format!(
+            "[vision]\nenabled = true\ncommunities = []\n[community.\"{B}\".vision]\nenabled = true"
+        ));
+        assert!(granted.vision_enabled_for(B), "named directly");
+        assert!(!granted.vision_enabled_for(A), "an empty list is not a wildcard");
+    }
+
+    /// The gate above is only worth anything if the lane asks it. This morning's
+    /// bug in this same codebase was a correct function with no caller, reporting
+    /// itself as clean the whole time — so the call site is pinned from source
+    /// rather than trusted.
+    #[test]
+    fn the_media_lane_actually_asks_the_gate() {
+        let src = include_str!("lanes.rs");
+        let at = src.find("vision_enabled_for").expect("the media lane must consult the per-community gate");
+        // And it must ask BEFORE fetching bytes: the whole point is that an
+        // unnamed community's attachments are never decrypted or uploaded.
+        let fetches = src.find("for att in &msg.message.attachments").expect("media loop");
+        assert!(at < fetches, "the gate must be asked before any attachment is touched");
+    }
+
     /// The shipped example documented `arm.vision`, which no struct has and
     /// nothing in the crate reads. Serde dropped it, validation passed, and the
     /// media lane went on judging that community — an operator following the
@@ -1058,7 +1138,9 @@ mod unknown_key_tests {
             ("[limits]\nhalt_if_over_pc = 50", "halt_if_over_pc"),
             ("[ladder]\ndecay_half_life_hour = 72", "decay_half_life_hour"),
             ("[community.\"fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea\".arm]\nraids = true", "raids"),
-            ("[community.\"fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea\".vision]\nenabled = false", "vision"),
+            // `community.*.vision.enabled` is REAL now (the operator picks which
+            // communities get the media lane), so the typo case moved inside it.
+            ("[community.\"fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea\".vision]\nenable = false", "enable"),
             ("[rules]\nwindow_hour = 72", "window_hour"),
         ] {
             let err = toml::from_str::<Config>(text).unwrap_err().to_string();

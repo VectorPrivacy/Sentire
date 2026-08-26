@@ -46,12 +46,22 @@ fn titleize(id: &str) -> String {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct Overrides {
+    pub vision: Option<VisionOverride>,
     pub arm: Option<ArmOverride>,
     pub limits: Option<LimitsOverride>,
     pub rules: Option<RulesOverride>,
     pub ladder: Option<LadderOverride>,
     pub shields: Option<ShieldsOverride>,
     pub raid: Option<RaidOverride>,
+}
+
+/// Whether this community gets the media lane. Separate from the rules because
+/// it is the operator's call to make, not the community's: the model costs money
+/// and sees decrypted attachments, so a community cannot vote itself into it.
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct VisionOverride {
+    pub enabled: Option<bool>,
 }
 
 /// Overrides fold FIELD by field. A whole-block override reset everything the
