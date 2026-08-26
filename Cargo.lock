@@ -2272,6 +2272,8 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 [[package]]
 name = "vector-core"
 version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d27e7600ba9c723134ed175052688ef8717701db470e2a713fd122d6536cf0f7"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2308,6 +2310,8 @@ dependencies = [
 [[package]]
 name = "vector_sdk"
 version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3bfa149936730d91c0d0e1a0a83f958104bf131afa2b57b893a95e773fa3f6f5"
 dependencies = [
  "nostr-sdk",
  "serde",

@@ -14,14 +14,11 @@ serde_json = "1"
 toml = "0.8"
 rusqlite = { version = "0.37", features = ["bundled"] }
 
-# Build against the Vector working tree instead of crates.io. Required until
-# vector-core 0.9.0 and vector_sdk 0.10.0 publish: everything Sentinel reads
-# from a verdict (band, shield, findings) is unreleased.
+# vector_sdk and vector-core come from crates.io now — 0.10.0 and 0.9.0 carry
+# everything this bot reads from a verdict.
 #
-# `nostr` is patched to match — the Vector workspace pins a fork whose SecretKey
-# Drop zeroizes with volatile writes, and a path build without this line quietly
-# links stock nostr instead.
+# `nostr` stays patched to the fork whose SecretKey Drop zeroizes with volatile
+# writes rather than a call the compiler may elide. Stock nostr builds fine; this
+# holds a key that can ban people, so the erasure is worth a git dependency.
 [patch.crates-io]
-vector_sdk = { path = "../Vector/crates/vector-sdk" }
-vector-core = { path = "../Vector/crates/vector-core" }
 nostr = { git = "https://github.com/VectorPrivacy/nostr.git", branch = "zeroize-secretkey-v0.45.1" }
