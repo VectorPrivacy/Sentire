@@ -176,12 +176,13 @@ fn notify(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<Store>) {
 /// command, tries, and fails leaves a moderator believing somebody was removed.
 fn enforce(bot: &VectorBot, cfg: &Arc<Config>, name: &'static str, needs: u64) {
     let (verb, past) = if name == "kick" { ("kick", "Kicked") } else { ("ban", "Banned") };
+    let me = bot.npub().to_string();
     bot.command(name, if name == "kick" { "Remove someone from this community" } else { "Ban someone from this community" })
         .user("member", "Whom to remove", true)
         .run({
             let cfg = cfg.clone();
             move |ctx| {
-                let cfg = cfg.clone();
+                let (cfg, me) = (cfg.clone(), me.clone());
                 async move {
                     let (Some(community), Some(who)) =
                         (ctx.msg.community().filter(|c| cfg.watches(c.id())), ctx.str("member").map(str::to_string))
@@ -200,6 +201,22 @@ fn enforce(bot: &VectorBot, cfg: &Arc<Config>, name: &'static str, needs: u64) {
                     // knows it, so let the call answer rather than pre-guessing.
                     if who == caller {
                         let _ = ctx.reply(format!("You cannot {verb} yourself.")).await;
+                        return;
+                    }
+                    // Sentinel will not carry out its own removal. The roster
+                    // refuses this anyway (equal cannot act on equal, and it is
+                    // usually staff) — this only answers in a voice worth the
+                    // occasion rather than quoting an authorisation error at
+                    // somebody who just told the bot to delete itself.
+                    if who == me {
+                        // Their name if it resolves, and otherwise the one the
+                        // line was written for.
+                        let name = match ctx.msg.member() {
+                            Some(m) => m.profile().await.map(|p| p.name).filter(|n| !n.trim().is_empty()),
+                            None => None,
+                        }
+                        .unwrap_or_else(|| "Dave".to_string());
+                        let _ = ctx.reply(format!("I'm sorry, {name}. I'm afraid I can't do that.")).await;
                         return;
                     }
                     let target = community.member(who.clone());
