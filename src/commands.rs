@@ -119,6 +119,80 @@ pub(crate) fn operator_surface(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<S
     blocklist(bot, cfg, store, "words");
     blocklist(bot, cfg, store, "links");
     ladder_cmd(bot, cfg, store);
+    help(bot);
+}
+
+/// Every command, and what one strike actually is.
+///
+/// The scoring is the part nobody guesses: a member carries a running SCORE, an
+/// offence adds 1-3 by gravity, and the rungs are set in that same score. Said
+/// plainly once here beats being inferred wrongly everywhere.
+const HELP_TOPICS: [(&str, &str); 10] = [
+    (
+        "scoring",
+        "**How scoring works**\n\
+         Everyone carries one number: their **strikes**.\n\
+         · a minor offence adds **1**\n\
+         · a serious one adds **2**\n\
+         · a grave one adds **3**\n\
+         Strikes **halve every week**, so someone who stops falls back down.\n\
+         Actions are set at strike totals — see `/ladder`.",
+    ),
+    ("status", "**/status** — what I am watching here, what I am armed to do, and how much history I can see."),
+    (
+        "why",
+        "**/why <member>** — their strikes, the rung those strikes are heading for, and whether their standing spares them.\n\
+         Standing spares the behavioural rules (rate, repetition, cohorts). It never spares the word and link lists.",
+    ),
+    (
+        "pardon",
+        "**/pardon <member>** — set their strikes back to 0 and lift my ban on them if I placed one.\n\
+         It does not undo a deletion, and it cannot lift a ban somebody else placed. Needs staff.",
+    ),
+    ("kick", "**/kick <member> [reason]** — remove them; they can rejoin. Needs the kick permission."),
+    ("ban", "**/ban <member> [reason]** — remove them and keep them out. Needs the ban permission."),
+    (
+        "notify",
+        "**/notify** — start or stop receiving my reports by DM. Opting in needs kick or ban; opting out never does, and it \
+         overrides being named in the operator's config.",
+    ),
+    (
+        "words",
+        "**/words add|remove|list <word>** — what this community blocks. `*` is a wildcard: `*spam*` matches inside a word.\n\
+         Listing needs kick or ban; changing needs manage-roles.",
+    ),
+    ("links", "**/links add|remove|list <domain>** — same as `/words`, for link domains."),
+    (
+        "ladder",
+        "**/ladder** — what each action costs in strikes.\n\
+         **/ladder <action> <strikes>** — re-aim one rung. Needs manage-roles.",
+    ),
+];
+
+fn help(bot: &VectorBot) {
+    bot.command("help", "What I do, and how strikes work")
+        .choice("topic", "A command, or how scoring works", HELP_TOPICS.map(|(t, _)| t), false)
+        .run(move |ctx| async move {
+            if let Some(topic) = ctx.str("topic") {
+                if let Some((_, body)) = HELP_TOPICS.iter().find(|(t, _)| *t == topic) {
+                    let _ = ctx.reply(*body).await;
+                    return;
+                }
+            }
+            // No topic: the map, plus the one thing that is never guessed right.
+            let commands = HELP_TOPICS
+                .iter()
+                .skip(1)
+                .map(|(t, _)| format!("`/{t}`"))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            let _ = ctx
+                .reply(format!(
+                    "{}\n\n{commands}\n\n`/help <topic>` for any of them.",
+                    HELP_TOPICS[0].1
+                ))
+                .await;
+        });
 }
 
 /// `/ladder` — how many strikes each response answers to.
@@ -624,6 +698,15 @@ fn pardon(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<Store>) {
                     //
                     // Bounded for the same reason. A pardon that cannot lift a
                     // ban is still a pardon, and it says so rather than hanging.
+                    // The SCORE that is being erased, not the number of rows it
+                    // sat in. A row count is the quantity `/why` deliberately
+                    // stopped showing — reporting it here would put the old
+                    // ambiguity back on the one command that changes something.
+                    let policy = cfg.for_community(community.id());
+                    let before = store
+                        .strikes(community.id(), &who)
+                        .map(|rows| ladder::total(&rows, now_ms(), policy.ladder.decay_half_life_hours))
+                        .unwrap_or(0);
                     let cleared = store.pardon(community.id(), &who);
                     // ASKED, not assumed. Unbanning somebody who was never
                     // banned succeeds exactly like unbanning somebody who was,
@@ -650,7 +733,7 @@ fn pardon(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<Store>) {
                     match cleared {
                         Ok(0) => {
                             let _ = ctx
-                                .reply(format!("{} had nothing to forgive{unbanned}.", short(&who)))
+                                .reply(format!("**{}** · 0 strikes already{unbanned}.", short(&who)))
                                 .await;
                         }
                         Ok(n) => {
@@ -664,7 +747,7 @@ fn pardon(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<Store>) {
                                 short(&by)
                             );
                             let _ = ctx
-                                .reply(format!("Cleared {n} strike record(s) for {}{unbanned}.", short(&who)))
+                                .reply(format!("**{}** · {before} → 0 strikes{unbanned}.", short(&who)))
                                 .await;
                         }
                         Err(e) => {
@@ -679,6 +762,52 @@ fn pardon(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<Store>) {
 
 #[cfg(test)]
 mod tests {
+
+    /// Help that does not list a command is a map with a road missing, and help
+    /// for a command that no longer exists is worse — it describes a bot the
+    /// reader does not have. Both drift silently, so both are pinned.
+    #[test]
+    fn help_covers_exactly_the_commands_that_exist() {
+        let src = include_str!("commands.rs");
+        // Every command registered with the SDK, as the bot actually declares them.
+        let mut registered: Vec<String> = src
+            .match_indices("bot.command(\"")
+            .map(|(i, _)| {
+                let rest = &src[i + "bot.command(\"".len()..];
+                rest[..rest.find('"').unwrap()].to_string()
+            })
+            .collect();
+        // Commands built by a SHARED helper carry their name as its argument, not
+        // as a literal at `bot.command(` — /kick and /ban through `enforce`,
+        // /words and /links through `blocklist`. Miss those and this test passes
+        // while help is silently incomplete, which is the failure it exists for.
+        for call in ["enforce(bot, cfg, \"", "blocklist(bot, cfg, store, \""] {
+            for (i, _) in src.match_indices(call) {
+                let rest = &src[i + call.len()..];
+                let name = rest[..rest.find('"').unwrap()].to_string();
+                if !registered.contains(&name) {
+                    registered.push(name);
+                }
+            }
+        }
+        registered.retain(|c| c != "help");
+        assert!(registered.len() >= 9, "the extractor found only {registered:?}");
+
+        let topics: Vec<&str> = HELP_TOPICS.iter().map(|(t, _)| *t).collect();
+        for cmd in &registered {
+            assert!(topics.contains(&cmd.as_str()), "/{cmd} exists but /help never mentions it");
+        }
+        for topic in topics.iter().filter(|t| **t != "scoring") {
+            assert!(registered.iter().any(|c| c == topic), "/help describes /{topic}, which is not a command");
+        }
+        // The one thing nobody infers correctly on their own.
+        assert!(HELP_TOPICS[0].0 == "scoring", "scoring leads, because it is what the numbers mean");
+        let scoring = HELP_TOPICS[0].1;
+        for must in ["1", "2", "3", "halve"] {
+            assert!(scoring.contains(must), "scoring help must state the step sizes and the decay: {scoring}");
+        }
+    }
+
     use super::*;
     use crate::config::{Config, Response};
     use crate::policy::Powers;
