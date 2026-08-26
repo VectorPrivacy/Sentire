@@ -136,6 +136,18 @@ fn blocklist(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<Store>, which: &'st
                         current.rules.links.iter().flat_map(|l| l.domains.iter().cloned()).collect()
                     };
 
+                    // Reading is gated too, and not for tidiness: a blocklist is an
+                    // EVASION MAP. Anyone who can see it knows exactly which words to
+                    // avoid or obfuscate, which is the same reason the media lane never
+                    // quotes its label and confidence at the member it warns. Moderators
+                    // see the rules they enforce; changing them takes more.
+                    let Some(caller) = ctx.msg.author() else { return };
+                    let member = community.member(caller.clone());
+                    if !NOTIFY_NEEDS.iter().any(|p| member.can(*p)) {
+                        let _ = ctx.reply(format!("Only this community's moderators can see the blocked {which}.")).await;
+                        return;
+                    }
+
                     if action == "list" {
                         let text = if listed.is_empty() {
                             format!("No {which} are blocked here.")
@@ -154,8 +166,7 @@ fn blocklist(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<Store>, which: &'st
                         return;
                     }
 
-                    let Some(caller) = ctx.msg.author() else { return };
-                    if !community.member(caller.clone()).can(CONFIG_NEEDS) {
+                    if !member.can(CONFIG_NEEDS) {
                         let _ = ctx.reply("Changing what this community blocks needs the manage-roles permission.").await;
                         return;
                     }
