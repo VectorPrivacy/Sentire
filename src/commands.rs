@@ -97,6 +97,97 @@ pub(crate) fn operator_surface(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<S
     notify(bot, cfg, store);
     blocklist(bot, cfg, store, "words");
     blocklist(bot, cfg, store, "links");
+    ladder_cmd(bot, cfg, store);
+}
+
+/// `/ladder` — how many strikes each response answers to.
+///
+/// Shown to any moderator, changed by an admin. The engine's own validator
+/// decides what is legal: rungs must ascend and must never de-escalate, so a
+/// community cannot ask for a ban before a warning or two rungs on one total.
+/// Refusing with its reason beats a UI that has to re-implement those rules and
+/// drift from them.
+fn ladder_cmd(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<Store>) {
+    bot.command("ladder", "How many strikes each action answers to")
+        .choice("action", "Which action to re-aim", ["warn", "delete", "kick", "ban"], false)
+        .number("at", "Strike total that triggers it", false)
+        .run({
+            let (cfg, store) = (cfg.clone(), store.clone());
+            move |ctx| {
+                let (cfg, store) = (cfg.clone(), store.clone());
+                async move {
+                    let Some(community) = ctx.msg.community().filter(|c| cfg.watches(c.id())) else {
+                        let _ = ctx.reply("I am not watching this community.").await;
+                        return;
+                    };
+                    let Some(caller) = ctx.msg.author() else { return };
+                    let member = community.member(caller.clone());
+                    if !NOTIFY_NEEDS.iter().any(|p| member.can(*p)) {
+                        let _ = ctx.reply("Only this community's moderators can see the ladder.").await;
+                        return;
+                    }
+                    let current = cfg.for_community(community.id());
+                    let show = |p: &CommunityPolicy| {
+                        let worth = &p.ladder.strikes;
+                        format!(
+                            "Strikes: note {} · minor {} · serious {} · grave {}\n{}",
+                            worth.note, worth.minor, worth.serious, worth.grave,
+                            p.ladder
+                                .steps
+                                .iter()
+                                .map(|s| format!("- **{}** at {} strike(s)", s.response.name(), s.at))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        )
+                    };
+
+                    let (Some(action), Some(at)) = (ctx.str("action").map(str::to_string), ctx.number("at")) else {
+                        let _ = ctx.reply(show(&current)).await;
+                        return;
+                    };
+                    if !member.can(CONFIG_NEEDS) {
+                        let _ = ctx.reply("Changing the ladder needs the manage-roles permission.").await;
+                        return;
+                    }
+                    if cfg.pinned(community.id(), SettingKey::LadderSteps) {
+                        let _ = ctx.reply("This community's ladder is set by the bot operator and cannot be changed here.").await;
+                        return;
+                    }
+                    let at = at.round();
+                    if !(1.0..=1_000_000.0).contains(&at) {
+                        let _ = ctx.reply("A rung answers to a strike total between 1 and 1000000.").await;
+                        return;
+                    }
+                    let at = at as u32;
+                    let response = match action.as_str() {
+                        "warn" => crate::config::Response::Warn,
+                        "delete" => crate::config::Response::DeleteAndWarn,
+                        "kick" => crate::config::Response::Kick,
+                        _ => crate::config::Response::Ban,
+                    };
+                    // Re-aim that rung and leave the others where they are. Sorted,
+                    // because the ladder is read in order and the validator refuses
+                    // one that is not — better to sort than to reject a change that
+                    // only arrived out of sequence.
+                    let mut steps: Vec<crate::config::Step> =
+                        current.ladder.steps.iter().filter(|s| s.response != response).cloned().collect();
+                    steps.push(crate::config::Step { at, response });
+                    steps.sort_by_key(|s| s.at);
+
+                    let outcome = cfg.set_chat_override(community.id(), &store, |o| {
+                        o.ladder.get_or_insert_with(Default::default).steps = Some(steps);
+                    });
+                    let text = match outcome {
+                        Ok(()) => {
+                            let now = cfg.for_community(community.id());
+                            format!("**{}** now answers to {at} strike(s).\n\n{}", response.name(), show(&now))
+                        }
+                        Err(e) => format!("Refused: {e}"),
+                    };
+                    let _ = ctx.reply(text).await;
+                }
+            }
+        });
 }
 
 /// The power to CONFIGURE Sentinel. Deliberately above the moderation bits:

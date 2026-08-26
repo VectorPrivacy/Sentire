@@ -64,11 +64,12 @@ pub enum SettingKey {
     DecayHalfLifeHours,
     Words,
     Links,
+    LadderSteps,
 }
 
 impl SettingKey {
     /// The name a person types, and the picker entry a client renders.
-    pub const ALL: [(&'static str, SettingKey); 14] = [
+    pub const ALL: [(&'static str, SettingKey); 15] = [
         ("warn", SettingKey::WarnArmed),
         ("delete", SettingKey::DeleteArmed),
         ("kick", SettingKey::KickArmed),
@@ -83,6 +84,7 @@ impl SettingKey {
         ("decay-half-life-hours", SettingKey::DecayHalfLifeHours),
         ("words", SettingKey::Words),
         ("links", SettingKey::Links),
+        ("ladder", SettingKey::LadderSteps),
     ];
 
     pub fn parse(name: &str) -> Option<SettingKey> {
@@ -128,6 +130,13 @@ impl SettingKey {
             SettingKey::DecayHalfLifeHours => p.ladder.decay_half_life_hours.to_string(),
             SettingKey::Words => p.rules.words.iter().map(|w| w.patterns.len()).sum::<usize>().to_string(),
             SettingKey::Links => p.rules.links.iter().map(|l| l.domains.len()).sum::<usize>().to_string(),
+            SettingKey::LadderSteps => p
+                .ladder
+                .steps
+                .iter()
+                .map(|s| format!("{} at {}", s.response.name(), s.at))
+                .collect::<Vec<_>>()
+                .join(", "),
         }
     }
 
@@ -144,6 +153,7 @@ impl SettingKey {
             | SettingKey::RaidArmed
             | SettingKey::RespectTrusted => "true or false",
             SettingKey::Words | SettingKey::Links => "use the /words and /links commands",
+            SettingKey::LadderSteps => "use the /ladder command",
             _ => "a whole number",
         }
     }
@@ -197,7 +207,9 @@ impl SettingKey {
             SettingKey::DecayHalfLifeHours => {
                 o.ladder.get_or_insert_with(Default::default).decay_half_life_hours = Some(number(8_760)?)
             }
-            SettingKey::Words | SettingKey::Links => return Err(self.expects().to_string()),
+            SettingKey::Words | SettingKey::Links | SettingKey::LadderSteps => {
+                return Err(self.expects().to_string())
+            }
         }
         Ok(())
     }
@@ -219,6 +231,7 @@ impl SettingKey {
             SettingKey::DecayHalfLifeHours => { if let Some(l) = o.ladder.as_mut() { l.decay_half_life_hours = None } }
             SettingKey::Words => { if let Some(r) = o.rules.as_mut() { r.words = None } }
             SettingKey::Links => { if let Some(r) = o.rules.as_mut() { r.links = None } }
+            SettingKey::LadderSteps => { if let Some(l) = o.ladder.as_mut() { l.steps = None } }
         }
     }
 
@@ -240,6 +253,7 @@ impl SettingKey {
             SettingKey::DecayHalfLifeHours => o.ladder.as_ref().is_some_and(|l| l.decay_half_life_hours.is_some()),
             SettingKey::Words => o.rules.as_ref().is_some_and(|r| r.words.is_some()),
             SettingKey::Links => o.rules.as_ref().is_some_and(|r| r.links.is_some()),
+            SettingKey::LadderSteps => o.ladder.as_ref().is_some_and(|l| l.steps.is_some()),
         }
     }
 }
@@ -593,6 +607,35 @@ impl Powers {
 
 #[cfg(test)]
 mod tests {
+
+    /// Re-aiming one rung leaves the others alone, and the result must still be
+    /// a legal ladder — ascending and never de-escalating. The engine's own
+    /// validator decides that; a chat command must not re-implement it and drift.
+    #[test]
+    fn a_ladder_rung_can_be_re_aimed_without_disturbing_the_rest() {
+        use crate::config::{Response, Step};
+        let cfg: crate::config::Config = toml::from_str("").unwrap();
+        let before = cfg.for_community("x").ladder.steps.clone();
+        assert!(before.iter().any(|s| s.response == Response::Kick), "defaults carry a kick rung");
+
+        // Exactly what the command builds: drop that response, re-add it, sort.
+        let mut steps: Vec<Step> = before.iter().filter(|s| s.response != Response::Kick).cloned().collect();
+        steps.push(Step { at: 100, response: Response::Kick });
+        steps.sort_by_key(|s| s.at);
+
+        assert_eq!(steps.iter().filter(|s| s.response == Response::Kick).count(), 1, "one rung per response");
+        assert_eq!(steps.iter().find(|s| s.response == Response::Kick).unwrap().at, 100);
+        assert!(
+            steps.windows(2).all(|w| w[1].at > w[0].at),
+            "the ladder is read in order, so sorting is what keeps a re-aim legal: {steps:?}"
+        );
+        // And the warn rung was not touched.
+        assert_eq!(
+            steps.iter().find(|s| s.response == Response::Warn).map(|s| s.at),
+            before.iter().find(|s| s.response == Response::Warn).map(|s| s.at)
+        );
+    }
+
 
     /// The whole permission model in one test: a community may change what the
     /// operator left open, and may not change what the operator named for them.
