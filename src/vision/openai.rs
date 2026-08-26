@@ -44,8 +44,15 @@ pub fn storyboard_preamble(board: &super::storyboard::Board) -> String {
     format!(
         "This image is a {cols}x{rows} grid of {n} still frames sampled in order \
          (left to right, top to bottom) from ONE video clip spanning {secs:.0} seconds. \
-         It is not {n} separate images. Judge the clip as a whole: if ANY frame shows \
-         something, score it for the whole clip. Blank black cells are padding, not content. ",
+         It is not {n} separate images, and it is NOT a comparison, collage, chart or \
+         character sheet — the rows and columns carry no meaning, they are only frames \
+         laid out in time order. \
+         Score each label as the MAXIMUM over the frames, never the average and never \
+         an overall impression: if ONE frame out of {n} qualifies, the clip scores as \
+         that frame does, exactly as if the rest were not there. A clip that is mild \
+         for five frames and explicit for one is an explicit clip. \
+         Describe the most extreme frame, not the sheet as a whole. \
+         Blank black cells are padding, not content. ",
         cols = board.cols,
         rows = board.rows,
         n = board.tiles(),
