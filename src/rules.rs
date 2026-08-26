@@ -26,7 +26,7 @@ fn seriousness(g: Gravity) -> Seriousness {
 /// policy would be a no-op with a hash.
 pub fn compile(cfg: &CommunityPolicy) -> Option<Policy> {
     let r = &cfg.rules;
-    let mut policy = Policy::named("Sentinel");
+    let mut policy = Policy::named("Sentire");
     let mut any = false;
 
     // Shields gate BEFORE conviction, so reaching a regular has to be said in the

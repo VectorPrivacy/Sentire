@@ -257,7 +257,7 @@ pub struct Profile {
 impl Default for Profile {
     fn default() -> Self {
         Profile {
-            name: "Sentinel".into(),
+            name: "Sentire".into(),
             about: "The watchtower for your Community".into(),
             avatar: String::new(),
             banner: String::new(),
