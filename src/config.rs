@@ -6,7 +6,7 @@
 //! grave offense, or an unshielded-protected config refuses to start and names
 //! the field.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Every check that reads a ladder, limits or raid settings — run against the
 /// FOLDED policy, so a per-community override cannot reach what the defaults
@@ -172,7 +172,7 @@ pub fn validate_policy(p: &crate::policy::CommunityPolicy, whose: &str) -> Resul
 /// Sentinel's own vocabulary for how bad something is. Deliberately NOT the
 /// engine's `Severity`: severity is the policy author's judgement, gravity is
 /// the operator's. The two map, they never silently merge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Gravity {
     Note,
@@ -197,7 +197,7 @@ impl Gravity {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub bot: Bot,
@@ -211,10 +211,23 @@ pub struct Config {
     pub notify: NotifyCfg,
     /// Per-community overrides, keyed by community id. Anything absent falls
     /// back to the blocks above, so an operator names only what differs.
+    ///
+    /// This layer PINS: it is applied after whatever the community set from
+    /// chat, so naming a setting here takes it out of their hands.
     pub community: std::collections::HashMap<String, crate::policy::Overrides>,
+    /// What communities set for THEMSELVES, from chat. Loaded from Sentinel's
+    /// store at boot and updated in place as commands land, so every reader of
+    /// `for_community` sees the change without the process restarting or the
+    /// shared `Arc<Config>` being swapped underneath running tasks.
+    ///
+    /// Never parsed from the TOML — the operator's file says what the operator
+    /// decided, and mixing the two would make a `/set` look like something they
+    /// had written.
+    #[serde(skip)]
+    pub chat: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, crate::policy::Overrides>>>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Bot {
     /// Env var holding the nsec — never the key itself, in any file.
@@ -232,7 +245,7 @@ pub struct Bot {
     pub profile: Profile,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Profile {
     pub name: String,
@@ -268,7 +281,7 @@ impl Default for Bot {
 /// class — a bot that warns is not thereby a bot that bans — and changing any
 /// of them clears that community's slate, so a rehearsal never becomes a
 /// backlog the armed run discharges at once.
-#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Arm {
     pub warn: bool,
@@ -278,7 +291,7 @@ pub struct Arm {
     pub raid: bool,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
     pub max_actions_per_run: usize,
@@ -302,7 +315,7 @@ impl Default for Limits {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Rules {
     pub window_hours: u64,
@@ -333,7 +346,7 @@ impl Default for Rules {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WordRule {
     pub id: String,
@@ -346,7 +359,7 @@ pub struct WordRule {
     pub gravity: Gravity,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LinkRule {
     pub id: String,
@@ -357,7 +370,7 @@ pub struct LinkRule {
     pub gravity: Gravity,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RateRule {
     pub enabled: bool,
@@ -370,7 +383,7 @@ pub struct RateRule {
     pub gravity: Gravity,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ToggleRule {
     pub enabled: bool,
@@ -394,7 +407,7 @@ impl Default for ToggleRule {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Ladder {
     /// What one offense of each gravity is worth.
@@ -405,7 +418,7 @@ pub struct Ladder {
     pub steps: Vec<Step>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Strikes {
     pub note: u32,
@@ -431,14 +444,14 @@ impl Strikes {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Step {
     pub at: u32,
     pub response: Response,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Response {
     Warn,
@@ -509,7 +522,7 @@ impl Default for Ladder {
 
 /// The media lane. Off by default: it ships bytes to a model, and that is a
 /// decision an operator makes rather than inherits.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VisionCfg {
     pub enabled: bool,
@@ -580,7 +593,7 @@ fn default_reasoning_effort() -> String {
 ///
 /// The mod channel is a room; this is a DM. An owner who is not reading the
 /// channel at 3am still finds out what happened in the morning.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NotifyCfg {
     /// npubs to DM. Empty means nobody, which is the default: Sentinel does not
@@ -618,7 +631,7 @@ impl Default for NotifyCfg {
 }
 
 /// How a clip becomes something a still-image model can answer for.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct VideoCfg {
     /// Off means video is refused rather than judged — which reaches a person,
@@ -657,7 +670,7 @@ impl Default for VideoCfg {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct VisionLabel {
     pub name: String,
@@ -726,7 +739,7 @@ impl VisionCfg {
 /// What a detected raid answers to. Deliberately outside the ladder: a raid is
 /// one event, and escalating through warnings while a hundred accounts post the
 /// same line is the wrong shape.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Raid {
     /// Confidence a suspect must reach to be contained. 75 is the Alert band's
@@ -759,7 +772,7 @@ pub struct Raid {
     pub protect_tenure_secs: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RaidResponse {
     /// Name the cohort and touch nobody.
@@ -797,7 +810,7 @@ impl Default for Raid {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Shields {
     /// A Trusted member is queued for a human, never actioned.
@@ -956,6 +969,63 @@ impl Config {
     /// community happened to hold.
     pub fn watches(&self, community_id: &str) -> bool {
         self.bot.communities.iter().any(|w| w == "*" || w == community_id)
+    }
+
+    /// Load what every community set for itself into the live chat layer.
+    ///
+    /// Called once at boot. A row that no longer parses is skipped and named,
+    /// never fatal: settings written by a newer Sentinel must not stop an older
+    /// one from moderating, and reverting somebody's rules in silence is exactly
+    /// the failure nobody notices.
+    pub fn load_chat_layer(&self, store: &crate::store::Store) {
+        let Ok(rows) = store.community_configs() else { return };
+        let mut live = self.chat.write().unwrap_or_else(|e| e.into_inner());
+        for (id, json) in rows {
+            match serde_json::from_str::<crate::policy::Overrides>(&json) {
+                Ok(o) => {
+                    live.insert(id, o);
+                }
+                Err(e) => eprintln!("[config] {}'s settings did not parse and were skipped: {e}", &id[..8.min(id.len())]),
+            }
+        }
+        if !live.is_empty() {
+            println!("[config] {} community/communities configured from chat", live.len());
+        }
+    }
+
+    /// Apply a change a community made, and persist it — validated FIRST.
+    ///
+    /// Order matters: a value that would not compile is refused with its reason
+    /// rather than stored. Otherwise a typo takes a community's moderation off
+    /// the air and the only symptom is that nothing ever happens again.
+    pub fn set_chat_override(
+        &self,
+        community_id: &str,
+        store: &crate::store::Store,
+        edit: impl FnOnce(&mut crate::policy::Overrides),
+    ) -> Result<(), String> {
+        let mut next = self
+            .chat
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(community_id)
+            .cloned()
+            .unwrap_or_default();
+        edit(&mut next);
+
+        // Validate the RESULT, in the same layering the bot will read it in —
+        // a value that is fine alone can still be nonsense once the operator's
+        // pins land on top of it.
+        let mut probe = self.clone();
+        probe.chat = std::sync::Arc::new(std::sync::RwLock::new(
+            [(community_id.to_string(), next.clone())].into_iter().collect(),
+        ));
+        validate_policy(&probe.for_community(community_id), "this community")?;
+
+        let json = serde_json::to_string(&next).map_err(|e| e.to_string())?;
+        store.set_community_config(community_id, &json, crate::now_ms())?;
+        self.chat.write().unwrap_or_else(|e| e.into_inner()).insert(community_id.to_string(), next);
+        Ok(())
     }
 
     /// Whether the media lane runs in this community.

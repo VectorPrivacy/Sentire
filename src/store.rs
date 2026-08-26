@@ -36,6 +36,11 @@ CREATE TABLE IF NOT EXISTS actions (
     at_ms     INTEGER NOT NULL,
     evidence  TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS community_config (
+    community TEXT PRIMARY KEY,
+    json      TEXT NOT NULL,
+    at_ms     INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS notify_subscriptions (
     community TEXT NOT NULL,
     subject   TEXT NOT NULL,
@@ -343,6 +348,37 @@ impl Store {
     /// wiped — permanently, since every later boot then read no change.
     ///
     /// True when the arming changed and the slate was wiped.
+    /// What every community set for itself, for the boot-time load.
+    ///
+    /// A row that no longer parses is SKIPPED, not fatal: a settings file from a
+    /// newer Sentinel must not stop an older one from moderating at all, and the
+    /// community keeps the defaults until it is read by a build that understands
+    /// it. The skip is announced, because silently reverting somebody's rules is
+    /// the kind of thing that has to be visible.
+    pub fn community_configs(&self) -> Result<Vec<(String, String)>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut q = conn.prepare("SELECT community, json FROM community_config").map_err(|e| e.to_string())?;
+        let rows = q
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| e.to_string())?;
+        Ok(rows.flatten().collect())
+    }
+
+    /// Persist what a community set for itself. Whole document per community:
+    /// the caller has already folded and VALIDATED it, so there is no partial
+    /// state here to reconcile and no second copy to drift.
+    pub fn set_community_config(&self, community: &str, json: &str, at_ms: u64) -> Result<(), String> {
+        self.conn
+            .lock()
+            .map_err(|e| e.to_string())?
+            .execute(
+                "INSERT OR REPLACE INTO community_config (community, json, at_ms) VALUES (?1, ?2, ?3)",
+                rusqlite::params![community, json, at_ms as i64],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
     /// Subscribe someone to this community's mod reports. Their permission is
     /// checked by the CALLER at opt-in and again at send: this row records a
     /// wish, never an authority.

@@ -200,6 +200,10 @@ async fn main() -> vector_sdk::Result<()> {
     // everyone from zero.
     let db_path = std::path::Path::new(&config_path).with_extension("db");
     let store = Arc::new(Store::open(&db_path.to_string_lossy()).map_err(vector_sdk::Error::Other)?);
+    // Before anything reads a policy: what communities set for themselves is
+    // part of the config, and loading it after the first sweep would moderate
+    // one pass under rules nobody chose.
+    cfg.load_chat_layer(&store);
     let cfg = Arc::new(cfg);
 
     let bot = VectorBot::builder().nsec(nsec).public().build().await?;

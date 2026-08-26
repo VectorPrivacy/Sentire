@@ -9,7 +9,7 @@
 //! can hand Sentinel MANAGE_MESSAGES and withhold BAN, and a sentence it cannot
 //! carry out is reported as such rather than attempted and silently dropped.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::{Arm, Config, Gravity, Ladder, Limits, Raid, Rules, Shields};
 
@@ -41,9 +41,83 @@ fn titleize(id: &str) -> String {
         .join(" ")
 }
 
+/// Every setting a community may change from chat, and the one place the name,
+/// the parser and the writer agree on it.
+///
+/// A closed vocabulary on purpose. A free-form `key = value` would let a typo
+/// store a setting nothing reads — the shape of an earlier bug here, where a
+/// documented `arm.vision` was silently dropped and an operator believed the
+/// media lane was off. Anything not in this list is not a setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingKey {
+    WarnArmed,
+    DeleteArmed,
+    KickArmed,
+    BanArmed,
+    RaidArmed,
+    RaidResponse,
+    RaidMinConfidence,
+    TripwireAccounts,
+    TripwireSecs,
+    RespectTrusted,
+    WindowHours,
+    DecayHalfLifeHours,
+    Words,
+    Links,
+}
+
+impl SettingKey {
+    /// The name a person types, and the picker entry a client renders.
+    pub const ALL: [(&'static str, SettingKey); 14] = [
+        ("warn", SettingKey::WarnArmed),
+        ("delete", SettingKey::DeleteArmed),
+        ("kick", SettingKey::KickArmed),
+        ("ban", SettingKey::BanArmed),
+        ("raid", SettingKey::RaidArmed),
+        ("raid-response", SettingKey::RaidResponse),
+        ("raid-confidence", SettingKey::RaidMinConfidence),
+        ("tripwire-accounts", SettingKey::TripwireAccounts),
+        ("tripwire-seconds", SettingKey::TripwireSecs),
+        ("respect-trusted", SettingKey::RespectTrusted),
+        ("window-hours", SettingKey::WindowHours),
+        ("decay-half-life-hours", SettingKey::DecayHalfLifeHours),
+        ("words", SettingKey::Words),
+        ("links", SettingKey::Links),
+    ];
+
+    pub fn parse(name: &str) -> Option<SettingKey> {
+        SettingKey::ALL.iter().find(|(n, _)| *n == name).map(|(_, k)| *k)
+    }
+
+    pub fn name(self) -> &'static str {
+        SettingKey::ALL.iter().find(|(_, k)| *k == self).map(|(n, _)| *n).unwrap_or("?")
+    }
+
+    /// Whether an overrides block names this setting — which is what "the
+    /// operator pinned it" means when the block is theirs.
+    pub fn present_in(self, o: &Overrides) -> bool {
+        match self {
+            SettingKey::WarnArmed => o.arm.is_some_and(|a| a.warn.is_some()),
+            SettingKey::DeleteArmed => o.arm.is_some_and(|a| a.delete.is_some()),
+            SettingKey::KickArmed => o.arm.is_some_and(|a| a.kick.is_some()),
+            SettingKey::BanArmed => o.arm.is_some_and(|a| a.ban.is_some()),
+            SettingKey::RaidArmed => o.arm.is_some_and(|a| a.raid.is_some()),
+            SettingKey::RaidResponse => o.raid.is_some_and(|r| r.response.is_some()),
+            SettingKey::RaidMinConfidence => o.raid.is_some_and(|r| r.min_confidence.is_some()),
+            SettingKey::TripwireAccounts => o.raid.is_some_and(|r| r.tripwire_accounts.is_some()),
+            SettingKey::TripwireSecs => o.raid.is_some_and(|r| r.tripwire_secs.is_some()),
+            SettingKey::RespectTrusted => o.shields.is_some_and(|s| s.respect_trusted.is_some()),
+            SettingKey::WindowHours => o.rules.as_ref().is_some_and(|r| r.window_hours.is_some()),
+            SettingKey::DecayHalfLifeHours => o.ladder.as_ref().is_some_and(|l| l.decay_half_life_hours.is_some()),
+            SettingKey::Words => o.rules.as_ref().is_some_and(|r| r.words.is_some()),
+            SettingKey::Links => o.rules.as_ref().is_some_and(|r| r.links.is_some()),
+        }
+    }
+}
+
 /// A per-community override block. Every field is optional and falls back to
 /// the top-level default, so an operator names only what differs.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct Overrides {
     pub vision: Option<VisionOverride>,
@@ -58,7 +132,7 @@ pub struct Overrides {
 /// Whether this community gets the media lane. Separate from the rules because
 /// it is the operator's call to make, not the community's: the model costs money
 /// and sees decrypted attachments, so a community cannot vote itself into it.
-#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct VisionOverride {
     pub enabled: Option<bool>,
@@ -67,7 +141,7 @@ pub struct VisionOverride {
 /// Overrides fold FIELD by field. A whole-block override reset everything the
 /// operator had customised globally back to library defaults — naming one
 /// tighter limit silently loosened the other two.
-#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct ArmOverride {
     pub warn: Option<bool>,
@@ -77,7 +151,7 @@ pub struct ArmOverride {
     pub raid: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct RulesOverride {
     pub window_hours: Option<u64>,
@@ -90,7 +164,7 @@ pub struct RulesOverride {
     pub repetition: Option<crate::config::ToggleRule>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct LimitsOverride {
     pub max_actions_per_run: Option<usize>,
@@ -99,7 +173,7 @@ pub struct LimitsOverride {
     pub halt_floor: Option<usize>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct LadderOverride {
     pub strikes: Option<StrikesOverride>,
@@ -114,7 +188,7 @@ pub struct LadderOverride {
 /// minor and serious to the library defaults — an override that only tightened
 /// producing a loosening the validator cannot see, since the result still
 /// ascends.
-#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct StrikesOverride {
     pub note: Option<u32>,
@@ -132,14 +206,14 @@ impl StrikesOverride {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct ShieldsOverride {
     pub respect_trusted: Option<bool>,
     pub respect_protected: Option<bool>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct RaidOverride {
     pub min_confidence: Option<u32>,
@@ -153,8 +227,18 @@ pub struct RaidOverride {
 
 impl Config {
     /// This community's rulebook: the defaults, with its overrides folded over.
+    /// This community's effective settings, in three layers — narrowest wins.
+    ///
+    /// 1. the top-level TOML, everyone's defaults;
+    /// 2. what the community set from chat, held in Sentinel's store;
+    /// 3. the operator's `[community."<id>"]` block, applied LAST so it pins.
+    ///
+    /// That order is the whole permission model in one line: what the operator
+    /// wrote for your community specifically is fixed, and the rest is yours.
+    /// Without a pin an operator could not decline liability for a bot running
+    /// under their key — a community could arm `ban` on it and they could not
+    /// say no.
     pub fn for_community(&self, id: &str) -> CommunityPolicy {
-        let o = self.community.get(id);
         let mut p = CommunityPolicy {
             arm: self.arm,
             limits: self.limits,
@@ -163,7 +247,22 @@ impl Config {
             shields: self.shields,
             raid: self.raid,
         };
-        let Some(o) = o else { return p };
+        if let Some(chat) = self.chat.read().unwrap_or_else(|e| e.into_inner()).get(id) {
+            Self::apply(&mut p, chat);
+        }
+        if let Some(o) = self.community.get(id) {
+            Self::apply(&mut p, o);
+        }
+        p
+    }
+
+    /// Whether the operator pinned this setting for this community, which is
+    /// what makes a chat change refuse instead of silently doing nothing.
+    pub fn pinned(&self, id: &str, key: SettingKey) -> bool {
+        self.community.get(id).is_some_and(|o| key.present_in(o))
+    }
+
+    fn apply(p: &mut CommunityPolicy, o: &Overrides) {
         if let Some(a) = &o.arm {
             let f = |over: Option<bool>, base: bool| over.unwrap_or(base);
             p.arm = Arm {
@@ -224,7 +323,6 @@ impl Config {
             p.raid.claim_ttl_secs = r.claim_ttl_secs.unwrap_or(p.raid.claim_ttl_secs);
             p.raid.max_batch = r.max_batch.unwrap_or(p.raid.max_batch);
         }
-        p
     }
 }
 
@@ -366,6 +464,40 @@ impl Powers {
 
 #[cfg(test)]
 mod tests {
+
+    /// The whole permission model in one test: a community may change what the
+    /// operator left open, and may not change what the operator named for them.
+    #[test]
+    fn the_operators_block_pins_and_everything_else_is_the_communitys() {
+        const C: &str = "cccc000000000000000000000000000000000000000000000000000000000000";
+        let cfg: crate::config::Config = toml::from_str(&format!(
+            "[arm]\nkick = false\nban = false\n[community.\"{C}\".arm]\nban = false"
+        ))
+        .unwrap();
+
+        // The community sets both from chat.
+        cfg.chat.write().unwrap().insert(
+            C.to_string(),
+            Overrides {
+                arm: Some(ArmOverride { kick: Some(true), ban: Some(true), ..Default::default() }),
+                ..Default::default()
+            },
+        );
+        let p = cfg.for_community(C);
+        assert!(p.arm.kick, "kick was open, so the community's answer stands");
+        assert!(!p.arm.ban, "ban was named by the operator, so the community cannot arm it");
+        assert!(cfg.pinned(C, SettingKey::BanArmed), "and the refusal is explainable before it is attempted");
+        assert!(!cfg.pinned(C, SettingKey::KickArmed));
+
+        // A community the operator wrote nothing for keeps everything.
+        const D: &str = "dddd000000000000000000000000000000000000000000000000000000000000";
+        cfg.chat.write().unwrap().insert(
+            D.to_string(),
+            Overrides { arm: Some(ArmOverride { ban: Some(true), ..Default::default() }), ..Default::default() },
+        );
+        assert!(cfg.for_community(D).arm.ban, "unpinned, so theirs to arm");
+    }
+
     use super::*;
 
     /// The operator's own word wins over the tidied id.

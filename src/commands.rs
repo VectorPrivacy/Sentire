@@ -6,7 +6,7 @@ use vector_sdk::vector_core::community::roles::Permissions;
 use vector_sdk::VectorBot;
 
 use crate::config::Config;
-use crate::policy::CommunityPolicy;
+use crate::policy::{CommunityPolicy, SettingKey};
 use crate::store::Store;
 use crate::{
     now_ms, powers_of, short,
@@ -95,6 +95,134 @@ pub(crate) fn operator_surface(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<S
     enforce(bot, cfg, "kick", Permissions::KICK);
     enforce(bot, cfg, "ban", Permissions::BAN);
     notify(bot, cfg, store);
+    blocklist(bot, cfg, store, "words");
+    blocklist(bot, cfg, store, "links");
+}
+
+/// The power to CONFIGURE Sentinel. Deliberately above the moderation bits:
+/// tuning the rulebook is administering the community, not doing a day's
+/// moderation in it, and someone trusted to remove a spammer is not
+/// automatically someone trusted to decide what counts as one.
+const CONFIG_NEEDS: u64 = Permissions::MANAGE_ROLES;
+
+/// `/words` and `/links` — the community's own blocklists, edited from chat.
+///
+/// One rule per list, under an id the community owns, so an operator's own
+/// entries in the TOML are never touched by a chat edit. Removing the last
+/// pattern removes the rule rather than leaving one that matches nothing.
+///
+/// The change is ANNOUNCED where it was made. A quiet edit to what the bot
+/// blocks is indistinguishable from the bot being broken, and an admin
+/// narrowing the list to nothing should not be something only they know about.
+fn blocklist(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<Store>, which: &'static str) {
+    let describe = if which == "words" { "Words this community blocks" } else { "Link domains this community blocks" };
+    bot.command(which, describe)
+        .choice("action", "add, remove, or list", ["add", "remove", "list"], true)
+        .string("value", if which == "words" { "The word or phrase" } else { "The domain" }, false)
+        .run({
+            let (cfg, store) = (cfg.clone(), store.clone());
+            move |ctx| {
+                let (cfg, store) = (cfg.clone(), store.clone());
+                async move {
+                    let Some(community) = ctx.msg.community().filter(|c| cfg.watches(c.id())) else {
+                        let _ = ctx.reply("I am not watching this community.").await;
+                        return;
+                    };
+                    let action = ctx.str("action").unwrap_or("list").to_string();
+                    let current = cfg.for_community(community.id());
+                    let listed: Vec<String> = if which == "words" {
+                        current.rules.words.iter().flat_map(|w| w.patterns.iter().cloned()).collect()
+                    } else {
+                        current.rules.links.iter().flat_map(|l| l.domains.iter().cloned()).collect()
+                    };
+
+                    if action == "list" {
+                        let text = if listed.is_empty() {
+                            format!("No {which} are blocked here.")
+                        } else {
+                            format!("Blocked {which} ({}):\n{}", listed.len(), listed.iter().map(|v| format!("- {v}")).collect::<Vec<_>>().join("\n"))
+                        };
+                        let _ = ctx.reply(text).await;
+                        return;
+                    }
+
+                    let Some(caller) = ctx.msg.author() else { return };
+                    if !community.member(caller.clone()).can(CONFIG_NEEDS) {
+                        let _ = ctx.reply("Changing what this community blocks needs the manage-roles permission.").await;
+                        return;
+                    }
+                    let key = if which == "words" { SettingKey::Words } else { SettingKey::Links };
+                    if cfg.pinned(community.id(), key) {
+                        let _ = ctx
+                            .reply(format!("This community's {which} list is set by the bot operator and cannot be changed here."))
+                            .await;
+                        return;
+                    }
+                    let Some(value) = ctx.str("value").map(|v| v.trim().to_lowercase()).filter(|v| !v.is_empty()) else {
+                        let _ = ctx.reply(format!("Give me a {} to {action}.", if which == "words" { "word" } else { "domain" })).await;
+                        return;
+                    };
+
+                    let adding = action == "add";
+                    if adding && listed.iter().any(|v| v == &value) {
+                        let _ = ctx.reply(format!("`{value}` is already blocked.")).await;
+                        return;
+                    }
+                    if !adding && !listed.iter().any(|v| v == &value) {
+                        let _ = ctx.reply(format!("`{value}` is not blocked here.")).await;
+                        return;
+                    }
+                    let mut next: Vec<String> = listed.clone();
+                    if adding { next.push(value.clone()) } else { next.retain(|v| v != &value) }
+
+                    let outcome = cfg.set_chat_override(community.id(), &store, |o| {
+                        let rules = o.rules.get_or_insert_with(Default::default);
+                        if which == "words" {
+                            rules.words = Some(if next.is_empty() {
+                                vec![]
+                            } else {
+                                vec![crate::config::WordRule {
+                                    id: "community-words".into(),
+                                    title: "blocked words".into(),
+                                    patterns: next.clone(),
+                                    gravity: crate::config::Gravity::Serious,
+                                }]
+                            });
+                        } else {
+                            rules.links = Some(if next.is_empty() {
+                                vec![]
+                            } else {
+                                vec![crate::config::LinkRule {
+                                    id: "community-links".into(),
+                                    title: "blocked links".into(),
+                                    domains: next.clone(),
+                                    gravity: crate::config::Gravity::Serious,
+                                }]
+                            });
+                        }
+                    });
+
+                    let text = match outcome {
+                        Ok(()) => {
+                            // Recompile so the engine reads the new list on the
+                            // next pass rather than the next restart.
+                            match crate::rules::install(&community, &cfg).await {
+                                Ok(_) => format!(
+                                    "{} `{value}` {} this community's blocked {which} — now {} entr{}.",
+                                    if adding { "Added" } else { "Removed" },
+                                    if adding { "to" } else { "from" },
+                                    next.len(),
+                                    if next.len() == 1 { "y" } else { "ies" }
+                                ),
+                                Err(e) => format!("Saved, but the rulebook did not install: {e}"),
+                            }
+                        }
+                        Err(e) => format!("Refused: {e}"),
+                    };
+                    let _ = ctx.reply(text).await;
+                }
+            }
+        });
 }
 
 /// The power that entitles someone to this community's mod reports. Either half
