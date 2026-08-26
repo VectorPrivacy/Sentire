@@ -258,7 +258,7 @@ impl Default for Profile {
     fn default() -> Self {
         Profile {
             name: "Sentire".into(),
-            about: "The watchtower for your Community".into(),
+            about: "The Guard for your Community".into(),
             avatar: String::new(),
             banner: String::new(),
         }
