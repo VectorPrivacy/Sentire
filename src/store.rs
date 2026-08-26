@@ -41,6 +41,12 @@ CREATE TABLE IF NOT EXISTS community_config (
     json      TEXT NOT NULL,
     at_ms     INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS notify_optout (
+    community TEXT NOT NULL,
+    subject   TEXT NOT NULL,
+    at_ms     INTEGER NOT NULL,
+    PRIMARY KEY (community, subject)
+);
 CREATE TABLE IF NOT EXISTS notify_subscriptions (
     community TEXT NOT NULL,
     subject   TEXT NOT NULL,
@@ -382,32 +388,60 @@ impl Store {
     /// Subscribe someone to this community's mod reports. Their permission is
     /// checked by the CALLER at opt-in and again at send: this row records a
     /// wish, never an authority.
+    ///
+    /// Clears any standing opt-out, so asking again is how you undo having
+    /// asked to stop.
     pub fn notify_subscribe(&self, community: &str, subject: &str, at_ms: u64) -> Result<(), String> {
-        self.conn
-            .lock()
-            .map_err(|e| e.to_string())?
-            .execute(
-                "INSERT OR REPLACE INTO notify_subscriptions (community, subject, at_ms) VALUES (?1, ?2, ?3)",
-                rusqlite::params![community, subject, at_ms as i64],
-            )
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "DELETE FROM notify_optout WHERE community = ?1 AND subject = ?2",
+            rusqlite::params![community, subject],
+        )
+        .map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT OR REPLACE INTO notify_subscriptions (community, subject, at_ms) VALUES (?1, ?2, ?3)",
+            rusqlite::params![community, subject, at_ms as i64],
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    }
+
+    /// Who has explicitly asked to STOP hearing about this community.
+    ///
+    /// Separate from "not subscribed", and it has to be: the operator's TOML
+    /// names recipients too, so without a standing refusal `/notify` could
+    /// promise someone the reports would stop and then keep sending them.
+    pub fn notify_opted_out(&self, community: &str) -> Result<Vec<String>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut q = conn
+            .prepare("SELECT subject FROM notify_optout WHERE community = ?1")
+            .map_err(|e| e.to_string())?;
+        let rows = q
+            .query_map(rusqlite::params![community], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        Ok(rows.flatten().collect())
     }
 
     /// Unsubscribe. Always permitted, whoever asks about themselves — a member
     /// who lost their role is exactly the person who must still be able to stop
     /// the reports, and gating this on the power they no longer hold would trap
     /// them in a feed of other people's moderation.
-    pub fn notify_unsubscribe(&self, community: &str, subject: &str) -> Result<bool, String> {
-        let n = self
-            .conn
-            .lock()
-            .map_err(|e| e.to_string())?
+    pub fn notify_unsubscribe(&self, community: &str, subject: &str, at_ms: u64) -> Result<bool, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let n = conn
             .execute(
                 "DELETE FROM notify_subscriptions WHERE community = ?1 AND subject = ?2",
                 rusqlite::params![community, subject],
             )
             .map_err(|e| e.to_string())?;
+        // A STANDING refusal, not merely the absence of a wish. The operator's
+        // config names recipients too, so deleting the subscription alone left
+        // somebody still being sent reports they had just been told would stop.
+        conn.execute(
+            "INSERT OR REPLACE INTO notify_optout (community, subject, at_ms) VALUES (?1, ?2, ?3)",
+            rusqlite::params![community, subject, at_ms as i64],
+        )
+        .map_err(|e| e.to_string())?;
         Ok(n > 0)
     }
 
@@ -506,6 +540,32 @@ impl Store {
 #[cfg(test)]
 pub mod tests {
 
+    /// Opting out has to beat the operator's config, or the promise is a lie.
+    ///
+    /// Recipients are the TOML list UNION the subscribers, so deleting a
+    /// subscription row left anyone named in `[notify] mods` still being sent
+    /// reports `/notify` had just told them would stop. Being named in a file
+    /// is not consent.
+    #[test]
+    fn an_opt_out_outranks_being_named_in_the_config() {
+        let s = Store::open(":memory:").unwrap();
+        assert!(s.notify_opted_out("c").unwrap().is_empty());
+
+        // Never subscribed — only ever named by the operator — and still able to stop.
+        s.notify_unsubscribe("c", "npub_in_toml", 1_000).unwrap();
+        assert_eq!(s.notify_opted_out("c").unwrap(), vec!["npub_in_toml"], "a standing refusal");
+        assert!(s.notify_subscribers("c").unwrap().is_empty(), "and no phantom subscription");
+
+        // Asking again is how you undo having asked to stop.
+        s.notify_subscribe("c", "npub_in_toml", 2_000).unwrap();
+        assert!(s.notify_opted_out("c").unwrap().is_empty(), "re-subscribing clears the refusal");
+        assert_eq!(s.notify_subscribers("c").unwrap(), vec!["npub_in_toml"]);
+
+        // Scoped per community, like everything else here.
+        s.notify_unsubscribe("other", "npub_in_toml", 3_000).unwrap();
+        assert!(s.notify_opted_out("c").unwrap().is_empty(), "opting out of one is not opting out of all");
+    }
+
     /// Opt-out must never be gated on the power that opt-in required. The person
     /// who should unsubscribe after losing their role is exactly the one who
     /// will not, so the store keeps no authority of its own — it records a wish
@@ -523,9 +583,9 @@ pub mod tests {
         s.notify_subscribe("other", "npub_else", 1_000).unwrap();
         assert_eq!(s.notify_subscribers("c").unwrap(), vec!["npub_mod"], "scoped per community");
 
-        assert!(s.notify_unsubscribe("c", "npub_mod").unwrap(), "withdrawn");
+        assert!(s.notify_unsubscribe("c", "npub_mod", 3_000).unwrap(), "withdrawn");
         assert!(s.notify_subscribers("c").unwrap().is_empty());
-        assert!(!s.notify_unsubscribe("c", "npub_mod").unwrap(), "withdrawing twice is not an error");
+        assert!(!s.notify_unsubscribe("c", "npub_mod", 3_000).unwrap(), "withdrawing twice is not an error");
         assert_eq!(s.notify_subscribers("other").unwrap(), vec!["npub_else"], "the other community is untouched");
     }
 

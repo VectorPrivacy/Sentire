@@ -712,9 +712,13 @@ impl Ctx {
         store: &crate::store::Store,
     ) -> Vec<String> {
         let subscribed = store.notify_subscribers(community.id()).unwrap_or_default();
+        // An explicit opt-out beats BOTH lists, including the operator's. Being
+        // named in a config file is not consent, and `/notify` promises the
+        // reports will stop — a promise it cannot keep if the TOML outranks it.
+        let refused = store.notify_opted_out(community.id()).unwrap_or_default();
         let mut out: Vec<String> = Vec::new();
         for who in cfg.notify.mods.iter().cloned().chain(subscribed) {
-            if !out.contains(&who) && crate::commands::may_receive(community, &who) {
+            if !out.contains(&who) && !refused.contains(&who) && crate::commands::may_receive(community, &who) {
                 out.push(who);
             }
         }

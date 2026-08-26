@@ -287,12 +287,16 @@ fn notify(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<Store>) {
                     return;
                 };
                 let Some(caller) = ctx.msg.author() else { return };
-                let subscribed = store
-                    .notify_subscribers(community.id())
-                    .map(|v| v.iter().any(|n| n == &caller))
-                    .unwrap_or(false);
-                if subscribed {
-                    let text = match store.notify_unsubscribe(community.id(), &caller) {
+                // The toggle asks "am I RECEIVING", not "is there a row" — the
+                // operator's config names recipients too, so keying on the
+                // subscription table alone told a mod named in the TOML that they
+                // would now start receiving what they had been getting all along.
+                let opted_out =
+                    store.notify_opted_out(community.id()).unwrap_or_default().iter().any(|n| n == &caller);
+                let listed = cfg.notify.mods.iter().any(|n| n == &caller)
+                    || store.notify_subscribers(community.id()).unwrap_or_default().iter().any(|n| n == &caller);
+                if !opted_out && listed {
+                    let text = match store.notify_unsubscribe(community.id(), &caller, now_ms()) {
                         Ok(_) => "You will no longer receive moderation reports here.".to_string(),
                         Err(e) => format!("Could not unsubscribe you: {e}"),
                     };
