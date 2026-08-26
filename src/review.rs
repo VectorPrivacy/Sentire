@@ -172,7 +172,7 @@ pub(crate) async fn sweep(
     }
     let id = short(community.id());
     let now = now_ms();
-    let ctx = Ctx::of(cfg, community, me, verdicts.all().count()).await;
+    let ctx = Ctx::of(cfg, community, store, me, verdicts.all().count()).await;
     let pass = Mutex::new(0usize);
     let mut convicted = 0usize;
     let mut halted = false;

@@ -101,7 +101,7 @@ pub(crate) async fn screen(
     }
     let strikes = store.strikes(community.id(), &author).map_err(vector_sdk::Error::Other)?;
     let total = ladder::total(&strikes, now, policy.ladder.decay_half_life_hours);
-    let ctx = live_ctx(cfg, &community, watches, me).await;
+    let ctx = live_ctx(cfg, &community, store, watches, me).await;
     if ladder::decide(&ctx.policy.ladder, total).is_some() {
         // The screen knows the message; an engine citation could not, since at
         // send time it does not exist yet.
@@ -400,7 +400,7 @@ pub(crate) async fn watch_media(
     }
     let strikes = store.strikes(community.id(), &author).map_err(vector_sdk::Error::Other)?;
     let total = ladder::total(&strikes, now, policy.ladder.decay_half_life_hours);
-    let ctx = live_ctx(cfg, &community, watches, me).await;
+    let ctx = live_ctx(cfg, &community, store, watches, me).await;
     if ladder::decide(&ctx.policy.ladder, total).is_some() {
         let findings = flagged
             .iter()
@@ -553,7 +553,7 @@ pub(crate) async fn unclassified(
     // covering all three tells an operator nothing about which they have.
     let bucket = format!("unjudged:{}:{}", why, now / 60_000);
     if store.claim(community.id(), &bucket, now, 3_600_000).unwrap_or(false) {
-        let ctx = live_ctx(cfg, community, watches, me).await;
+        let ctx = live_ctx(cfg, community, store, watches, me).await;
         announce(bot, community, &ctx, &format!("Some attachments were not judged — {why}.")).await;
     }
 }
@@ -594,10 +594,10 @@ pub(crate) fn media_lane(cfg: &Config) -> vector_sdk::Result<Arc<Option<vision::
 /// One community's context for a live lane. Its rulebook and its powers, same
 /// as the sweep resolves — a message arriving is not a reason to judge it by
 /// somebody else's standards.
-pub(crate) async fn live_ctx(cfg: &Config, community: &Community, watches: &Watches, me: &str) -> Ctx {
+pub(crate) async fn live_ctx(cfg: &Config, community: &Community, store: &crate::store::Store, watches: &Watches, me: &str) -> Ctx {
     // The roster as the LAST SWEEP counted it: a live lane has no corpus, and a
     // ceiling measured against nothing bounds nothing.
-    Ctx::of(cfg, community, me, roster_size(watches, community.id())).await
+    Ctx::of(cfg, community, store, me, roster_size(watches, community.id())).await
 }
 
 /// One blob at a time per community, and no more than the operator allows per

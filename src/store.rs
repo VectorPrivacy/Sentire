@@ -36,6 +36,12 @@ CREATE TABLE IF NOT EXISTS actions (
     at_ms     INTEGER NOT NULL,
     evidence  TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS notify_subscriptions (
+    community TEXT NOT NULL,
+    subject   TEXT NOT NULL,
+    at_ms     INTEGER NOT NULL,
+    PRIMARY KEY (community, subject)
+);
 CREATE TABLE IF NOT EXISTS classifications (
     content_hash TEXT NOT NULL,
     model        TEXT NOT NULL,
@@ -337,6 +343,51 @@ impl Store {
     /// wiped — permanently, since every later boot then read no change.
     ///
     /// True when the arming changed and the slate was wiped.
+    /// Subscribe someone to this community's mod reports. Their permission is
+    /// checked by the CALLER at opt-in and again at send: this row records a
+    /// wish, never an authority.
+    pub fn notify_subscribe(&self, community: &str, subject: &str, at_ms: u64) -> Result<(), String> {
+        self.conn
+            .lock()
+            .map_err(|e| e.to_string())?
+            .execute(
+                "INSERT OR REPLACE INTO notify_subscriptions (community, subject, at_ms) VALUES (?1, ?2, ?3)",
+                rusqlite::params![community, subject, at_ms as i64],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Unsubscribe. Always permitted, whoever asks about themselves — a member
+    /// who lost their role is exactly the person who must still be able to stop
+    /// the reports, and gating this on the power they no longer hold would trap
+    /// them in a feed of other people's moderation.
+    pub fn notify_unsubscribe(&self, community: &str, subject: &str) -> Result<bool, String> {
+        let n = self
+            .conn
+            .lock()
+            .map_err(|e| e.to_string())?
+            .execute(
+                "DELETE FROM notify_subscriptions WHERE community = ?1 AND subject = ?2",
+                rusqlite::params![community, subject],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(n > 0)
+    }
+
+    /// Who asked to hear about this community. A wish list, not a recipient
+    /// list: every caller re-checks the power before sending.
+    pub fn notify_subscribers(&self, community: &str) -> Result<Vec<String>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut q = conn
+            .prepare("SELECT subject FROM notify_subscriptions WHERE community = ?1 ORDER BY at_ms")
+            .map_err(|e| e.to_string())?;
+        let rows = q
+            .query_map(rusqlite::params![community], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        Ok(rows.flatten().collect())
+    }
+
     pub fn note_armed(&self, community: &str, classes: &str) -> Result<bool, String> {
         use rusqlite::OptionalExtension;
         let mut conn = self.lock();
@@ -418,6 +469,30 @@ impl Store {
 
 #[cfg(test)]
 pub mod tests {
+
+    /// Opt-out must never be gated on the power that opt-in required. The person
+    /// who should unsubscribe after losing their role is exactly the one who
+    /// will not, so the store keeps no authority of its own — it records a wish
+    /// and every send re-asks the roster.
+    #[test]
+    fn a_subscription_is_a_wish_that_anyone_can_withdraw() {
+        let s = Store::open(":memory:").unwrap();
+        assert!(s.notify_subscribers("c").unwrap().is_empty(), "nobody subscribed yet");
+
+        s.notify_subscribe("c", "npub_mod", 1_000).unwrap();
+        s.notify_subscribe("c", "npub_mod", 2_000).unwrap();
+        assert_eq!(s.notify_subscribers("c").unwrap(), vec!["npub_mod"], "subscribing twice is one row");
+
+        // A different community is a different list — reports must not cross.
+        s.notify_subscribe("other", "npub_else", 1_000).unwrap();
+        assert_eq!(s.notify_subscribers("c").unwrap(), vec!["npub_mod"], "scoped per community");
+
+        assert!(s.notify_unsubscribe("c", "npub_mod").unwrap(), "withdrawn");
+        assert!(s.notify_subscribers("c").unwrap().is_empty());
+        assert!(!s.notify_unsubscribe("c", "npub_mod").unwrap(), "withdrawing twice is not an error");
+        assert_eq!(s.notify_subscribers("other").unwrap(), vec!["npub_else"], "the other community is untouched");
+    }
+
     use super::*;
 
     /// Only the rehearsal boundary wipes. Every other arming change is an

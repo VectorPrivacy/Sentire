@@ -498,7 +498,7 @@ pub(crate) async fn notify_mods_raid(
     removed: &[&str],
     report: Option<&vector_sdk::ContainmentReport>,
 ) {
-    if ctx.notify.mods.is_empty() || removed.is_empty() {
+    if ctx.notify_to.is_empty() || removed.is_empty() {
         return;
     }
     // Full npubs, one per line: the reader has to be able to paste any of them
@@ -542,7 +542,7 @@ pub(crate) async fn notify_mods_raid(
         ctx.community_name,
         removed.len(),
     );
-    for who in &ctx.notify.mods {
+    for who in &ctx.notify_to {
         if who == &ctx.me {
             continue;
         }
@@ -553,7 +553,7 @@ pub(crate) async fn notify_mods_raid(
 }
 
 async fn notify_mods(bot: &VectorBot, ctx: &Ctx, v: &Verdict, rule: &str, action: &str, why: &str) {
-    if ctx.notify.mods.is_empty() {
+    if ctx.notify_to.is_empty() {
         return;
     }
     // The full npub, not a short form: this is the one message whose reader has
@@ -565,7 +565,7 @@ async fn notify_mods(bot: &VectorBot, ctx: &Ctx, v: &Verdict, rule: &str, action
         v.npub,
         why.replace(['\n', '\r'], " ").trim()
     );
-    for who in &ctx.notify.mods {
+    for who in &ctx.notify_to {
         if who == &ctx.me {
             continue;
         }
@@ -626,10 +626,12 @@ impl Ctx {
     pub(crate) async fn of(
         cfg: &crate::config::Config,
         community: &Community,
+        store: &crate::store::Store,
         me: &str,
         roster: usize,
     ) -> Ctx {
         Ctx {
+            notify_to: Self::report_recipients(cfg, community, store),
             community_name: community.name().await,
             policy: cfg.for_community(community.id()),
             powers: crate::powers_of(community).await,
@@ -640,11 +642,41 @@ impl Ctx {
             vision_labels: cfg.vision.labels.clone(),
         }
     }
+
+    /// Who hears about this community's moderation, resolved fresh every pass.
+    ///
+    /// The operator's configured list UNION everyone who ran `/notify` here —
+    /// and then filtered by the power, NOW. A subscription records a wish, never
+    /// an authority: standing expires, and the moderator who should unsubscribe
+    /// after losing their role is exactly the one who will not. Checking here
+    /// rather than at opt-in is what keeps a demoted mod out of the feed.
+    ///
+    /// The configured list is filtered too. An operator naming somebody in the
+    /// TOML does not make them a moderator of a community they were removed
+    /// from, and reports quote what members said — including, once channel
+    /// scoping lands, from rooms the reader may no longer enter.
+    fn report_recipients(
+        cfg: &crate::config::Config,
+        community: &Community,
+        store: &crate::store::Store,
+    ) -> Vec<String> {
+        let subscribed = store.notify_subscribers(community.id()).unwrap_or_default();
+        let mut out: Vec<String> = Vec::new();
+        for who in cfg.notify.mods.iter().cloned().chain(subscribed) {
+            if !out.contains(&who) && crate::commands::may_receive(community, &who) {
+                out.push(who);
+            }
+        }
+        out
+    }
 }
 
 /// One community, as this pass sees it: its own rulebook, its own powers, its
 /// own roster. Nothing about judging one community may leak into another.
 pub(crate) struct Ctx {
+    /// Who to DM about moderation here: the config list plus `/notify` opt-ins,
+    /// each re-checked for the power at the moment this Ctx was built.
+    pub(crate) notify_to: Vec<String>,
     /// What the community calls itself, for the person being answered.
     pub(crate) community_name: String,
     pub(crate) policy: CommunityPolicy,

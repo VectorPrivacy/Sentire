@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use vector_sdk::vector_core::community::roles::Permissions;
 use vector_sdk::VectorBot;
 
 use crate::config::Config;
@@ -91,6 +92,129 @@ pub(crate) fn operator_surface(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<S
     status(bot, cfg);
     why(bot, cfg, store, wires);
     pardon(bot, cfg, store);
+    enforce(bot, cfg, "kick", Permissions::KICK);
+    enforce(bot, cfg, "ban", Permissions::BAN);
+    notify(bot, cfg, store);
+}
+
+/// The power that entitles someone to this community's mod reports. Either half
+/// of the enforcement pair: a moderator who can remove people is a moderator who
+/// needs to know when somebody was removed.
+pub(crate) const NOTIFY_NEEDS: [u64; 2] = [Permissions::KICK, Permissions::BAN];
+
+/// Whether `npub` may RECEIVE this community's mod reports, asked fresh.
+///
+/// Deliberately re-asked at send time and not only at opt-in. Opt-in is consent;
+/// authority expires. The person who should unsubscribe after losing their role
+/// is precisely the person who will not, so a stored subscription must never be
+/// treated as a standing permission.
+pub(crate) fn may_receive(community: &vector_sdk::Community, npub: &str) -> bool {
+    let m = community.member(npub.to_string());
+    NOTIFY_NEEDS.iter().any(|p| m.can(*p))
+}
+
+/// `/notify` — subscribe or unsubscribe from this community's mod reports.
+///
+/// Opting IN needs the power; opting OUT never does. That asymmetry is the same
+/// direction-of-safety rule the banlist follows, where lifting a restriction must
+/// not be blockable: a member stripped of their role has to be able to stop the
+/// feed, and gating it on the power they just lost would trap them in it.
+///
+/// The subscription lives in SENTINEL'S store, never in the community's shared
+/// policy — who is watching is personal, and publishing it would tell a raider
+/// which moderators to check for activity before striking.
+fn notify(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<Store>) {
+    bot.command("notify", "Receive this community's moderation reports by DM").run({
+        let (cfg, store) = (cfg.clone(), store.clone());
+        move |ctx| {
+            let (cfg, store) = (cfg.clone(), store.clone());
+            async move {
+                let Some(community) = ctx.msg.community().filter(|c| cfg.watches(c.id())) else {
+                    let _ = ctx.reply("I am not watching this community.").await;
+                    return;
+                };
+                let Some(caller) = ctx.msg.author() else { return };
+                let subscribed = store
+                    .notify_subscribers(community.id())
+                    .map(|v| v.iter().any(|n| n == &caller))
+                    .unwrap_or(false);
+                if subscribed {
+                    let text = match store.notify_unsubscribe(community.id(), &caller) {
+                        Ok(_) => "You will no longer receive moderation reports here.".to_string(),
+                        Err(e) => format!("Could not unsubscribe you: {e}"),
+                    };
+                    let _ = ctx.reply(text).await;
+                    return;
+                }
+                if !may_receive(&community, &caller) {
+                    let _ = ctx
+                        .reply("Moderation reports go to moderators — you need kick or ban permission here.")
+                        .await;
+                    return;
+                }
+                let text = match store.notify_subscribe(community.id(), &caller, now_ms()) {
+                    Ok(()) => "You will receive this community's moderation reports by DM. Run /notify again to stop.".to_string(),
+                    Err(e) => format!("Could not subscribe you: {e}"),
+                };
+                let _ = ctx.reply(text).await;
+            }
+        }
+    });
+}
+
+/// `/kick` and `/ban` — the same command twice, differing only in the power it
+/// demands and the call it makes.
+///
+/// The community's roster decides who may run it, asked through the SDK so the
+/// answer is the protocol's, not a second permission model Sentinel invented and
+/// has to keep in step. `KICK` and `BAN` are asked for SEPARATELY: a role may
+/// carry one without the other, and collapsing them into "is staff" would hand
+/// every moderator the heavier power.
+///
+/// Two refusals ride on the protocol rather than on politeness. The CALLER must
+/// hold the power. And Sentinel must hold it too — a bot that accepts the
+/// command, tries, and fails leaves a moderator believing somebody was removed.
+fn enforce(bot: &VectorBot, cfg: &Arc<Config>, name: &'static str, needs: u64) {
+    let (verb, past) = if name == "kick" { ("kick", "Kicked") } else { ("ban", "Banned") };
+    bot.command(name, if name == "kick" { "Remove someone from this community" } else { "Ban someone from this community" })
+        .user("member", "Whom to remove", true)
+        .run({
+            let cfg = cfg.clone();
+            move |ctx| {
+                let cfg = cfg.clone();
+                async move {
+                    let (Some(community), Some(who)) =
+                        (ctx.msg.community().filter(|c| cfg.watches(c.id())), ctx.str("member").map(str::to_string))
+                    else {
+                        let _ = ctx.reply("I am not watching this community.").await;
+                        return;
+                    };
+                    let Some(caller) = ctx.msg.author() else { return };
+                    // Fails closed: an unreadable roster authorises nobody.
+                    if !community.member(caller.clone()).can(needs) {
+                        let _ = ctx.reply(format!("You do not have permission to {verb} here.")).await;
+                        return;
+                    }
+                    // Refusing to act on someone who outranks the caller is the
+                    // protocol's rule, not a courtesy — and it is the roster that
+                    // knows it, so let the call answer rather than pre-guessing.
+                    if who == caller {
+                        let _ = ctx.reply(format!("You cannot {verb} yourself.")).await;
+                        return;
+                    }
+                    let target = community.member(who.clone());
+                    let outcome = if name == "kick" { target.kick().await } else { target.ban().await };
+                    let text = match outcome {
+                        Ok(()) => format!("{past} {}.", short(&who)),
+                        // The reason is the protocol's: no permission for
+                        // Sentinel, a target who outranks it, or a publish that
+                        // did not land. Saying which beats a bare failure.
+                        Err(e) => format!("Could not {verb} {}: {e}", short(&who)),
+                    };
+                    let _ = ctx.reply(text).await;
+                }
+            }
+        });
 }
 
 fn status(bot: &VectorBot, cfg: &Arc<Config>) {
