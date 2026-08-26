@@ -140,7 +140,15 @@ fn blocklist(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<Store>, which: &'st
                         let text = if listed.is_empty() {
                             format!("No {which} are blocked here.")
                         } else {
-                            format!("Blocked {which} ({}):\n{}", listed.len(), listed.iter().map(|v| format!("- {v}")).collect::<Vec<_>>().join("\n"))
+                            // Inline code, because a pattern is not prose: `*spam*`
+                            // is a wildcard and markdown would render it as
+                            // emphasis, showing the operator something they did
+                            // not write and cannot copy back.
+                            format!(
+                                "Blocked {which} ({}):\n{}",
+                                listed.len(),
+                                listed.iter().map(|v| format!("- `{v}`")).collect::<Vec<_>>().join("\n")
+                            )
                         };
                         let _ = ctx.reply(text).await;
                         return;
@@ -158,7 +166,13 @@ fn blocklist(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<Store>, which: &'st
                             .await;
                         return;
                     }
-                    let Some(value) = ctx.str("value").map(|v| v.trim().to_lowercase()).filter(|v| !v.is_empty()) else {
+                    let Some(value) = ctx
+                        .str("value")
+                        // A backtick would break out of the inline code every
+                        // reply renders these in, and no pattern needs one.
+                        .map(|v| v.trim().to_lowercase().replace('`', ""))
+                        .filter(|v| !v.is_empty())
+                    else {
                         let _ = ctx.reply(format!("Give me a {} to {action}.", if which == "words" { "word" } else { "domain" })).await;
                         return;
                     };
