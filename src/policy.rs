@@ -93,6 +93,135 @@ impl SettingKey {
         SettingKey::ALL.iter().find(|(_, k)| *k == self).map(|(n, _)| *n).unwrap_or("?")
     }
 
+    /// The settings `/set` accepts. Words and links are lists, edited by their
+    /// own commands — a flat value cannot express "add one of several".
+    pub const SCALARS: [SettingKey; 12] = [
+        SettingKey::WarnArmed,
+        SettingKey::DeleteArmed,
+        SettingKey::KickArmed,
+        SettingKey::BanArmed,
+        SettingKey::RaidArmed,
+        SettingKey::RaidResponse,
+        SettingKey::RaidMinConfidence,
+        SettingKey::TripwireAccounts,
+        SettingKey::TripwireSecs,
+        SettingKey::RespectTrusted,
+        SettingKey::WindowHours,
+        SettingKey::DecayHalfLifeHours,
+    ];
+
+    /// What this setting is worth right now, for `/config` and for telling
+    /// somebody what their change actually did.
+    pub fn read(self, p: &CommunityPolicy) -> String {
+        match self {
+            SettingKey::WarnArmed => p.arm.warn.to_string(),
+            SettingKey::DeleteArmed => p.arm.delete.to_string(),
+            SettingKey::KickArmed => p.arm.kick.to_string(),
+            SettingKey::BanArmed => p.arm.ban.to_string(),
+            SettingKey::RaidArmed => p.arm.raid.to_string(),
+            SettingKey::RaidResponse => format!("{:?}", p.raid.response).to_lowercase(),
+            SettingKey::RaidMinConfidence => p.raid.min_confidence.to_string(),
+            SettingKey::TripwireAccounts => p.raid.tripwire_accounts.to_string(),
+            SettingKey::TripwireSecs => p.raid.tripwire_secs.to_string(),
+            SettingKey::RespectTrusted => p.shields.respect_trusted.to_string(),
+            SettingKey::WindowHours => p.rules.window_hours.to_string(),
+            SettingKey::DecayHalfLifeHours => p.ladder.decay_half_life_hours.to_string(),
+            SettingKey::Words => p.rules.words.iter().map(|w| w.patterns.len()).sum::<usize>().to_string(),
+            SettingKey::Links => p.rules.links.iter().map(|l| l.domains.len()).sum::<usize>().to_string(),
+        }
+    }
+
+    /// What a person may type for this setting, shown when they type something
+    /// else. Refusing without saying what WOULD work is a dead end.
+    pub fn expects(self) -> &'static str {
+        match self {
+            SettingKey::RaidResponse => "report, kick or ban",
+            SettingKey::RaidMinConfidence => "0-100",
+            SettingKey::WarnArmed
+            | SettingKey::DeleteArmed
+            | SettingKey::KickArmed
+            | SettingKey::BanArmed
+            | SettingKey::RaidArmed
+            | SettingKey::RespectTrusted => "true or false",
+            SettingKey::Words | SettingKey::Links => "use the /words and /links commands",
+            _ => "a whole number",
+        }
+    }
+
+    /// Parse `value` and write it into an overrides block.
+    ///
+    /// Rejects rather than coerces: `kick = maybe` is a mistake, and storing
+    /// `false` for it would disarm a community that believed it had armed one.
+    pub fn write(self, o: &mut Overrides, value: &str) -> Result<(), String> {
+        let v = value.trim().to_lowercase();
+        let boolean = || match v.as_str() {
+            "true" | "yes" | "on" | "1" => Ok(true),
+            "false" | "no" | "off" | "0" => Ok(false),
+            _ => Err(format!("`{value}` is not true or false")),
+        };
+        let number = |max: u64| {
+            v.parse::<u64>().map_err(|_| format!("`{value}` is not a whole number")).and_then(|n| {
+                if n > max { Err(format!("`{value}` is above the maximum of {max}")) } else { Ok(n) }
+            })
+        };
+        fn arm(o: &mut Overrides) -> &mut ArmOverride {
+            o.arm.get_or_insert_with(Default::default)
+        }
+        fn raid(o: &mut Overrides) -> &mut RaidOverride {
+            o.raid.get_or_insert_with(Default::default)
+        }
+        match self {
+            SettingKey::WarnArmed => arm(o).warn = Some(boolean()?),
+            SettingKey::DeleteArmed => arm(o).delete = Some(boolean()?),
+            SettingKey::KickArmed => arm(o).kick = Some(boolean()?),
+            SettingKey::BanArmed => arm(o).ban = Some(boolean()?),
+            SettingKey::RaidArmed => arm(o).raid = Some(boolean()?),
+            SettingKey::RespectTrusted => {
+                o.shields.get_or_insert_with(Default::default).respect_trusted = Some(boolean()?)
+            }
+            SettingKey::RaidResponse => {
+                let r = match v.as_str() {
+                    "report" => crate::config::RaidResponse::Report,
+                    "kick" => crate::config::RaidResponse::Kick,
+                    "ban" => crate::config::RaidResponse::Ban,
+                    _ => return Err(format!("`{value}` is not {}", self.expects())),
+                };
+                raid(o).response = Some(r);
+            }
+            SettingKey::RaidMinConfidence => raid(o).min_confidence = Some(number(100)? as u32),
+            SettingKey::TripwireAccounts => raid(o).tripwire_accounts = Some(number(1_000)? as usize),
+            SettingKey::TripwireSecs => raid(o).tripwire_secs = Some(number(86_400)?),
+            SettingKey::WindowHours => {
+                o.rules.get_or_insert_with(Default::default).window_hours = Some(number(8_760)?)
+            }
+            SettingKey::DecayHalfLifeHours => {
+                o.ladder.get_or_insert_with(Default::default).decay_half_life_hours = Some(number(8_760)?)
+            }
+            SettingKey::Words | SettingKey::Links => return Err(self.expects().to_string()),
+        }
+        Ok(())
+    }
+
+    /// Forget what the community chose, back to whatever they inherit.
+    pub fn clear(self, o: &mut Overrides) {
+        match self {
+            SettingKey::WarnArmed => { if let Some(a) = o.arm.as_mut() { a.warn = None } }
+            SettingKey::DeleteArmed => { if let Some(a) = o.arm.as_mut() { a.delete = None } }
+            SettingKey::KickArmed => { if let Some(a) = o.arm.as_mut() { a.kick = None } }
+            SettingKey::BanArmed => { if let Some(a) = o.arm.as_mut() { a.ban = None } }
+            SettingKey::RaidArmed => { if let Some(a) = o.arm.as_mut() { a.raid = None } }
+            SettingKey::RaidResponse => { if let Some(r) = o.raid.as_mut() { r.response = None } }
+            SettingKey::RaidMinConfidence => { if let Some(r) = o.raid.as_mut() { r.min_confidence = None } }
+            SettingKey::TripwireAccounts => { if let Some(r) = o.raid.as_mut() { r.tripwire_accounts = None } }
+            SettingKey::TripwireSecs => { if let Some(r) = o.raid.as_mut() { r.tripwire_secs = None } }
+            SettingKey::RespectTrusted => { if let Some(sh) = o.shields.as_mut() { sh.respect_trusted = None } }
+            SettingKey::WindowHours => { if let Some(r) = o.rules.as_mut() { r.window_hours = None } }
+            SettingKey::DecayHalfLifeHours => { if let Some(l) = o.ladder.as_mut() { l.decay_half_life_hours = None } }
+            SettingKey::Words => { if let Some(r) = o.rules.as_mut() { r.words = None } }
+            SettingKey::Links => { if let Some(r) = o.rules.as_mut() { r.links = None } }
+        }
+    }
+
     /// Whether an overrides block names this setting — which is what "the
     /// operator pinned it" means when the block is theirs.
     pub fn present_in(self, o: &Overrides) -> bool {

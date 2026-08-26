@@ -100,6 +100,23 @@ pub(crate) async fn enforce(
         }
         Sentence::Powerless { needs } => {
             println!("[{id}] CANNOT  {} {who} — this community grants Sentinel no {needs}", response.name());
+            // Powerless is a DRY RUN, not silence. A community that grants
+            // Sentinel nothing still gets the judgement — which is how you trial
+            // the bot before handing it the power to act, and how a community
+            // that revoked its role finds out the difference. The strike is
+            // already on the ledger by now (the charge is recorded before the
+            // sentence), so granting the role later starts from real history.
+            let rule = broken_rule(ctx, v).unwrap_or_else(|| "community".to_string());
+            notify_mods(
+                bot,
+                community,
+                ctx,
+                v,
+                &rule,
+                &format!("none — I would have {} them, but this community grants me no {needs}", response.name()),
+                &why,
+            )
+            .await;
             return Ok(Outcome::Powerless);
         }
         Sentence::Held { why: reason } => {
@@ -210,13 +227,17 @@ pub(crate) async fn enforce(
     // AFTER the ledger. Both are courtesies on top of a sentence that has
     // already happened and been recorded — neither may fail it, and a channel
     // notice for an action no row remembers is the one order that misleads.
-    if armed {
-        let rule = broken_rule(ctx, v).unwrap_or_else(|| "community".to_string());
-        if ctx.notify.notice_in_channel {
-            notice_in_channel(bot, notice_chat, v, &rule, ctx.notify.notice_ttl_secs).await;
-        }
-        notify_mods(bot, community, ctx, v, &rule, name, &why).await;
+    let rule = broken_rule(ctx, v).unwrap_or_else(|| "community".to_string());
+    // The channel notice belongs to an action that HAPPENED — telling a room
+    // somebody was kicked when they were not is the one message that misleads.
+    if armed && ctx.notify.notice_in_channel {
+        notice_in_channel(bot, notice_chat, v, &rule, ctx.notify.notice_ttl_secs).await;
     }
+    // The moderators' report does not: an unarmed Sentinel is a dry run, and a
+    // dry run whose findings reach nobody is indistinguishable from a quiet
+    // community. Say what would have happened and that it did not.
+    let taken = if armed { name.to_string() } else { format!("none — {name} is not armed here") };
+    notify_mods(bot, community, ctx, v, &rule, &taken, &why).await;
     *pass.lock().unwrap_or_else(|e| e.into_inner()) += 1;
     Ok(Outcome::Acted)
 }
