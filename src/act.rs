@@ -215,7 +215,7 @@ pub(crate) async fn enforce(
         if ctx.notify.notice_in_channel {
             notice_in_channel(bot, notice_chat, v, &rule, ctx.notify.notice_ttl_secs).await;
         }
-        notify_mods(bot, ctx, v, &rule, name, &why).await;
+        notify_mods(bot, community, ctx, v, &rule, name, &why).await;
     }
     *pass.lock().unwrap_or_else(|e| e.into_inner()) += 1;
     Ok(Outcome::Acted)
@@ -552,10 +552,33 @@ pub(crate) async fn notify_mods_raid(
     }
 }
 
-async fn notify_mods(bot: &VectorBot, ctx: &Ctx, v: &Verdict, rule: &str, action: &str, why: &str) {
+/// The channels a verdict's evidence was drawn from, resolved from the messages
+/// it cites. Empty when it cites none (tenure, join burst) — nothing was quoted,
+/// so nothing needs a room to have been read from.
+async fn cited_channels(bot: &VectorBot, v: &Verdict) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for id in v.findings.iter().flat_map(|f| f.messages.iter()) {
+        if let Some(msg) = bot.message(id).await {
+            let chat = msg.chat_id.clone();
+            if !chat.is_empty() && !out.contains(&chat) {
+                out.push(chat);
+            }
+        }
+    }
+    out
+}
+
+async fn notify_mods(bot: &VectorBot, community: &Community, ctx: &Ctx, v: &Verdict, rule: &str, action: &str, why: &str) {
     if ctx.notify_to.is_empty() {
         return;
     }
+    // A report QUOTES what was said, so it may only go to someone who could have
+    // read the room it was said in. Community power is the wrong question here:
+    // BAN says what a moderator may do to people, never which rooms they may
+    // see, and a private channel is gated by its own role (CORD-03). Without
+    // this the bot is a way to read a room you were never admitted to — it holds
+    // every key, so it would forward what it saw to whoever holds the ban bit.
+    let rooms = cited_channels(bot, v).await;
     // The full npub, not a short form: this is the one message whose reader has
     // to go and DO something about a specific person, and eight characters is
     // not something anybody can paste into a moderation tool.
@@ -567,6 +590,13 @@ async fn notify_mods(bot: &VectorBot, ctx: &Ctx, v: &Verdict, rule: &str, action
     );
     for who in &ctx.notify_to {
         if who == &ctx.me {
+            continue;
+        }
+        // Every room, not any: evidence from two channels may only go to
+        // someone admitted to both.
+        let member = community.member(who.clone());
+        if let Some(shut) = rooms.iter().find(|c| !member.can_read(c)) {
+            eprintln!("[notify] {} holds no key for {} — report withheld", short(who), short(shut));
             continue;
         }
         if let Err(e) = bot.dm(who.clone()).send(&line).await {
