@@ -167,6 +167,91 @@ pub(crate) enum Gate {
 /// could be media at all — never whether it gets judged. Clients render by
 /// extension, so anything claiming to be an image or a video is fetched and
 /// answered for by its bytes.
+/// Fetch a LINKED image, with the guards a bot following a stranger's URL needs.
+///
+/// SSRF first and always: `validate_url_not_private` refuses loopback, private,
+/// link-local and CGNAT space, so a member cannot use the bot as a probe into
+/// whatever network it happens to run on. The cap is enforced on the BYTES as
+/// they arrive, not on a Content-Length the server chose — a lying header is
+/// free, and streaming past the limit is the whole attack.
+///
+/// Two things this cannot fix, and they are why it is a config flag: the host
+/// learns the bot's IP, and it may serve clean bytes to the bot while serving
+/// something else to everyone else.
+pub(crate) async fn fetch_linked(url: &str, max_bytes: u64, timeout_secs: u64) -> Result<Vec<u8>, String> {
+    vector_sdk::vector_core::net::validate_url_not_private(url).map_err(|e| e.to_string())?;
+    let client = vector_sdk::vector_core::net::build_http_client(std::time::Duration::from_secs(timeout_secs))
+        .map_err(|e| e.to_string())?;
+    let resp = client.get(url).send().await.map_err(|e| format!("link unreachable: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("link answered {}", resp.status()));
+    }
+    let mut resp = resp;
+    let mut out: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| format!("link download failed: {e}"))? {
+        if out.len() as u64 + chunk.len() as u64 > max_bytes {
+            return Err("link is over the size limit".to_string());
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
+
+/// Something in a message that might be media: an attachment, or an image a
+/// member merely LINKED.
+///
+/// A link renders inline in the client exactly like an upload, so judging only
+/// uploads left the whole surface open — post the URL instead of the file and
+/// nothing looked at it.
+pub(crate) enum Src<'a> {
+    Att(&'a vector_sdk::vector_core::types::Attachment),
+    Link(String),
+}
+
+pub(crate) struct Cand<'a> {
+    /// For logging and for `unclassified`. The real cache key is always the
+    /// hash of what actually arrived, never this.
+    pub(crate) id: String,
+    pub(crate) extension: String,
+    /// The sender's word, and only used to decline early. Zero for a link,
+    /// where nothing is claimed until the bytes are in hand.
+    pub(crate) size: u64,
+    pub(crate) src: Src<'a>,
+}
+
+/// Image and video URLs a message links, in order, deduped.
+///
+/// Extension-gated on purpose: following every URL a member posts to see what
+/// comes back is a crawler, and this is a moderation bot. Anything whose path
+/// does not name a type the operator judges is left alone.
+pub(crate) fn linked_media(text: &str, cfg: &crate::config::VisionCfg) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in text.split_whitespace() {
+        let candidate = raw.trim_matches(|c: char| "<>()[]{}\"',;!".contains(c));
+        if !candidate.starts_with("http://") && !candidate.starts_with("https://") {
+            continue;
+        }
+        // Path only: a query or fragment must not turn `?x=.png` into a type
+        // claim, and the authority must not either.
+        let after_scheme = candidate.split_once("//").map(|(_, r)| r).unwrap_or(candidate);
+        let path = after_scheme.split(['?', '#']).next().unwrap_or("");
+        let ext = path
+            .rsplit('/')
+            .next()
+            .filter(|f| f.contains('.'))
+            .and_then(|f| f.rsplit_once('.').map(|(_, e)| e.to_lowercase()))
+            .unwrap_or_default();
+        if ext.is_empty() || matches!(gate(&ext, 0, cfg), Gate::Skip) {
+            continue;
+        }
+        let clean = candidate.to_string();
+        if !out.contains(&clean) {
+            out.push(clean);
+        }
+    }
+    out
+}
+
 pub(crate) fn gate(extension: &str, declared_size: u64, cfg: &crate::config::VisionCfg) -> Gate {
     let declared = vector_sdk::vector_core::crypto::mime_from_extension(extension);
     if !declared.starts_with("image/") && !declared.starts_with("video/") {
@@ -230,7 +315,22 @@ pub(crate) async fn watch_media(
     // Every flagged attachment in this message, so one post is one sentence.
     let mut flagged: Vec<(String, String)> = Vec::new();
 
-    for att in &msg.message.attachments {
+    let mut cands: Vec<Cand> = msg
+        .message
+        .attachments
+        .iter()
+        .map(|a| Cand { id: a.id.clone(), extension: a.extension.clone(), size: a.size, src: Src::Att(a) })
+        .collect();
+    if cfg.vision.judge_links {
+        for url in linked_media(&msg.message.content, &cfg.vision) {
+            let extension =
+                url.rsplit('/').next().and_then(|f| f.rsplit_once('.').map(|(_, e)| e.to_lowercase())).unwrap_or_default();
+            cands.push(Cand { id: url.clone(), extension, size: 0, src: Src::Link(url) });
+        }
+    }
+
+    for cand in &cands {
+        let att = cand;
         match gate(&att.extension, att.size, &cfg.vision) {
             Gate::Skip => {
                 println!("[media] {} — a type I do not judge", short(&att.id));
@@ -259,7 +359,11 @@ pub(crate) async fn watch_media(
         let now = now_ms();
         // `att.id` is the SENDER's declared hash and is never verified, so the
         // cache keys on what actually downloaded.
-        let bytes = match bot.download_attachment_from(att, msg.message.npub.as_deref()).await {
+        let fetched = match &cand.src {
+            Src::Att(a) => bot.download_attachment_from(a, msg.message.npub.as_deref()).await.map_err(|e| e.to_string()),
+            Src::Link(url) => fetch_linked(url, cfg.vision.max_bytes, cfg.vision.timeout_secs).await,
+        };
+        let bytes = match fetched {
             Ok(b) => b,
             Err(e) => {
                 unclassified(bot, &community, cfg, store, watches, me, now, &att.id, &format!("{e}")).await;
@@ -675,6 +779,66 @@ impl Budget {
 
 #[cfg(test)]
 mod tests {
+
+    fn vis() -> crate::config::VisionCfg {
+        let mut c = crate::config::VisionCfg { enabled: true, ..Default::default() };
+        c.mimes = ["image/png", "image/jpeg", "image/gif", "video/mp4"].map(String::from).to_vec();
+        c.video.enabled = true;
+        c
+    }
+
+    /// A linked image renders inline exactly like an upload, so it has to be
+    /// judged like one — posting the URL instead of the file was a clean bypass.
+    #[test]
+    fn a_linked_image_is_media_too() {
+        let c = vis();
+        let found = linked_media("look at https://example.com/pics/bad.png please", &c);
+        assert_eq!(found, vec!["https://example.com/pics/bad.png"]);
+
+        // Trailing punctuation belongs to the sentence, not the URL.
+        assert_eq!(
+            linked_media("see (https://example.com/a.jpg), yes", &c),
+            vec!["https://example.com/a.jpg"]
+        );
+
+        // Same link twice is one fetch.
+        assert_eq!(linked_media("https://e.com/a.gif https://e.com/a.gif", &c).len(), 1);
+
+        // Types the operator does not judge are left alone: following every URL
+        // a member posts is a crawler, not a moderation bot.
+        assert!(linked_media("https://example.com/readme.txt", &c).is_empty());
+        assert!(linked_media("https://example.com/no-extension", &c).is_empty());
+        assert!(linked_media("not a link at all", &c).is_empty());
+
+        // A query string must not be able to CLAIM a type the path does not have.
+        assert!(
+            linked_media("https://example.com/tracker?file=.png", &c).is_empty(),
+            "the path names the type, never the query"
+        );
+        // ...nor a fragment.
+        assert!(linked_media("https://example.com/page#a.png", &c).is_empty());
+        // ...nor the host.
+        assert!(linked_media("https://a.png/path", &c).is_empty(), "the authority is not the path");
+    }
+
+    /// The bot must never be usable as a probe into the network it runs on.
+    #[tokio::test]
+    async fn a_linked_fetch_refuses_private_space() {
+        for target in [
+            "http://127.0.0.1/x.png",
+            "http://localhost/x.png",
+            "http://192.168.1.10/x.png",
+            "http://[::1]/x.png",
+            "http://169.254.169.254/latest/meta-data.png",
+            "file:///etc/passwd.png",
+        ] {
+            assert!(
+                fetch_linked(target, 1024, 1).await.is_err(),
+                "{target} must be refused before any request leaves this machine"
+            );
+        }
+    }
+
     use super::*;
     use vector_sdk::vector_core::crypto::mime_from_magic_bytes;
 

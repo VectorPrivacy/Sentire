@@ -526,6 +526,16 @@ impl Default for Ladder {
 #[serde(default, deny_unknown_fields)]
 pub struct VisionCfg {
     pub enabled: bool,
+    /// Judge images a member LINKS, not only ones they upload.
+    ///
+    /// A URL renders inline in the client exactly like an upload, so with this
+    /// off the whole surface is open: post the link instead of the file and
+    /// nothing looks at it.
+    ///
+    /// It is a flag because following a stranger's URL has costs the SSRF guard
+    /// cannot remove — the host learns this machine's IP, and it may serve clean
+    /// bytes to the bot while serving something else to the room.
+    pub judge_links: bool,
     /// How many attachments this bot judges at once, per community.
     ///
     /// The slot is held from before the download until the model answers, so at
@@ -703,6 +713,7 @@ impl Default for VisionCfg {
     fn default() -> Self {
         VisionCfg {
             communities: None,
+            judge_links: true,
             concurrent: 1,
             enabled: false,
             base_url: "http://127.0.0.1:8080/v1".into(),
