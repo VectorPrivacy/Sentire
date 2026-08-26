@@ -29,49 +29,65 @@ pub fn compile(cfg: &CommunityPolicy) -> Option<Policy> {
     let mut policy = Policy::named("Sentinel");
     let mut any = false;
 
-    // Shields gate BEFORE conviction, so a community that has chosen to reach
-    // its regulars has to say so in the RULEBOOK — otherwise the engine spares
-    // them upstream and `respect_trusted = false` decides nothing at all. The
-    // engine allows this only for the gravest rungs, which is its call to make.
-    let reach = |rule: PolicyRule| {
+    // Shields gate BEFORE conviction, so reaching a regular has to be said in the
+    // RULEBOOK — otherwise the engine spares them upstream and nothing downstream
+    // ever sees a finding to weigh. The engine permits piercing only at its
+    // gravest severity, so anything lighter yields to standing whatever is asked
+    // here; asking anyway is a policy the validator rejects outright.
+    //
+    // CONTENT rules — the operator's word and link lists — pierce on their own
+    // account, not on `respect_trusted`. Those lists say what this community will
+    // not host whoever posts it, which is exactly what `spared_from_content`
+    // already refuses to spare a trusted member from. Without piercing here that
+    // refusal is unreachable code: the engine gates the finding upstream, and a
+    // regular who earned standing by not behaving like a spammer may then post a
+    // slur freely. Standing is leniency on BEHAVIOUR — rate, repetition, cohorts
+    // — and was never meant to be a licence on content.
+    // `even_for_trusted` pierces at the RULE level and lifts each rung only where
+    // the engine permits it (its gravest severity), so this is safe at any
+    // gravity — the validator refuses a rung that overreaches, never the rule.
+    let behaviour_reach = |rule: PolicyRule| {
         if cfg.shields.respect_trusted {
             rule
         } else {
             rule.even_for_trusted()
         }
     };
+    let content_reach = |rule: PolicyRule| rule.even_for_trusted();
 
     for w in &r.words {
         policy = policy
-            .rule(reach(PolicyRule::words(&w.id, w.patterns.iter().cloned()).seriousness(seriousness(w.gravity))));
+            .rule(content_reach(PolicyRule::words(&w.id, w.patterns.iter().cloned()).seriousness(seriousness(w.gravity))));
         any = true;
     }
     for l in &r.links {
         policy = policy
-            .rule(reach(PolicyRule::links(&l.id, l.domains.iter().cloned()).seriousness(seriousness(l.gravity))));
+            .rule(content_reach(PolicyRule::links(&l.id, l.domains.iter().cloned()).seriousness(seriousness(l.gravity))));
         any = true;
     }
     if let Some(rate) = &r.rate {
         if rate.enabled {
-            policy = policy.rule(
+            policy = policy.rule(behaviour_reach(
                 PolicyRule::rate_limit("rate", rate.per_secs)
                     .at_least(rate.messages)
                     .seriousness(seriousness(rate.gravity)),
-            );
+            ));
             any = true;
         }
     }
     if let Some(mt) = &r.mass_tagging {
         if mt.enabled {
-            policy = policy
-                .rule(PolicyRule::mass_tagging("mass-tagging").at_least(mt.times).seriousness(seriousness(mt.gravity)));
+            policy = policy.rule(behaviour_reach(
+                PolicyRule::mass_tagging("mass-tagging").at_least(mt.times).seriousness(seriousness(mt.gravity)),
+            ));
             any = true;
         }
     }
     if let Some(rep) = &r.repetition {
         if rep.enabled {
-            policy = policy
-                .rule(PolicyRule::repetition("repetition").at_least(rep.times).seriousness(seriousness(rep.gravity)));
+            policy = policy.rule(behaviour_reach(
+                PolicyRule::repetition("repetition").at_least(rep.times).seriousness(seriousness(rep.gravity)),
+            ));
             any = true;
         }
     }
@@ -109,6 +125,61 @@ mod tests {
 
     fn policy(toml_text: &str) -> CommunityPolicy {
         toml::from_str::<crate::config::Config>(toml_text).unwrap().for_community("aa")
+    }
+
+    /// Standing is leniency on BEHAVIOUR, never a licence on content. The engine
+    /// gates a rule against a Trusted member BEFORE conviction unless the rule
+    /// pierces, so a word list that does not pierce produces no finding at all —
+    /// and `spared_from_content`, which already refuses to spare a trusted member
+    /// from content rules, never gets a message to refuse with. That combination
+    /// shipped: a member became Trusted merely by holding a role (a read-only
+    /// private-channel grant is enough) and could then post a slur untouched,
+    /// while every log line read "0 convicted".
+    #[test]
+    fn a_grave_word_list_reaches_a_trusted_member() {
+        let built = compile(&policy(
+            r#"
+            [[rules.words]]
+            id = "slurs"
+            patterns = ["badword"]
+            gravity = "grave"
+            "#,
+        ))
+        .unwrap()
+        .build()
+        .unwrap();
+        assert!(
+            built.contains("\"pierces_trusted\":true"),
+            "a grave word list must reach a trusted member, or standing becomes a licence to post it: {built}"
+        );
+    }
+
+    /// A content rule reaches a trusted member at ANY gravity, and the rulebook
+    /// stays valid while doing it: `even_for_trusted` pierces at the rule level
+    /// and lifts only the rungs the engine permits (its gravest severity). An
+    /// earlier attempt to gate the whole rule on severity looked safer and was
+    /// wrong — it silenced every sub-grave word list against regulars.
+    #[test]
+    fn a_lighter_content_rule_still_reaches_and_still_validates() {
+        let built = compile(&policy(
+            r#"
+            [[rules.links]]
+            id = "shorteners"
+            domains = ["bit.ly"]
+            gravity = "serious"
+            "#,
+        ))
+        .unwrap()
+        .build()
+        .expect("a sub-severe content rule must still produce a VALID policy");
+        assert!(
+            built.contains("\"pierces_trusted\":true"),
+            "the rule itself reaches a regular: {built}"
+        );
+        assert!(
+            !built.contains("\"severity\":\"major\",\"weight\":70,\"pierces_trusted\":true"),
+            "but a sub-severe RUNG must not claim to pierce, or the engine rejects the rulebook"
+        );
     }
 
     #[test]
