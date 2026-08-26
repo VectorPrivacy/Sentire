@@ -151,14 +151,14 @@ impl Drop for ShutdownFlag {
 }
 
 /// This community's classifier budget, made on first use.
-fn budget_of(watches: &Watches, community: &str, per_min: u32) -> Arc<crate::lanes::Budget> {
+fn budget_of(watches: &Watches, community: &str, per_min: u32, concurrent: u32) -> Arc<crate::lanes::Budget> {
     watches
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .entry(community.to_string())
         .or_default()
         .budget
-        .get_or_insert_with(|| Arc::new(crate::lanes::Budget::new(per_min.max(1))))
+        .get_or_insert_with(|| Arc::new(crate::lanes::Budget::new(per_min.max(1), concurrent)))
         .clone()
 }
 

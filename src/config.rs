@@ -526,6 +526,15 @@ impl Default for Ladder {
 #[serde(default, deny_unknown_fields)]
 pub struct VisionCfg {
     pub enabled: bool,
+    /// How many attachments this bot judges at once, per community.
+    ///
+    /// The slot is held from before the download until the model answers, so at
+    /// 1 a second image posted in the same second waits out the whole first
+    /// inference — tens of seconds against a large local model, which reads as
+    /// "it ignored my post". Raise it where the endpoint can take the
+    /// concurrency; each extra slot is another blob resident and another request
+    /// in flight, so it is the operator's call and not a default.
+    pub concurrent: u32,
     /// Which communities the media lane runs in. `None` (the key absent) means
     /// every watched community, which is what a single-tenant bot wants.
     ///
@@ -694,6 +703,7 @@ impl Default for VisionCfg {
     fn default() -> Self {
         VisionCfg {
             communities: None,
+            concurrent: 1,
             enabled: false,
             base_url: "http://127.0.0.1:8080/v1".into(),
             model: "llava".into(),
@@ -1143,6 +1153,31 @@ mod tests {
 #[cfg(test)]
 mod unknown_key_tests {
     use super::*;
+
+    /// One slot per community is held from before the download until the model
+    /// answers, so at `concurrent = 1` a second image posted in the same second
+    /// waits out the entire first inference. On a large local model that is tens
+    /// of seconds of apparent silence, which is what it was reported as: "the
+    /// NSFW one didn't process". It had not been dropped, only queued.
+    #[test]
+    fn media_concurrency_is_the_operators_to_raise() {
+        let one = toml::from_str::<Config>("[vision]\nenabled = true").unwrap();
+        assert_eq!(one.vision.concurrent, 1, "one at a time by default — each slot is another resident blob");
+
+        let many = toml::from_str::<Config>("[vision]\nenabled = true\nconcurrent = 4").unwrap();
+        assert_eq!(many.vision.concurrent, 4);
+
+        // Zero would wedge the lane forever rather than pausing it, so the
+        // semaphore floors it. A community with vision off says so with
+        // `enabled`, never by setting the width to nothing.
+        let zero = toml::from_str::<Config>("[vision]\nenabled = true\nconcurrent = 0").unwrap();
+        let b = crate::lanes::Budget::new(zero.vision.max_per_min, zero.vision.concurrent);
+        assert_eq!(b.slot.available_permits(), 1, "0 must floor to 1, never deadlock the lane");
+        assert!(
+            b.fetch.available_permits() > 1,
+            "downloads run in parallel regardless: they are network-bound, and making them wait              behind an inference is what made a post look ignored"
+        );
+    }
 
     /// The media lane is the expensive one and the only one that decrypts an
     /// attachment and ships it to a model, so a bot watching `["*"]` must not

@@ -226,7 +226,7 @@ pub(crate) async fn watch_media(
     // The cache remembers a verdict; `asked` remembers the QUESTION. Keyed on
     // the model alone, a blob classified before a label existed was exempt from
     // that label for good — the answer was cached, the question was not.
-    let budget = crate::budget_of(watches, community.id(), cfg.vision.max_per_min);
+    let budget = crate::budget_of(watches, community.id(), cfg.vision.max_per_min, cfg.vision.concurrent);
     // Every flagged attachment in this message, so one post is one sentence.
     let mut flagged: Vec<(String, String)> = Vec::new();
 
@@ -248,7 +248,11 @@ pub(crate) async fn watch_media(
         // the SDK spawns a handler per message, with 32 attachments allowed in
         // each. Waiting rather than declining: an image that has to queue still
         // gets judged, and a decline is a mod-channel line saying it was not.
-        let _slot = budget.slot.acquire().await;
+        // FETCH first, and in parallel. Waiting for the inference slot before
+        // downloading meant an image posted a second after another sat untouched
+        // for the whole of that model call — reported, fairly, as "it didn't
+        // process". Get the bytes now; queue for the model after.
+        let mut _fetching = Some(budget.fetch.acquire().await);
         // After the wait, not before it. The permit is held across a download
         // a sender can stretch, so a timestamp read at the top of the handler
         // would stamp strikes and cache rows minutes early.
@@ -320,6 +324,14 @@ pub(crate) async fn watch_media(
                     }
                     None => (bytes.clone(), vision::Shown::Still { mime: actual }),
                 };
+                // The bytes are in hand and the sheet is cut; only the model is
+                // scarce from here. Drop the fetch permit so the next post can
+                // start downloading while this one waits its turn.
+                _fetching = None;
+                if budget.slot.available_permits() == 0 {
+                    println!("[media] {} — downloaded, queued for the model", short(&att.id));
+                }
+                let _inferring = budget.slot.acquire().await;
                 println!("[media] {} — asking {} ({} KiB)", short(&att.id), eyes.model(), payload.len() / 1024);
                 let v = eyes.classify(&payload, shown).await;
                 // Never cache Unknown: one timeout would retire that blob from
@@ -615,14 +627,32 @@ pub(crate) async fn live_ctx(cfg: &Config, community: &Community, store: &crate:
 /// The tripwire runs before this, or a queue here would hide a wave of images
 /// from the one thing meant to catch it.
 pub(crate) struct Budget {
+    /// Downloads run in parallel: they are network-bound and cheap, and making
+    /// them wait behind an inference meant a post sat untouched for as long as
+    /// the model took on somebody else's image. Bounded anyway, because the
+    /// SDK's own cap is 256 MiB and decryption copies, so this is the resident-
+    /// bytes ceiling for one community.
+    pub(crate) fetch: Semaphore,
+    /// Inference is the scarce one — a local model answers a request at a time —
+    /// so this is what actually queues. Widen it only if the endpoint can take it.
     pub(crate) slot: Semaphore,
     pub(crate) per_min: u32,
     pub(crate) spent: Mutex<(u64, u32)>,
 }
 
 impl Budget {
-    pub(crate) fn new(per_min: u32) -> Budget {
-        Budget { slot: Semaphore::new(1), per_min, spent: Mutex::new((0, 0)) }
+    /// How many blobs may be resident per community while downloading. Not the
+    /// inference width: fetching four small images at once costs a few MiB and
+    /// buys every one of them a head start.
+    pub(crate) const FETCH_WIDTH: usize = 4;
+
+    pub(crate) fn new(per_min: u32, concurrent: u32) -> Budget {
+        Budget {
+            fetch: Semaphore::new(Self::FETCH_WIDTH),
+            slot: Semaphore::new(concurrent.max(1) as usize),
+            per_min,
+            spent: Mutex::new((0, 0)),
+        }
     }
 
     /// False means the minute's allowance is gone. Refusing is safe: the caller
@@ -852,8 +882,8 @@ mod tests {
     /// room's screening.
     #[test]
     fn each_community_spends_its_own_minute() {
-        let a = Budget::new(2);
-        let b = Budget::new(2);
+        let a = Budget::new(2, 1);
+        let b = Budget::new(2, 1);
         assert!(a.claim() && a.claim(), "its own allowance");
         assert!(!a.claim(), "and then it is spent");
         assert!(b.claim(), "which says nothing about anywhere else");
