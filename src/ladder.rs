@@ -206,8 +206,13 @@ mod tests {
     /// An explicit four-rung ladder, NOT the shipped default: these tests are
     /// about how the ladder climbs, and pinning the shape here keeps them from
     /// moving every time the default policy is retuned.
+    /// Its OWN scale, deliberately. These tests pin the ladder's arithmetic —
+    /// decay, ordering, what a total answers to — and inheriting the product's
+    /// calibration made them fail when that calibration was re-tuned for
+    /// readability, which is a change they have no opinion about.
     fn ladder() -> Ladder {
         Ladder {
+            strikes: crate::config::Strikes { note: 1, minor: 2, serious: 4, grave: 12 },
             steps: vec![
                 crate::config::Step { at: 1, response: Response::Warn },
                 crate::config::Step { at: 4, response: Response::DeleteAndWarn },

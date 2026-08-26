@@ -39,13 +39,6 @@ pub(crate) fn why_line(
     // prose.
     let standing = crate::adjudicate::spared_by_standing(policy, shield);
     let n = strikes.len();
-    let dot = match (standing.is_some(), n) {
-        (true, _) => "🛡️",
-        (_, 0) => "🟢",
-        (_, 1) => "🟡",
-        (_, 2) => "🟠",
-        _ => "🔴",
-    };
     let standing_line = match standing {
         Some(why) => format!("✅ {why}"),
         None => "❌ none".to_string(),
@@ -60,13 +53,27 @@ pub(crate) fn why_line(
     // they are just no longer called the same thing as the score.
     let total = ladder::total(strikes, now, policy.ladder.decay_half_life_hours);
     let heading_for = policy.ladder.steps.iter().find(|s| s.at > total);
+    // ONE number, and it is the one the ladder is set in. Showing the offence
+    // COUNT beside it was worse than showing neither: two quantities, both
+    // called something like "strikes", differing by a factor nobody can see —
+    // an operator who set kick at 100 watched a member removed at "84". What
+    // each offence is worth stays granular; it is simply how much this number
+    // moves, not a second number to reconcile.
     let score_line = match heading_for {
         Some(step) => format!("{total} of {} → {}", step.at, step.response.label()),
-        None => format!("{total} (past every rung)"),
+        None => format!("{total} — past every rung"),
     };
-    let offences = if n == 0 { "none".to_string() } else { n.to_string() };
+    // The dot tracks the ONE number, not a count: how far along this member is
+    // towards whatever lands next.
+    let dot = match (standing.is_some(), heading_for, total) {
+        (true, _, _) => "🛡️",
+        (_, _, 0) => "🟢",
+        (_, None, _) => "🔴",
+        (_, Some(step), t) if t * 2 >= step.at => "🟠",
+        _ => "🟡",
+    };
     let mut card = format!(
-        "{dot} **{}**\n**Strikes** · {score_line}\n**Offences** · {offences}\n**Standing** · {standing_line}",
+        "{dot} **{}**\n**Strikes** · {score_line}\n**Standing** · {standing_line}",
         short(who)
     );
     if n == 0 {
@@ -703,8 +710,8 @@ mod tests {
     #[test]
     fn a_clean_member_is_said_to_be_clean() {
         let line = why_line("npub1abcdefghijk", "none", &[], &[], &policy(), all(), NOW);
-        assert!(line.contains("**Offences** \u{b7} none"), "{line}");
         assert!(line.contains("**Strikes** \u{b7} 0 of"), "a clean member is zero against the first rung: {line}");
+        assert!(!line.contains("Offences"), "ONE number: a second count is what nobody could reconcile");
     }
 
     /// The naive answer read the ladder's steps directly and ignored both what
@@ -807,7 +814,7 @@ mod tests {
     /// 24 after decay" learns what the member did or what happens to them next,
     /// and the number invites operators to argue with the sum instead.
     #[test]
-    fn why_quotes_the_ladders_own_unit_and_names_the_count_separately() {
+    fn why_shows_one_number_and_it_is_the_ladders_own() {
         let p = policy();
         for (n, answers) in
             [(1usize, &[][..]), (2, &[Answer { response: "warn".into(), at_ms: NOW }][..])]
@@ -832,7 +839,10 @@ mod tests {
                 line.contains(&format!("**Strikes** \u{b7} {}", 12 * n as u32)),
                 "the score is the ladder's own arithmetic: {line}"
             );
-            assert!(line.contains(&format!("**Offences** \u{b7} {n}")), "and the count is its own line: {line}");
+            assert!(
+                !line.contains("Offences"),
+                "ONE number. Two quantities on one card is what collapsed the mental model: {line}"
+            );
             // A bare number means nothing: either it names the rung it is
             // climbing towards, or it says there is none left above it.
             assert!(

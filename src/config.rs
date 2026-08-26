@@ -428,8 +428,25 @@ pub struct Strikes {
 }
 
 impl Default for Strikes {
+    /// One offence, one strike — and a worse one counts for more.
+    ///
+    /// The scale is the whole readability of this system. At 1/2/4/12 against
+    /// rungs of 36 and 48, the running total could never be read as a count of
+    /// anything: an operator set a kick at 100 and watched a member removed at
+    /// what looked like 84, because a grave offence was worth twelve of what the
+    /// rung counted. Nobody holds that model in their head.
+    ///
+    /// The RATIOS were always right — the shipped ladder gave a grave offender two
+    /// warnings, then a kick, then a ban, which is the sentence anyone would say
+    /// out loud. It was the SCALE that hid it: at 12 a throw against rungs of 36
+    /// and 48, the same three steps read as arbitrary arithmetic.
+    ///
+    /// So: one rule small enough to say. An offence adds 1, 2 or 3 by gravity,
+    /// and the rungs are 1 / 9 / 12 — still exactly two warnings then a kick then
+    /// a ban for grave offences, and a minor one now takes three times as long to
+    /// get there, which is what gravity was always for.
     fn default() -> Self {
-        Strikes { note: 1, minor: 2, serious: 4, grave: 12 }
+        Strikes { note: 1, minor: 1, serious: 2, grave: 3 }
     }
 }
 
@@ -513,8 +530,8 @@ impl Default for Ladder {
             // ladder step only ever decides what happens to the member.
             steps: vec![
                 Step { at: 1, response: Response::Warn },
-                Step { at: 36, response: Response::Kick },
-                Step { at: 48, response: Response::Ban },
+                Step { at: 9, response: Response::Kick },
+                Step { at: 12, response: Response::Ban },
             ],
         }
     }
