@@ -46,13 +46,27 @@ pub(crate) fn why_line(
         (_, 2) => "🟠",
         _ => "🔴",
     };
-    let count = if n == 0 { "none".to_string() } else { n.to_string() };
     let standing_line = match standing {
         Some(why) => format!("✅ {why}"),
         None => "❌ none".to_string(),
     };
+    // The SAME unit the ladder is set in, against the rung it is heading for.
+    //
+    // This card used to print the number of offences under the word "Strikes"
+    // while `/ladder` set its rungs in weighted, decayed strike VALUE — two
+    // unrelated quantities sharing one word. An operator who set kick at 100
+    // watched somebody removed at "84" and could not reconcile it, because a
+    // grave offence is worth 12 and a note is worth 1. Offences are still shown;
+    // they are just no longer called the same thing as the score.
+    let total = ladder::total(strikes, now, policy.ladder.decay_half_life_hours);
+    let heading_for = policy.ladder.steps.iter().find(|s| s.at > total);
+    let score_line = match heading_for {
+        Some(step) => format!("{total} of {} → {}", step.at, step.response.label()),
+        None => format!("{total} (past every rung)"),
+    };
+    let offences = if n == 0 { "none".to_string() } else { n.to_string() };
     let mut card = format!(
-        "{dot} **{}**\n**Strikes** · {count}\n**Standing** · {standing_line}",
+        "{dot} **{}**\n**Strikes** · {score_line}\n**Offences** · {offences}\n**Standing** · {standing_line}",
         short(who)
     );
     if n == 0 {
@@ -129,13 +143,26 @@ fn ladder_cmd(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<Store>) {
                     let current = cfg.for_community(community.id());
                     let show = |p: &CommunityPolicy| {
                         let worth = &p.ladder.strikes;
+                        // Rungs are counted in STRIKES, and an offence is worth
+                        // more than one of them — that mismatch is the whole
+                        // reason someone set kick to 100 and watched it fire at
+                        // what looked like 84. So every rung says how many grave
+                        // offences it actually is.
+                        let per_grave = worth.grave.max(1);
                         format!(
-                            "Strikes: note {} · minor {} · serious {} · grave {}\n{}",
+                            "An offence is worth: note {} · minor {} · serious {} · grave {} strike(s).\n\
+                             Strikes halve every {}h, so a quiet member falls back down the ladder.\n\n{}",
                             worth.note, worth.minor, worth.serious, worth.grave,
+                            p.ladder.decay_half_life_hours,
                             p.ladder
                                 .steps
                                 .iter()
-                                .map(|s| format!("- **{}** at {} strike(s)", s.response.name(), s.at))
+                                .map(|s| format!(
+                                    "- **{}** at {} strike(s) — about {} grave offence(s)",
+                                    s.response.name(),
+                                    s.at,
+                                    s.at.div_ceil(per_grave)
+                                ))
                                 .collect::<Vec<_>>()
                                 .join("\n")
                         )
@@ -676,7 +703,8 @@ mod tests {
     #[test]
     fn a_clean_member_is_said_to_be_clean() {
         let line = why_line("npub1abcdefghijk", "none", &[], &[], &policy(), all(), NOW);
-        assert!(line.contains("**Strikes** \u{b7} none"), "{line}");
+        assert!(line.contains("**Offences** \u{b7} none"), "{line}");
+        assert!(line.contains("**Strikes** \u{b7} 0 of"), "a clean member is zero against the first rung: {line}");
     }
 
     /// The naive answer read the ladder's steps directly and ignored both what
@@ -779,7 +807,7 @@ mod tests {
     /// 24 after decay" learns what the member did or what happens to them next,
     /// and the number invites operators to argue with the sum instead.
     #[test]
-    fn why_never_quotes_the_ladders_score() {
+    fn why_quotes_the_ladders_own_unit_and_names_the_count_separately() {
         let p = policy();
         for (n, answers) in
             [(1usize, &[][..]), (2, &[Answer { response: "warn".into(), at_ms: NOW }][..])]
@@ -793,10 +821,24 @@ mod tests {
                 all(),
                 NOW,
             );
-            for score in ["worth", "decay", "12", "24", "owed"] {
-                assert!(!line.contains(score), "{n} strike(s) leaked `{score}`: {line}");
-            }
-            assert!(line.contains(&format!("**Strikes** \u{b7} {n}")), "{line}");
+            // The SCORE, in the unit `/ladder` sets rungs in. This card used to
+            // hide it deliberately — "an operator wants what they did, not a
+            // score" — and print the offence COUNT under the same word. So
+            // somebody set kick at 100, watched a member removed at what the
+            // card called 84, and had no way to reconcile the two: a grave
+            // offence is worth 12 of what the rung counts. Both numbers are
+            // shown now, and neither borrows the other's name.
+            assert!(
+                line.contains(&format!("**Strikes** \u{b7} {}", 12 * n as u32)),
+                "the score is the ladder's own arithmetic: {line}"
+            );
+            assert!(line.contains(&format!("**Offences** \u{b7} {n}")), "and the count is its own line: {line}");
+            // A bare number means nothing: either it names the rung it is
+            // climbing towards, or it says there is none left above it.
+            assert!(
+                line.contains(" of ") || line.contains("past every rung"),
+                "a score has to say where it stands on the ladder: {line}"
+            );
         }
     }
 
