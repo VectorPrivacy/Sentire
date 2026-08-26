@@ -260,7 +260,10 @@ pub(crate) fn gate(extension: &str, declared_size: u64, cfg: &crate::config::Vis
     if declared.starts_with("video/") && !cfg.video.enabled {
         return Gate::Refuse("video judging is switched off");
     }
-    if declared_size > cfg.max_bytes {
+    // A sheeted type is judged as a grid of frames, so its own size never
+    // reaches the model — only the download and the cut have to survive it.
+    let ceiling = if sheeted(declared, cfg) { cfg.max_sheeted_bytes.max(cfg.max_bytes) } else { cfg.max_bytes };
+    if declared_size > ceiling {
         return Gate::Refuse("declared over the size limit");
     }
     Gate::Fetch
@@ -371,7 +374,13 @@ pub(crate) async fn watch_media(
             }
         };
         // The declared size was the sender's word too.
-        if bytes.len() as u64 > cfg.vision.max_bytes {
+        let actual_early = vector_sdk::vector_core::crypto::mime_from_magic_bytes(&bytes);
+        let ceiling = if sheeted(actual_early, &cfg.vision) {
+            cfg.vision.max_sheeted_bytes.max(cfg.vision.max_bytes)
+        } else {
+            cfg.vision.max_bytes
+        };
+        if bytes.len() as u64 > ceiling {
             unclassified(bot, &community, cfg, store, watches, me, now, &att.id, "over the size limit").await;
             continue;
         }
@@ -779,6 +788,39 @@ impl Budget {
 
 #[cfg(test)]
 mod tests {
+
+    /// A clip never reaches the model as a clip — it is cut into a sheet of a
+    /// few hundred KiB first — so its own size is download and ffmpeg cost, not
+    /// model cost. One cap for both refused ordinary 10-50 MiB GIFs unseen,
+    /// which is exactly the media a raider reaches for.
+    #[test]
+    fn a_sheeted_clip_gets_the_larger_ceiling() {
+        let mut c = vis();
+        c.max_bytes = 8 * 1024 * 1024;
+        c.max_sheeted_bytes = 64 * 1024 * 1024;
+        let big = 30 * 1024 * 1024;
+
+        assert!(matches!(gate("gif", big, &c), Gate::Fetch), "a 30 MiB GIF is judged, not declined");
+        assert!(matches!(gate("mp4", big, &c), Gate::Fetch), "and so is a clip");
+        assert!(
+            matches!(gate("png", big, &c), Gate::Refuse(_)),
+            "a still IS the model payload, so it keeps the smaller ceiling"
+        );
+        // Still bounded — the bytes are resident while they are cut.
+        assert!(matches!(gate("gif", 100 * 1024 * 1024, &c), Gate::Refuse(_)));
+
+        // With sheeting off a GIF is judged as a still, so it must not inherit
+        // the larger allowance for bytes that would go straight to the model.
+        c.video.enabled = false;
+        assert!(matches!(gate("gif", big, &c), Gate::Refuse(_)), "no sheet, no allowance");
+
+        // A misconfigured smaller sheeted cap must never TIGHTEN the still cap.
+        let mut odd = vis();
+        odd.max_bytes = 8 * 1024 * 1024;
+        odd.max_sheeted_bytes = 1024;
+        assert!(matches!(gate("gif", 4 * 1024 * 1024, &odd), Gate::Fetch), "floors at max_bytes");
+    }
+
 
     fn vis() -> crate::config::VisionCfg {
         let mut c = crate::config::VisionCfg { enabled: true, ..Default::default() };

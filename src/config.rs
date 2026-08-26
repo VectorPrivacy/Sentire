@@ -526,6 +526,18 @@ impl Default for Ladder {
 #[serde(default, deny_unknown_fields)]
 pub struct VisionCfg {
     pub enabled: bool,
+    /// The cap for media that is CUT INTO A SHEET first — clips and animations.
+    ///
+    /// `max_bytes` bounds what is sent to the model, and for a still that is the
+    /// file itself. A clip is different: it becomes a contact sheet of a few
+    /// hundred KiB however large the source was, so the source size is transient
+    /// download and ffmpeg cost, not model cost. Holding both to one number meant
+    /// an 8 MiB ceiling refused ordinary 10-50 MiB GIFs unseen — the exact media
+    /// a raider reaches for.
+    ///
+    /// Still bounded, because the bytes are resident while they are cut: this
+    /// times the fetch width is the peak for one community.
+    pub max_sheeted_bytes: u64,
     /// Judge images a member LINKS, not only ones they upload.
     ///
     /// A URL renders inline in the client exactly like an upload, so with this
@@ -713,6 +725,7 @@ impl Default for VisionCfg {
     fn default() -> Self {
         VisionCfg {
             communities: None,
+            max_sheeted_bytes: 64 * 1024 * 1024,
             judge_links: true,
             concurrent: 1,
             enabled: false,
