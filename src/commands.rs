@@ -122,6 +122,26 @@ pub(crate) fn operator_surface(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<S
     help(bot);
 }
 
+/// What Sentire is, for somebody meeting it in a room for the first time.
+///
+/// Concrete rather than promotional: what it looks at, what it can do about it,
+/// and — the part that reassures a real member — that the community sets all of
+/// it and it does nothing it was not granted.
+const INTRO: &str = "\
+**Sentire** — the Guard for your Community.\n\n\
+I read every channel I have been given access to and judge what is posted against \
+**this community's own rules**: blocked words and links, behaviour like flooding or \
+repetition, and images and video where the operator has enabled it.\n\n\
+When somebody breaks a rule I take down what they posted and add to their **strikes** \
+— one running score per member. Enough strikes and I warn, then remove, then ban. \
+Strikes fade on their own, so a member who stops is forgiven without anybody having \
+to remember.\n\n\
+I also watch for **raids**: a wave of accounts arriving together and posting the same \
+thing. That gets contained in one move — everyone in the wave removed and the keys \
+rotated so they cannot come back with what they hold.\n\n\
+Your admins configure all of it from here, and I only ever do what this community has \
+granted me. Given nothing, I still watch and report — I simply act on nobody.";
+
 /// Every command, and what one strike actually is.
 ///
 /// The scoring is the part nobody guesses: a member carries a running SCORE, an
@@ -188,7 +208,7 @@ fn help(bot: &VectorBot) {
                 .join(" · ");
             let _ = ctx
                 .reply(format!(
-                    "{}\n\n{commands}\n\n`/help <topic>` for any of them.",
+                    "{INTRO}\n\n———\n\n{}\n\n———\n\n{commands}\n\n`/help <topic>` for any of them.",
                     HELP_TOPICS[0].1
                 ))
                 .await;
@@ -799,6 +819,11 @@ mod tests {
         }
         for topic in topics.iter().filter(|t| **t != "scoring") {
             assert!(registered.iter().any(|c| c == topic), "/help describes /{topic}, which is not a command");
+        }
+        // The bare `/help` is the first thing a member ever reads about me, so it
+        // has to answer "what is this" before "what are the numbers".
+        for must in ["Sentire", "strikes", "raid", "granted"] {
+            assert!(INTRO.contains(must), "the intro must say what I am and what I will not do: missing {must}");
         }
         // The one thing nobody infers correctly on their own.
         assert!(HELP_TOPICS[0].0 == "scoring", "scoring leads, because it is what the numbers mean");
