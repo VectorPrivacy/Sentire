@@ -129,18 +129,17 @@ pub(crate) fn operator_surface(bot: &VectorBot, cfg: &Arc<Config>, store: &Arc<S
 /// it and it does nothing it was not granted.
 const INTRO: &str = "\
 **Sentire** — the Guard for your Community.\n\n\
-I read every channel I have been given access to and judge what is posted against \
-**this community's own rules**: blocked words and links, behaviour like flooding or \
-repetition, and images and video where the operator has enabled it.\n\n\
-When somebody breaks a rule I take down what they posted and add to their **strikes** \
-— one running score per member. Enough strikes and I warn, then remove, then ban. \
-Strikes fade on their own, so a member who stops is forgiven without anybody having \
-to remember.\n\n\
-I also watch for **raids**: a wave of accounts arriving together and posting the same \
-thing. That gets contained in one move — everyone in the wave removed and the keys \
-rotated so they cannot come back with what they hold.\n\n\
-Your admins configure all of it from here, and I only ever do what this community has \
-granted me. Given nothing, I still watch and report — I simply act on nobody.";
+I defend this community against what it has decided it will not host: blocked words \
+and links, flooding and repetition, and images or video where the operator has turned \
+that on. Break one of those and the post comes down and your **strikes** go up.\n\n\
+Strikes are one running score per member. Enough of them and I warn, then remove, then \
+ban. They fade on their own, so somebody who stops is forgiven without anyone having to \
+remember to forgive them.\n\n\
+**Raids are what I am built for.** A wave of accounts arriving together to flood a \
+channel is answered in one move: the whole wave removed and the keys rotated, so what \
+they are holding stops working.\n\n\
+Your admins decide all of it from here — what counts as an offence, what each one costs, \
+and what I am allowed to do about it. I only ever use what this community has granted me.";
 
 /// Every command, and what one strike actually is.
 ///
@@ -822,8 +821,9 @@ mod tests {
         }
         // The bare `/help` is the first thing a member ever reads about me, so it
         // has to answer "what is this" before "what are the numbers".
-        for must in ["Sentire", "strikes", "raid", "granted"] {
-            assert!(INTRO.contains(must), "the intro must say what I am and what I will not do: missing {must}");
+        let intro = INTRO.to_lowercase();
+        for must in ["sentire", "strikes", "raid", "granted"] {
+            assert!(intro.contains(must), "the intro must say what I am and what I will not do: missing {must}");
         }
         // The one thing nobody infers correctly on their own.
         assert!(HELP_TOPICS[0].0 == "scoring", "scoring leads, because it is what the numbers mean");
