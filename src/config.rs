@@ -1237,10 +1237,17 @@ mod unknown_key_tests {
     fn the_media_lane_actually_asks_the_gate() {
         let src = include_str!("lanes.rs");
         let at = src.find("vision_enabled_for").expect("the media lane must consult the per-community gate");
-        // And it must ask BEFORE fetching bytes: the whole point is that an
-        // unnamed community's attachments are never decrypted or uploaded.
-        let fetches = src.find("for att in &msg.message.attachments").expect("media loop");
-        assert!(at < fetches, "the gate must be asked before any attachment is touched");
+        // And it must ask BEFORE anything is fetched: the whole point is that an
+        // unnamed community's media is never decrypted, downloaded or uploaded.
+        // Anchored on the candidate loop, which covers linked media as well as
+        // attachments — a bypass that reached only one of the two would be the
+        // same hole in a new place.
+        let fetches = src.find("for cand in &cands").expect("media loop");
+        assert!(at < fetches, "the gate must be asked before any media is touched");
+        // The CALL SITE, not the definition — which sits above the gate and would
+        // pass this trivially.
+        let links = src.find("linked_media(&msg.message.content").expect("link extraction call");
+        assert!(at < links, "and before a linked URL is even extracted");
     }
 
     /// The shipped example documented `arm.vision`, which no struct has and
