@@ -307,7 +307,12 @@ pub(crate) async fn watch_media(
     let policy = cfg.for_community(community.id());
     // What somebody posted is a content question, so only a role at or above
     // Sentinel's spares them from it. A trusted regular's media is judged.
-    if crate::adjudicate::spared_from_content(&shield).is_some() {
+    if let Some(why) = crate::adjudicate::spared_from_content(&shield) {
+        // Named, not silent. Every other skip says why; sparing did not, so a
+        // shielded member's post and a broken lane produced the same empty log.
+        for a in &msg.message.attachments {
+            println!("[media] {} — not judged: {why}", short(&a.id));
+        }
         return Ok(());
     }
     let now = now_ms();
@@ -477,6 +482,21 @@ pub(crate) async fn watch_media(
                 unclassified(bot, &community, cfg, store, watches, me, now, &att.id, &why).await;
             }
             vision::Verdict::Flagged { labels, description } => {
+                // Every score the model returned, threshold or no. A label that
+                // lands just under the bar is the single most useful thing an
+                // operator can see — it is how a threshold gets tuned — and
+                // without this line a near miss and a clean answer were the same
+                // silence.
+                let scored = labels
+                    .iter()
+                    .map(|l| format!("{} {:.0}%", l.name, l.score * 100.0))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!(
+                    "[media] {} — {scored}{}",
+                    short(&att.id),
+                    description.as_deref().map(|d| format!(" — {d}")).unwrap_or_default()
+                );
                 let hits = vision::over_threshold(&labels, &cfg.vision.labels);
                 if hits.is_empty() {
                     continue;
@@ -499,9 +519,13 @@ pub(crate) async fn watch_media(
                 // The operator's console keeps the parts the member never sees.
                 let internals =
                     format!("{} ({:.0}% per {})", label.name, label.score * 100.0, eyes.model());
-                // One strike per (blob, label): re-posting the same image is
-                // the same offense, escalating happens by posting more.
-                let conviction = format!("vision:{content_hash}:{}", label.name);
+                // Keyed on the POST as well as the blob. On the blob alone one
+                // image was worth one strike per community for good, so the same
+                // file re-posted a hundred times cost a raider nothing after the
+                // first — the cheapest bypass in the lane. The verdict is still
+                // cached by content hash, so a repost is free to judge and
+                // costly to make.
+                let conviction = format!("vision:{}:{content_hash}:{}", msg.message.id, label.name);
                 let fresh = store
                     .record(community.id(), &author, &conviction, worth, now, &evidence)
                     .map_err(vector_sdk::Error::Other)?;
@@ -690,19 +714,24 @@ pub(crate) async fn unclassified(
 }
 
 /// The classifier, if the operator configured one.
-pub(crate) fn media_lane(cfg: &Config) -> vector_sdk::Result<Arc<Option<vision::openai::OpenAiVision>>> {
+pub(crate) async fn media_lane(cfg: &Config) -> vector_sdk::Result<Arc<Option<vision::openai::OpenAiVision>>> {
     if !cfg.vision.enabled {
         return Ok(Arc::new(None));
     }
-    let eyes = vision::openai::OpenAiVision::new(cfg.vision.clone()).map_err(vector_sdk::Error::Other)?;
+    let eyes = vision::openai::OpenAiVision::new(cfg.vision.clone())
+        .await
+        .map_err(vector_sdk::Error::Other)?;
+    let endpoint = eyes.endpoint();
     println!(
         "media lane: {} at {}{}",
         cfg.vision.model,
-        cfg.vision.base_url,
-        if cfg.vision.is_local() {
+        endpoint,
+        // An enclave still receives the bytes, so the warning stands; what
+        // changes is that the operator can name the code that got them.
+        if cfg.vision.is_local() && cfg.vision.provider == crate::config::VisionProvider::OpenAi {
             String::new()
         } else {
-            format!("  ⚠ REMOTE — decrypted attachments leave this machine for {}", cfg.vision.base_url)
+            format!("  ⚠ REMOTE — decrypted attachments leave this machine for {}", cfg.vision.remote_host())
         }
     );
     // At boot, not on the first clip. An operator who armed video judging and is
@@ -788,6 +817,25 @@ impl Budget {
 
 #[cfg(test)]
 mod tests {
+    /// The vision conviction must name the POST, not only the file.
+    ///
+    /// Parsed from source because the failure is invisible from the outside: a
+    /// key of `vision:{hash}:{label}` still classifies, still flags and still
+    /// logs — it just silently stops charging for every repost after the first,
+    /// which is a bypass that looks exactly like working software.
+    #[test]
+    fn the_vision_conviction_is_keyed_on_the_post() {
+        let src = include_str!("lanes.rs");
+        let line = src
+            .lines()
+            .find(|l| l.contains("let conviction = format!(\"vision:"))
+            .expect("the vision conviction id is built here");
+        assert!(
+            line.contains("msg.message.id"),
+            "a conviction keyed on the blob alone makes one image one strike for good: {line}"
+        );
+    }
+
 
     /// A clip never reaches the model as a clip — it is cut into a sheet of a
     /// few hundred KiB first — so its own size is download and ffmpeg cost, not
@@ -949,7 +997,15 @@ mod tests {
         webm.extend_from_slice(b"webm");
         webm.resize(80, 0);
 
+        // Matroska shares webm's EBML header and differs only by DocType.
+        let mut mkv = vec![0x1A, 0x45, 0xDF, 0xA3];
+        mkv.extend_from_slice(&[0u8; 20]);
+        mkv.extend_from_slice(b"matroska");
+        mkv.resize(80, 0);
+
         let samples: Vec<(&str, Vec<u8>)> = vec![
+            ("video/quicktime", b"\0\0\0\x14ftypqt  ".to_vec()),
+            ("video/x-matroska", mkv),
             ("image/png", vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
             ("image/jpeg", vec![0xFF, 0xD8, 0xFF, 0xE0, 0, 0, 0, 0]),
             ("image/gif", b"GIF89a\0\0".to_vec()),

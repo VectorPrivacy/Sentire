@@ -15,8 +15,16 @@ use crate::config::VisionCfg;
 
 pub struct OpenAiVision {
     cfg: VisionCfg,
-    api_key: Option<String>,
-    client: reqwest::Client,
+    wire: Wire,
+}
+
+/// How the body reaches the model. The body itself, the schema, the retries and
+/// the parse are identical either way — only the carriage differs, so a second
+/// provider is a variant here rather than a second implementation of the lane.
+enum Wire {
+    Http { api_key: Option<String>, client: reqwest::Client },
+    #[cfg(feature = "tee")]
+    Tee(super::tee::Tee),
 }
 
 /// What the model is asked. A constant rather than a buried string: an operator
@@ -61,14 +69,37 @@ pub fn storyboard_preamble(board: &super::storyboard::Board) -> String {
 }
 
 impl OpenAiVision {
-    pub fn new(cfg: VisionCfg) -> Result<Self, String> {
-        let api_key = if cfg.api_key_env.is_empty() {
-            None
-        } else {
-            Some(std::env::var(&cfg.api_key_env).map_err(|_| format!("vision.api_key_env {} is unset", cfg.api_key_env))?)
+    pub async fn new(cfg: VisionCfg) -> Result<Self, String> {
+        let wire = match cfg.provider {
+            crate::config::VisionProvider::OpenAi => {
+                let api_key = if cfg.api_key_env.is_empty() {
+                    None
+                } else {
+                    Some(std::env::var(&cfg.api_key_env).map_err(|_| {
+                        format!("vision.api_key_env {} is unset", cfg.api_key_env)
+                    })?)
+                };
+                Wire::Http { api_key, client: build_http_client(Duration::from_secs(cfg.timeout_secs))? }
+            }
+            #[cfg(feature = "tee")]
+            crate::config::VisionProvider::Tee => Wire::Tee(super::tee::Tee::connect(&cfg).await?),
+            #[cfg(not(feature = "tee"))]
+            crate::config::VisionProvider::Tee => {
+                return Err("vision.provider = \"tee\" but this build has no `tee` feature".into())
+            }
         };
-        let client = build_http_client(Duration::from_secs(cfg.timeout_secs))?;
-        Ok(OpenAiVision { cfg, api_key, client })
+        Ok(OpenAiVision { cfg, wire })
+    }
+
+    /// What the boot line says about where attachments go. For an enclave that
+    /// is the verified release, because "encrypted" without a measurement is a
+    /// claim rather than a fact.
+    pub fn endpoint(&self) -> String {
+        match &self.wire {
+            Wire::Http { .. } => self.cfg.base_url.clone(),
+            #[cfg(feature = "tee")]
+            Wire::Tee(t) => format!("{} [attested: {}]", self.cfg.enclave_proxy, t.describe()),
+        }
     }
 
     /// Each label with the operator's own definition of it. A bare name leaves
@@ -141,11 +172,20 @@ impl std::fmt::Display for Rejected {
 
 impl OpenAiVision {
     async fn post(&self, body: &Value) -> Result<Value, Rejected> {
-        let mut req = self
-            .client
+        let (api_key, client) = match &self.wire {
+            Wire::Http { api_key, client } => (api_key, client),
+            // The enclave path has no status code to read: a sealed body either
+            // round-trips or the transport says why. A parameter it dislikes
+            // comes back as an error like any other, so the one retry that
+            // strips `response_format` is not available and does not need to be
+            // — this endpoint honours the schema.
+            #[cfg(feature = "tee")]
+            Wire::Tee(t) => return t.post(body).await.map_err(Rejected::Other),
+        };
+        let mut req = client
             .post(format!("{}/chat/completions", self.cfg.base_url.trim_end_matches('/')))
             .json(body);
-        if let Some(key) = &self.api_key {
+        if let Some(key) = api_key {
             req = req.bearer_auth(key);
         }
         let resp = req.send().await.map_err(|e| Rejected::Other(format!("unreachable: {e}")))?;
@@ -406,7 +446,7 @@ mod tests {
         println!("sheet: {}x{} tiles, {} bytes", board.cols, board.rows, sheet.len());
         assert!(board.tiles() > 1, "a 90-frame clip deserves a grid: {board:?}");
 
-        let eyes = OpenAiVision::new(cfg).unwrap();
+        let eyes = OpenAiVision::new(cfg).await.unwrap();
         let verdict = eyes.classify(&sheet, Shown::Storyboard { mime: "image/jpeg", board }).await;
         println!("verdict: {verdict:?}");
 
@@ -456,7 +496,15 @@ mod tests {
                 .collect(),
             ..VisionCfg::default()
         };
-        OpenAiVision::new(cfg).unwrap()
+        // Built directly: every test below reads a reply, and a parser needs no
+        // transport to stand up.
+        OpenAiVision {
+            wire: Wire::Http {
+                api_key: None,
+                client: build_http_client(Duration::from_secs(cfg.timeout_secs)).unwrap(),
+            },
+            cfg,
+        }
     }
 
     #[test]

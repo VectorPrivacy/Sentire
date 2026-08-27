@@ -2,3 +2,5 @@
 sentinel.db
 sentinel.toml
 *.local.toml
+.env
+*.env

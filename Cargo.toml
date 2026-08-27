@@ -14,6 +14,17 @@ serde_json = "1"
 toml = "0.8"
 rusqlite = { version = "0.37", features = ["bundled"] }
 
+# Confidential inference. The enclave's attestation and the HPKE sealing of every
+# request body are this crate's job — reimplementing either would be writing our
+# own SEV-SNP verifier, which is exactly the thing you do not hand-roll.
+tinfoil = { git = "https://github.com/tinfoilsh/tinfoil-rs", optional = true }
+
+[features]
+default = ["tee"]
+# Off for a bot that only ever talks to a local model: the verifier pulls a
+# sigstore and SEV-SNP dependency tree that a LAN endpoint never touches.
+tee = ["dep:tinfoil"]
+
 # vector_sdk and vector-core come from crates.io now — 0.10.0 and 0.9.0 carry
 # everything this bot reads from a verdict.
 #

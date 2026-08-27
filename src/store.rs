@@ -10,7 +10,7 @@ use rusqlite::Connection;
 
 use crate::ladder::Strike;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
@@ -22,12 +22,25 @@ CREATE TABLE IF NOT EXISTS strikes (
     worth         INTEGER NOT NULL,
     at_ms         INTEGER NOT NULL,
     evidence      TEXT NOT NULL DEFAULT '',
+    -- The messages this conviction cited, so a pardon can name what it forgave.
+    citations     TEXT NOT NULL DEFAULT '',
     -- A forgiven strike stays as a tombstone. The engine re-reports a standing
     -- conviction for as long as its evidence sits in the window, so a deleted
     -- row is re-inserted within one poll at full worth and a fresh timestamp:
     -- the pardon would raise the total it was meant to clear.
     pardoned      INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (community, subject, conviction_id)
+);
+-- What a pardon forgave, by citation. A conviction_id is stable per RUNG, not
+-- per hit, so one more matching message mints a new id and the tombstone no
+-- longer covers it — the pardon undoes itself against evidence still in the
+-- window. Forgiving the CITATIONS survives that: the same messages can never
+-- fund another strike, however the engine renames the conviction.
+CREATE TABLE IF NOT EXISTS forgiven (
+    community  TEXT NOT NULL,
+    subject    TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    PRIMARY KEY (community, subject, message_id)
 );
 CREATE TABLE IF NOT EXISTS actions (
     community TEXT NOT NULL,
@@ -121,15 +134,57 @@ impl Store {
         at_ms: u64,
         evidence: &str,
     ) -> Result<bool, String> {
-        let n = self
-            .lock()
+        self.record_citing(community, subject, conviction_id, worth, at_ms, evidence, &[])
+    }
+
+    /// [`Store::record`], naming the messages the conviction cited.
+    ///
+    /// A conviction whose every citation was already forgiven lands tombstoned:
+    /// the pardon settled that evidence, and the engine re-reporting it under a
+    /// new id is an echo, not a new offense.
+    pub fn record_citing(
+        &self,
+        community: &str,
+        subject: &str,
+        conviction_id: &str,
+        worth: u32,
+        at_ms: u64,
+        evidence: &str,
+        citations: &[String],
+    ) -> Result<bool, String> {
+        let conn = self.lock();
+        let settled = !citations.is_empty()
+            && citations.iter().try_fold(true, |all, m| {
+                conn.query_row(
+                    "SELECT 1 FROM forgiven WHERE community = ?1 AND subject = ?2 AND message_id = ?3",
+                    rusqlite::params![community, subject, m],
+                    |_| Ok(()),
+                )
+                .map(|()| all)
+                .or_else(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(false),
+                    other => Err(other.to_string()),
+                })
+            })?;
+        let n = conn
             .execute(
-                "INSERT OR IGNORE INTO strikes (community, subject, conviction_id, worth, at_ms, evidence)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![community, subject, conviction_id, worth, at_ms as i64, evidence],
+                "INSERT OR IGNORE INTO strikes
+                     (community, subject, conviction_id, worth, at_ms, evidence, citations, pardoned)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    community,
+                    subject,
+                    conviction_id,
+                    worth,
+                    at_ms as i64,
+                    evidence,
+                    citations.join(","),
+                    i64::from(settled),
+                ],
             )
             .map_err(|e| e.to_string())?;
-        Ok(n > 0)
+        // A tombstone is not a new offense, so it never reads as fresh.
+        Ok(n > 0 && !settled)
     }
 
     pub fn strikes(&self, community: &str, subject: &str) -> Result<Vec<Strike>, String> {
@@ -498,6 +553,16 @@ impl Store {
         // re-inserted within one poll at full worth and a fresh timestamp —
         // the pardon would raise the total it was asked to clear. `record` is
         // INSERT OR IGNORE, so the tombstone survives every later poll.
+        // Forgive the CITATIONS before tombstoning, or the same messages fund a
+        // fresh strike the moment one more hit renames the conviction.
+        conn.execute(
+            "INSERT OR IGNORE INTO forgiven (community, subject, message_id)
+             SELECT community, subject, TRIM(value)
+             FROM strikes, json_each('[\"' || REPLACE(citations, ',', '\",\"') || '\"]')
+             WHERE community = ?1 AND subject = ?2 AND citations <> ''",
+            rusqlite::params![community, subject],
+        )
+        .map_err(|e| e.to_string())?;
         let n = conn
             .execute(
                 "UPDATE strikes SET pardoned = 1 WHERE community = ?1 AND subject = ?2 AND pardoned = 0",
@@ -593,6 +658,54 @@ pub mod tests {
 
     /// Only the rehearsal boundary wipes. Every other arming change is an
     /// operator tuning a live bot, and the rows are answers it really delivered.
+    /// The cheapest bypass there was: one image, one strike, then post it
+    /// forever for free. A conviction keyed on the blob alone cannot tell a
+    /// second offense from an echo of the first.
+    #[test]
+    fn the_same_image_posted_again_is_a_second_offense() {
+        let s = Store::open(":memory:").unwrap();
+        let blob = "deadbeef";
+        let first = format!("vision:msg1:{blob}:nsfw");
+        let again = format!("vision:msg2:{blob}:nsfw");
+
+        assert!(s.record("c", "npub1a", &first, 3, 1_000, "e").unwrap());
+        // The SAME post re-delivered is still one offense.
+        assert!(!s.record("c", "npub1a", &first, 3, 1_500, "e").unwrap(), "a re-delivery is an echo");
+        assert!(s.record("c", "npub1a", &again, 3, 2_000, "e").unwrap(), "a new post of the same file convicts");
+        assert_eq!(s.strikes("c", "npub1a").unwrap().len(), 2, "two posts, two strikes");
+    }
+
+    /// A pardon has to survive the conviction being RENAMED. The window id
+    /// carries the rung, so one more hit on evidence already forgiven mints an
+    /// id the tombstone never covered — and the pardon undid itself.
+    #[test]
+    fn a_pardon_settles_the_evidence_not_just_the_name() {
+        let s = Store::open(":memory:").unwrap();
+        s.record_citing("c", "npub1a", "win:words:per_window:1", 3, 1_000, "said it", &["m1".into()])
+            .unwrap();
+        assert_eq!(s.strikes("c", "npub1a").unwrap().len(), 1);
+
+        s.pardon("c", "npub1a").unwrap();
+        assert!(s.strikes("c", "npub1a").unwrap().is_empty(), "the pardon clears the total");
+
+        // Same message, one rung higher: a NEW id over evidence already settled.
+        let fresh = s
+            .record_citing("c", "npub1a", "win:words:per_window:2", 3, 2_000, "said it", &["m1".into()])
+            .unwrap();
+        assert!(!fresh, "an echo of forgiven evidence is not a new offense");
+        assert!(
+            s.strikes("c", "npub1a").unwrap().is_empty(),
+            "a renamed conviction over forgiven citations must not refill the ladder"
+        );
+
+        // A genuinely new message is untouched by the pardon.
+        let fresh = s
+            .record_citing("c", "npub1a", "win:words:per_window:3", 3, 3_000, "said it again", &["m2".into()])
+            .unwrap();
+        assert!(fresh, "new evidence still convicts");
+        assert_eq!(s.strikes("c", "npub1a").unwrap().len(), 1);
+    }
+
     #[test]
     fn arming_more_rungs_on_a_live_bot_keeps_the_record() {
         let s = mem();

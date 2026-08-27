@@ -9,6 +9,8 @@
 //! as a cross-client verdict.
 
 pub mod openai;
+#[cfg(feature = "tee")]
+pub mod tee;
 pub mod storyboard;
 
 use crate::config::Gravity;

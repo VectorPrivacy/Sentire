@@ -243,7 +243,7 @@ async fn main() -> vector_sdk::Result<()> {
 
     let wires: Watches = Arc::new(Mutex::new(HashMap::new()));
     commands::operator_surface(&bot, &cfg, &store, &wires);
-    let eyes = lanes::media_lane(&cfg)?;
+    let eyes = lanes::media_lane(&cfg).await?;
 
 
     // The sweep runs beside the listener rather than instead of it: slash

@@ -138,8 +138,25 @@ claim_ttl_secs = 21600          # 6 hours
 # is the same block with a different base_url and an api_key_env — but note that
 # an attachment is end-to-end encrypted right up until Sentinel decrypts it and
 # posts it to somebody else's server, so allow_remote must be set on purpose.
+#
+# `provider` picks the wire. "openai" is any OpenAI-compatible endpoint, local or
+# hosted. "tee" is a confidential-computing enclave: the request body is sealed
+# with HPKE to a key the enclave proved it holds, so neither the billing proxy
+# nor the operator of the machine running the model can read the attachment.
+#
+# For "tee", name the enclave-internal model (gemma4-31b, not private/gemma4-31b)
+# and point api_key_env at your proxy key. The enclave_host, enclave_repo and
+# enclave_proxy keys default to Tinfoil's inference router, which is what PPQ's
+# private models sit behind, and base_url goes unused.
+#
+# What is attested is that ROUTER, which terminates the encrypted channel and
+# forwards to a model enclave it verified itself. So the guarantee is that
+# measured, publicly audited code handles the plaintext — not that nothing does.
+# Worth knowing before describing it to a community. The verified release is
+# printed at boot.
 [vision]
 enabled      = false
+provider     = "openai"
 base_url     = "http://127.0.0.1:8080/v1"
 model        = "llava"
 api_key_env  = ""               # empty = local, no auth

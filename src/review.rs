@@ -29,6 +29,9 @@ pub(crate) struct Charge {
     pub(crate) rule_id: String,
     pub(crate) worth: u32,
     pub(crate) evidence: String,
+    /// The messages this cited. A pardon forgives these, so the same evidence
+    /// cannot fund a second strike once the rung renames the conviction.
+    pub(crate) citations: Vec<String>,
 }
 
 /// One finding in the words a member reads.
@@ -92,6 +95,7 @@ pub(crate) fn charges(v: &vector_sdk::policy::Verdict, policy: &crate::policy::C
                     rule_id: f.rule_id.clone(),
                     worth,
                     evidence: evidence.clone(),
+                    citations: vec![mid.clone()],
                 });
             }
             continue;
@@ -111,6 +115,7 @@ pub(crate) fn charges(v: &vector_sdk::policy::Verdict, policy: &crate::policy::C
             rule_id: f.rule_id.clone(),
             worth,
             evidence,
+            citations: f.messages.clone(),
         });
     }
     out
@@ -225,7 +230,9 @@ pub(crate) async fn sweep(
             continue;
         }
         for c in kept {
-            store.record(community.id(), &v.npub, &c.conviction, c.worth, now, &c.evidence).map_err(vector_sdk::Error::Other)?;
+            store
+                .record_citing(community.id(), &v.npub, &c.conviction, c.worth, now, &c.evidence, &c.citations)
+                .map_err(vector_sdk::Error::Other)?;
         }
         let strikes = store.strikes(community.id(), &v.npub).map_err(vector_sdk::Error::Other)?;
         handled.insert(v.npub.clone());

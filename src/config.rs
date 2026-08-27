@@ -537,6 +537,20 @@ impl Default for Ladder {
     }
 }
 
+/// Which wire carries an attachment to the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum VisionProvider {
+    /// Any OpenAI-compatible endpoint, reached over plain HTTP(S).
+    #[default]
+    OpenAi,
+    /// A confidential-computing enclave: the body is sealed to an attested HPKE
+    /// key, so the operator of the machine running the model cannot read it.
+    /// The attestation is checked on every connection and a failure refuses the
+    /// send rather than falling back.
+    Tee,
+}
+
 /// The media lane. Off by default: it ships bytes to a model, and that is a
 /// decision an operator makes rather than inherits.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -583,6 +597,24 @@ pub struct VisionCfg {
     /// public bot names the communities that get it, and everyone else still
     /// gets text rules and raid containment for nothing.
     pub communities: Option<Vec<String>>,
+    #[serde(default)]
+    pub provider: VisionProvider,
+    /// The enclave whose attestation is verified, and the repository whose
+    /// published measurements it is checked against. Defaults describe Tinfoil's
+    /// inference router, which is what PPQ's private models sit behind.
+    ///
+    /// The router is what the body is sealed to — it terminates the encrypted
+    /// channel, then forwards to a model enclave IT verified. So this attests
+    /// the front door, not the GPU: the guarantee is that measured, publicly
+    /// audited code is what handles the plaintext, not that nothing does.
+    #[serde(default = "default_enclave_host")]
+    pub enclave_host: String,
+    #[serde(default = "default_enclave_repo")]
+    pub enclave_repo: String,
+    /// The billing front-end that forwards to the enclave. Sealed bodies pass
+    /// through it opaque; it reads only headers.
+    #[serde(default = "default_enclave_proxy")]
+    pub enclave_proxy: String,
     /// llama.cpp's server speaks the OpenAI-compatible shape, so local and
     /// remote differ by a URL and a header, not by an implementation.
     pub base_url: String,
@@ -623,6 +655,18 @@ pub struct VisionCfg {
     pub labels: Vec<VisionLabel>,
     #[serde(default)]
     pub video: VideoCfg,
+}
+
+fn default_enclave_host() -> String {
+    "inference.tinfoil.sh".into()
+}
+
+fn default_enclave_repo() -> String {
+    "tinfoilsh/confidential-model-router".into()
+}
+
+fn default_enclave_proxy() -> String {
+    "https://api.ppq.ai/private".into()
 }
 
 fn default_answer_tokens() -> u32 {
@@ -746,6 +790,10 @@ impl Default for VisionCfg {
             judge_links: true,
             concurrent: 1,
             enabled: false,
+            provider: VisionProvider::default(),
+            enclave_host: default_enclave_host(),
+            enclave_repo: default_enclave_repo(),
+            enclave_proxy: default_enclave_proxy(),
             base_url: "http://127.0.0.1:8080/v1".into(),
             model: "llava".into(),
             api_key_env: String::new(),
@@ -753,7 +801,7 @@ impl Default for VisionCfg {
             timeout_secs: 60,
             max_bytes: 8 * 1024 * 1024,
             max_per_min: 20,
-            mimes: ["image/png", "image/jpeg", "image/webp", "image/gif", "video/mp4", "video/webm"]
+            mimes: ["image/png", "image/jpeg", "image/webp", "image/gif", "video/mp4", "video/webm", "video/quicktime", "video/x-matroska"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
@@ -773,6 +821,21 @@ impl VisionCfg {
     /// has authority `127.0.0.1:8080@evil.com` and a HOST of `evil.com`. Reading
     /// the leading text as the host would have judged that local and shipped
     /// decrypted attachments off the machine with no warning printed.
+    /// Just the host attachments are sent to, for the warning line. The boot
+    /// line already prints the endpoint in full; repeating it says nothing and
+    /// buries the warning.
+    pub fn remote_host(&self) -> String {
+        let url = match self.provider {
+            VisionProvider::Tee => &self.enclave_proxy,
+            VisionProvider::OpenAi => &self.base_url,
+        };
+        url.split("://")
+            .nth(1)
+            .and_then(|rest| rest.split('/').next())
+            .unwrap_or(url)
+            .to_string()
+    }
+
     pub fn is_local(&self) -> bool {
         let after_scheme = self.base_url.split_once("//").map(|(_, r)| r).unwrap_or(&self.base_url);
         let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or_default();
@@ -1001,7 +1064,33 @@ impl Config {
             if self.vision.model.trim().is_empty() {
                 return Err("vision.model is empty".into());
             }
-            if !self.vision.is_local() && !self.vision.allow_remote {
+            if self.vision.provider == VisionProvider::Tee {
+                if self.vision.api_key_env.is_empty() {
+                    return Err(
+                        "vision.provider = \"tee\" with no vision.api_key_env: the enclave is reached \
+                         through a billing proxy that authenticates with a key."
+                            .into(),
+                    );
+                }
+                for (field, value) in [
+                    ("enclave_host", &self.vision.enclave_host),
+                    ("enclave_repo", &self.vision.enclave_repo),
+                    ("enclave_proxy", &self.vision.enclave_proxy),
+                ] {
+                    if value.trim().is_empty() {
+                        return Err(format!("vision.{field} is empty: nothing to attest against"));
+                    }
+                }
+                // The enclave-internal id. A proxy's catalogue name ("private/x")
+                // is rejected upstream, and the failure reads as a bad model
+                // rather than a prefix.
+                if let Some(rest) = self.vision.model.split_once('/').map(|(_, r)| r) {
+                    return Err(format!(
+                        "vision.model '{}' is a proxy catalogue name — the enclave wants '{rest}'",
+                        self.vision.model
+                    ));
+                }
+            } else if !self.vision.is_local() && !self.vision.allow_remote {
                 return Err(format!(
                     "vision.base_url {} is not loopback and vision.allow_remote is false. \
                      An attachment is end-to-end encrypted until Sentinel decrypts it and posts it \
@@ -1118,12 +1207,34 @@ mod tests {
         assert_eq!(ranks.len(), 4, "two responses share a rank");
     }
 
+    /// Every video type the byte sniffer can NAME is judged.
+    ///
+    /// A format left off the list is refused before a byte is fetched and goes
+    /// to a person — so `.mov`, the default capture format on iOS, sailed past
+    /// the media lane entirely. The sniffer is the ceiling here: a type it
+    /// cannot name would be fetched, unidentified, and escalated forever.
+    #[test]
+    fn every_nameable_video_type_is_judged_by_default() {
+        let shipped = VisionCfg::default().mimes;
+        let missing: Vec<&str> = vector_sdk::vector_core::crypto::RECOGNISED_MIMES
+            .iter()
+            .filter(|m| m.starts_with("video/"))
+            .filter(|m| !shipped.iter().any(|s| s == *m))
+            .copied()
+            .collect();
+        assert!(missing.is_empty(), "ffmpeg reads these and the sniffer names them, but they go unjudged: {missing:?}");
+    }
+
     #[test]
     fn the_defaults_validate_and_are_dry() {
         let cfg = Config::default();
         assert!(cfg.validate().is_ok());
         assert!(!cfg.arm.warn && !cfg.arm.delete && !cfg.arm.kick && !cfg.arm.ban && !cfg.arm.raid);
     }
+
+    const TEE_BASE: &str = "[vision]\nenabled = true\nprovider = \"tee\"\nmodel = \"gemma4-31b\"\n[[vision.labels]]\nname = \"gore\"\nthreshold = 0.9\ngravity = \"grave\"";
+    const TEE_NO_HOST: &str = "[vision]\nenabled = true\nprovider = \"tee\"\nmodel = \"gemma4-31b\"\napi_key_env = \"K\"\nenclave_host = \"\"\n[[vision.labels]]\nname = \"gore\"\nthreshold = 0.9\ngravity = \"grave\"";
+    const TEE_PREFIXED: &str = "[vision]\nenabled = true\nprovider = \"tee\"\nmodel = \"private/gemma4-31b\"\napi_key_env = \"K\"\n[[vision.labels]]\nname = \"gore\"\nthreshold = 0.9\ngravity = \"grave\"";
 
     #[test]
     fn every_refusal_names_its_field() {
@@ -1155,6 +1266,12 @@ mod tests {
             ("[community.\"fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea\".raid]\nmax_batch = 0", "max_batch"),
             ("[community.\"fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea\".limits]\nhalt_if_over_pct = 0", "halt_if_over_pct"),
             ("[community.\"fe4abeb3fd227a67fc59d8a4363420649bb970436dc3b14d51c2b66fee334dea\".raid]\ntripwire_accounts = 1", "tripwire_accounts"),
+            // An enclave is reached through a billing proxy, so an unnamed key
+            // is a boot that would fail on the first attachment instead.
+            (TEE_BASE, "api_key_env"),
+            (TEE_NO_HOST, "enclave_host"),
+            // The proxy's catalogue name reaches the enclave as an unknown model.
+            (TEE_PREFIXED, "catalogue name"),
         ];
         for (toml_text, expect) in cases {
             let cfg: Config = toml::from_str(toml_text).unwrap();
