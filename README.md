@@ -46,6 +46,19 @@ Moderation on most platforms means trusting someone else's rules, someone else's
 
 </div>
 
+## Getting Started
+
+Easily **add Sentire-001 to your Vector Community** by inviting him if you are the creator or admin.
+
+Add this Vector ID (npub) as a contact, then invite the bot to your Community:
+
+```
+npub1pc5sdve5w6wczjhhnzu4te7ayjujlprm2y4ndx044gzsqx0gq64qytz06y
+```
+
+**Check the npub character by character before you add it.** Anyone can create a Nostr identity with a matching display name and avatar, and a moderation bot has admin powers in your Community. Copy it from this page or from the official Vector docs, never from a message someone sent you. Also, notice that for bots on Vector that they have a bot icon to the right of their name.
+
+---
 
 ## Four lanes, one score
 
