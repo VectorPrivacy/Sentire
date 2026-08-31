@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/Sentire-001-GitHub-Banner.png" width="830 px" alt="Sentire">
+<img src="assets/Sentire-001-GitHub-Banner.png" width=100% alt="Sentire">
 
 # Sentire
 ***sentīre** (Latin, /senˈtiː.re/) — to perceive, to notice, to understand. The root of **sentinel** and **sentient**.*
@@ -12,7 +12,9 @@
 ---
 
 ## Community Moderation Bot
-**Sentire-001 is a full-time guardian for your Community.** Always vigilant, never off duty. A dedicated moderation bot for Vector Communities, built for the rooms that have outgrown what a handful of volunteers can watch by hand. Sentire-001 screens text as it lands, judges media through a vision model you choose, contains raids before they spread, and keeps one legible score per member. It works the same at three in the morning as it does at noon, and it never gets tired of the same troll trying again.
+**Sentire-001 is a full-time guardian for your Community.** Always vigilant, never off duty. A dedicated moderation bot for Vector Communities, built for the rooms that have outgrown what a handful of volunteers can watch by hand. Sentire-001 screens text as it lands, judges media through a vision model you choose, contains raids before they spread, and keeps one legible score per member. 
+
+*It works the same at three in the morning as it does at noon, and it never gets tired of the same troll trying again.*
 
 Moderation on most platforms means trusting someone else's rules, someone else's model, and someone else's servers. Sentire runs on yours. You set the policy, you pick the vision model, and every action it takes is a signed Concord event any member can verify. Nothing about your Community leaves it.
 
