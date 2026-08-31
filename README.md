@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/Sentire-001-GitHub-Banner.png" width=100% alt="Sentire">
+<img src="assets/Sentire-001-GitHub-Banner.png" width="830px" alt="Sentire">
 
 # Sentire
 ***sentīre** (Latin, /senˈtiː.re/) — to perceive, to notice, to understand. The root of **sentinel** and **sentient**.*
