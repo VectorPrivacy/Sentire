@@ -1,22 +1,49 @@
 <div align="center">
 
-<img src="assets/sentire.png" width="170" alt="Sentire">
+<img src="assets/Sentire-001-GitHub-Banner.png" width="830 px" alt="Sentire">
 
 # Sentire
-
-**The Guard for your Community.**
-
-A moderation bot for [Vector](https://vectorapp.io) communities. Screens text as it lands,
-judges media through a vision model you choose, contains raids, and keeps one legible
-score per member.
+***sentīre** (Latin, /senˈtiː.re/) — to perceive, to notice, to understand. The root of **sentinel** and **sentient**.*
 
 [![license](https://img.shields.io/badge/license-MIT-59fcb3)](LICENSE)
 [![rust](https://img.shields.io/badge/rust-2021-59fcb3)](Cargo.toml)
 [![tests](https://img.shields.io/badge/tests-307-59fcb3)](#testing)
 
-</div>
+---
+
+## Community Moderation Bot
+**Sentire-001 is a full-time guardian for your Community.** Always vigilant, never off duty. A dedicated moderation bot for Vector Communities, built for the rooms that have outgrown what a handful of volunteers can watch by hand. Sentire-001 screens text as it lands, judges media through a vision model you choose, contains raids before they spread, and keeps one legible score per member. It works the same at three in the morning as it does at noon, and it never gets tired of the same troll trying again.
+
+Moderation on most platforms means trusting someone else's rules, someone else's model, and someone else's servers. Sentire runs on yours. You set the policy, you pick the vision model, and every action it takes is a signed Concord event any member can verify. Nothing about your Community leaves it.
 
 ---
+
+<img align="left" src="./assets/vector_check.png" width="150">
+
+<h3 align="left">Raid Protection</h3>
+
+<p align="left">Sentire watches the shape of activity, not just its content: a burst of fresh accounts joining together, near-identical messages arriving from different members, or a sudden spike in link posts all read as one coordinated event rather than a dozen unrelated ones. When it sees one, it acts on the whole wave at once, clearing a raid in a single batched moderation pass instead of racing it one ban at a time.</p>
+
+---
+
+<img align="left" src="./assets/vector_check.png" width="150">
+
+<h3 align="left">Reputation System</h3>
+
+<p align="left">Every member carries a single score that moves with their behaviour: helpful participation lifts it, deleted messages and warnings pull it down, and the number is visible rather than buried in a black box. Moderators can see why a score sits where it does before they act on it, so a decision rests on a member's history rather than on whichever message happened to be the last one read.</p>
+
+---
+
+<img align="left" src="./assets/vector_warning.png" width="150">
+
+<h3 align="left">Chat & Media Moderation (Explicit Material)</h3>
+
+<p align="left">Text is screened as it lands, and images and video are passed to a vision model you choose, so the line between acceptable and not is set by your Community rather than by a policy written somewhere else. Anything that crosses it is removed before the room sees it, with the match logged so a moderator can review the call and adjust the threshold. Nobody has to look at what got caught in order for it to be caught.</p>
+
+---
+
+</div>
+
 
 ## Four lanes, one score
 
