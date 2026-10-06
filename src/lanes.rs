@@ -368,7 +368,22 @@ pub(crate) async fn watch_media(
         // `att.id` is the SENDER's declared hash and is never verified, so the
         // cache keys on what actually downloaded.
         let fetched = match &cand.src {
-            Src::Att(a) => bot.download_attachment_from(a, msg.message.npub.as_deref()).await.map_err(|e| e.to_string()),
+            Src::Att(a) => match bot.download_attachment_from(a, msg.message.npub.as_deref()).await {
+                Ok(b) => Ok(b),
+                // An attachment that will not decrypt is, in practice, a plain
+                // public file: other Nostr clients attach unencrypted uploads,
+                // and Vector shows them by falling back to the raw bytes. Giving
+                // up here made the image every member could see the one image
+                // nobody judged — seen live during a lewd-media raid. Fetch it
+                // the way a linked image is fetched, and judge what arrives.
+                Err(e) if e.to_string().contains("decrypt") => {
+                    println!("[media] {} — not encrypted; fetching it as a plain file", short(&a.id));
+                    fetch_linked(&a.url, cfg.vision.max_sheeted_bytes.max(cfg.vision.max_bytes), cfg.vision.timeout_secs)
+                        .await
+                        .map_err(|le| format!("{e}; as a plain file: {le}"))
+                }
+                Err(e) => Err(e.to_string()),
+            },
             Src::Link(url) => fetch_linked(url, cfg.vision.max_bytes, cfg.vision.timeout_secs).await,
         };
         let bytes = match fetched {
