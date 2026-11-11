@@ -365,7 +365,7 @@ async fn main() -> vector_sdk::Result<()> {
                     }
                     // A join flood is the other half of the raid shape, and it
                     // arrives before anyone has said anything at all.
-                    BotEvent::MemberJoin { channel_id, npub } => {
+                    BotEvent::MemberJoin { channel_id, npub, .. } => {
                         if let Some(community) = bot.channel(channel_id).community() {
                             if lanes::observe_arrival(&cfg, &wires, &community, &npub) {
                                 lanes::evaluate_now(&bot, &community, &cfg, &store, &wires, &me).await;
@@ -408,7 +408,7 @@ async fn introduce(bot: &VectorBot, want: &crate::config::Profile) {
     if same {
         return;
     }
-    if bot.update_profile(&want.name, &avatar, &banner, &want.about).await {
+    if bot.update_profile(&want.name, &avatar, &banner, &want.about).await.is_ok() {
         println!("published profile — {}", want.name);
     } else {
         eprintln!("could not publish profile; members looking up this npub will find nothing");

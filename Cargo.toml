@@ -7,12 +7,12 @@ license = "MIT"
 rust-version = "1.82"  # Option::is_none_or
 
 [dependencies]
-vector_sdk = "0.10"
+vector_sdk = "0.12"
 tokio = { version = "1.49", features = ["rt", "rt-multi-thread", "macros", "time", "signal", "sync", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
 
 # Confidential inference. The enclave's attestation and the HPKE sealing of every
 # request body are this crate's job — reimplementing either would be writing our
@@ -25,11 +25,10 @@ default = ["tee"]
 # sigstore and SEV-SNP dependency tree that a LAN endpoint never touches.
 tee = ["dep:tinfoil"]
 
-# vector_sdk and vector-core come from crates.io now — 0.10.0 and 0.9.0 carry
-# everything this bot reads from a verdict.
+# vector_sdk and vector-core come from crates.io.
 #
 # `nostr` stays patched to the fork whose SecretKey Drop zeroizes with volatile
 # writes rather than a call the compiler may elide. Stock nostr builds fine; this
 # holds a key that can ban people, so the erasure is worth a git dependency.
 [patch.crates-io]
-nostr = { git = "https://github.com/VectorPrivacy/nostr.git", branch = "zeroize-secretkey-v0.45.1" }
+nostr = { git = "https://github.com/VectorPrivacy/nostr.git", branch = "vector-v0.45.6" }

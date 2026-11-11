@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use vector_sdk::vector_core::net::{build_http_client, reqwest};
+use vector_sdk::net::{build_http_client, HttpClient};
 
 use super::{Label, Shown, Verdict, Vision};
 use crate::config::VisionCfg;
@@ -22,7 +22,7 @@ pub struct OpenAiVision {
 /// the parse are identical either way — only the carriage differs, so a second
 /// provider is a variant here rather than a second implementation of the lane.
 enum Wire {
-    Http { api_key: Option<String>, client: reqwest::Client },
+    Http { api_key: Option<String>, client: HttpClient },
     #[cfg(feature = "tee")]
     Tee(super::tee::Tee),
 }
@@ -192,7 +192,7 @@ impl OpenAiVision {
         let status = resp.status();
         if !status.is_success() {
             // 400 is the only status a different body could fix.
-            if status == reqwest::StatusCode::BAD_REQUEST {
+            if status.as_u16() == 400 {
                 return Err(Rejected::Parameter);
             }
             return Err(Rejected::Other(format!("HTTP {status}")));
